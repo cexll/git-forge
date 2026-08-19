@@ -57,9 +57,13 @@ impl EventKind {
             EventKind::PrMerge => "pr.merge",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Option<Self> {
-        Some(match s {
+impl std::str::FromStr for EventKind {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Ok(match s {
             "issue.created" => Self::IssueCreated,
             "issue.comment" => Self::IssueComment,
             "issue.close" => Self::IssueClose,
@@ -68,7 +72,7 @@ impl EventKind {
             "pr.comment" => Self::PrComment,
             "pr.review" => Self::PrReview,
             "pr.merge" => Self::PrMerge,
-            _ => return None,
+            _ => return Err(()),
         })
     }
 }
@@ -144,7 +148,8 @@ impl Event {
         let seed = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos() as u64)
-            .unwrap_or(0) ^ entity_id;
+            .unwrap_or(0)
+            ^ entity_id;
         Self {
             v: 1,
             id: uuid_v4_from_seed(seed),
@@ -193,7 +198,7 @@ impl Event {
         if !is_uuid_v4(&id) {
             return None;
         }
-        let kind = EventKind::from_str(object.get("kind")?.as_str()?)?;
+        let kind = object.get("kind")?.as_str()?.parse().ok()?;
         let entity = object.get("entity")?.as_str()?.to_string();
         let entity_id = object.get("entity_id")?.as_u64()?;
         let ts = object.get("ts")?.as_str()?.to_string();
@@ -255,7 +260,9 @@ pub struct PrState {
 
 impl PrState {
     fn apply(&mut self, event: &Event) {
-        let str_field = |m: &HashMap<String, JsonValue>, key: &str| m.get(key).and_then(JsonValue::as_str).map(String::from);
+        let str_field = |m: &HashMap<String, JsonValue>, key: &str| {
+            m.get(key).and_then(JsonValue::as_str).map(String::from)
+        };
         match event.kind {
             EventKind::PrCreated => {
                 self.title = str_field(&event.body, "title");
@@ -298,8 +305,16 @@ pub fn fold(events: &[Event]) -> FoldState {
                 state.issue.id = event.entity_id;
                 match event.kind {
                     EventKind::IssueCreated => {
-                        state.issue.title = event.body.get("title").and_then(JsonValue::as_str).map(String::from);
-                        state.issue.description = event.body.get("description").and_then(JsonValue::as_str).map(String::from);
+                        state.issue.title = event
+                            .body
+                            .get("title")
+                            .and_then(JsonValue::as_str)
+                            .map(String::from);
+                        state.issue.description = event
+                            .body
+                            .get("description")
+                            .and_then(JsonValue::as_str)
+                            .map(String::from);
                         state.issue.open = true;
                     }
                     EventKind::IssueComment => {
@@ -393,11 +408,16 @@ struct Parser<'a> {
 
 impl<'a> Parser<'a> {
     fn new(input: &'a str) -> Self {
-        Self { bytes: input.as_bytes(), pos: 0 }
+        Self {
+            bytes: input.as_bytes(),
+            pos: 0,
+        }
     }
 
     fn skip_ws(&mut self) {
-        while self.pos < self.bytes.len() && matches!(self.bytes[self.pos], b' ' | b'\t' | b'\r' | b'\n') {
+        while self.pos < self.bytes.len()
+            && matches!(self.bytes[self.pos], b' ' | b'\t' | b'\r' | b'\n')
+        {
             self.pos += 1;
         }
     }
@@ -422,13 +442,25 @@ impl<'a> Parser<'a> {
             b'[' => self.parse_array(),
             b'"' => Some(JsonValue::String(self.parse_string()?)),
             b't' => {
-                if self.consume_literal("true") { Some(JsonValue::Bool(true)) } else { None }
+                if self.consume_literal("true") {
+                    Some(JsonValue::Bool(true))
+                } else {
+                    None
+                }
             }
             b'f' => {
-                if self.consume_literal("false") { Some(JsonValue::Bool(false)) } else { None }
+                if self.consume_literal("false") {
+                    Some(JsonValue::Bool(false))
+                } else {
+                    None
+                }
             }
             b'n' => {
-                if self.consume_literal("null") { Some(JsonValue::Null) } else { None }
+                if self.consume_literal("null") {
+                    Some(JsonValue::Null)
+                } else {
+                    None
+                }
             }
             b'-' | b'0'..=b'9' => self.parse_number(),
             _ => None,
@@ -533,7 +565,7 @@ impl<'a> Parser<'a> {
             self.pos += 1;
         }
         let digits_start = self.pos;
-        while self.bytes.get(self.pos).map_or(false, |b| b.is_ascii_digit()) {
+        while self.bytes.get(self.pos).is_some_and(|b| b.is_ascii_digit()) {
             self.pos += 1;
         }
         if self.pos == digits_start {

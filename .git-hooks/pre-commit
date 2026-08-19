@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+set -euo pipefail
+# git-native pre-commit hook. Variant C; no framework dependency.
+# core.hooksPath = .git-hooks (set by `git config core.hooksPath .git-hooks`).
+
+bash "$(dirname "$0")/check-naming.sh"
+
+# Rust gates. Run only when a root manifest exists (t0 worker lands it);
+# before that, product checks are unavailable and reported by `just check`.
+if [ -f Cargo.toml ]; then
+  cargo fmt --check
+  cargo clippy --all-targets -- -D warnings
+fi

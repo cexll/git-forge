@@ -1,6 +1,4 @@
-use git_forge::event::{
-    Event, EventKind, JsonValue, first_allocation, fold, is_uuid_v4,
-};
+use git_forge::event::{first_allocation, fold, is_uuid_v4, Event, EventKind, JsonValue};
 use std::collections::HashMap;
 
 fn event(kind: EventKind, entity: &str, id: u64, actor: &str, body: &[(&str, JsonValue)]) -> Event {
@@ -8,7 +6,9 @@ fn event(kind: EventKind, entity: &str, id: u64, actor: &str, body: &[(&str, Jso
         .iter()
         .map(|(k, v)| (k.to_string(), v.clone()))
         .collect();
-    let numeric = entity.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+    let numeric = entity
+        .bytes()
+        .fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
     Event::new_with_id(
         &format!("11111111-1111-4111-8111-{:012x}", (numeric << 8) ^ id),
         kind,
@@ -32,7 +32,13 @@ fn serializes_all_l1_kinds() {
         EventKind::PrReview,
         EventKind::PrMerge,
     ] {
-        let e = event(kind, "issue", 1, "a@x", &[("title", JsonValue::String("x".into()))]);
+        let e = event(
+            kind,
+            "issue",
+            1,
+            "a@x",
+            &[("title", JsonValue::String("x".into()))],
+        );
         let json = e.to_json();
         let back = Event::from_json(&json).expect("round trip");
         assert_eq!(back.v, 1);
@@ -44,13 +50,7 @@ fn serializes_all_l1_kinds() {
 
 #[test]
 fn generated_id_is_uuid_v4_shape() {
-    let e = Event::new(
-        EventKind::IssueCreated,
-        "issue",
-        1,
-        "a@x",
-        HashMap::new(),
-    );
+    let e = Event::new(EventKind::IssueCreated, "issue", 1, "a@x", HashMap::new());
     assert!(is_uuid_v4(&e.id), "id={}", e.id);
     assert!(!is_uuid_v4("not-a-uuid"));
 }
@@ -70,7 +70,9 @@ fn rejects_non_v1_schema_and_bad_uuid() {
     // Variant nibble '1' (4th group) is outside RFC 4122 variant [89ab];
     // note "badbadbadbad" would NOT be a valid negative fixture: b/a/d are all
     // hex digits, so it is a well-formed v4 shape and must be accepted.
-    let bad_id = good.to_json().replacen(&good.id, "11111111-1111-4111-1111-111111111111", 1);
+    let bad_id = good
+        .to_json()
+        .replacen(&good.id, "11111111-1111-4111-1111-111111111111", 1);
     assert!(Event::from_json(&bad_id).is_none());
 
     assert!(Event::new_with_id(
@@ -96,7 +98,13 @@ fn folds_issue_and_pr_fields() {
             ("description", JsonValue::String("D".into())),
         ],
     );
-    let comment = event(EventKind::IssueComment, "issue", 7, "a", &[("body", JsonValue::String("first".into()))]);
+    let comment = event(
+        EventKind::IssueComment,
+        "issue",
+        7,
+        "a",
+        &[("body", JsonValue::String("first".into()))],
+    );
     let close = event(EventKind::IssueClose, "issue", 7, "a", &[]);
     let pr = event(
         EventKind::PrCreated,
@@ -124,8 +132,20 @@ fn folds_issue_and_pr_fields() {
 
 #[test]
 fn effective_review_is_last_reachable() {
-    let approve = event(EventKind::PrReview, "pr", 1, "a", &[("decision", JsonValue::String("approve".into()))]);
-    let reject = event(EventKind::PrReview, "pr", 1, "a", &[("decision", JsonValue::String("reject".into()))]);
+    let approve = event(
+        EventKind::PrReview,
+        "pr",
+        1,
+        "a",
+        &[("decision", JsonValue::String("approve".into()))],
+    );
+    let reject = event(
+        EventKind::PrReview,
+        "pr",
+        1,
+        "a",
+        &[("decision", JsonValue::String("reject".into()))],
+    );
     let state = fold(&[approve, reject]);
     assert_eq!(state.pr.effective_decision.as_deref(), Some("reject"));
 }
