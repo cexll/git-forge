@@ -153,6 +153,39 @@ fn git_issue_wrapper_matches_forge() {
 }
 
 #[test]
+fn git_forge_discovery_on_path() {
+    let dir = tmpdir("gforge");
+    init_repo(&dir);
+    // `git forge issue ...`: git runs `git-forge` found on PATH, passing
+    // argv = ["issue", ...]. This is the primary user surface.
+    let bindir = dir.join(".gforgepath");
+    std::fs::create_dir_all(&bindir).unwrap();
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    std::fs::copy(bin, bindir.join("git-forge")).unwrap();
+    let path = format!(
+        "{}:{}",
+        bindir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    let out = Command::new("git")
+        .args(["forge", "issue", "new", "discovered"])
+        .current_dir(&dir)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    let code = out.status.code().unwrap_or(-1);
+    assert_eq!(
+        code,
+        0,
+        "git forge issue new failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (c, os, es) = forge(&dir, &["forge", "issue", "show", "1"]);
+    assert_eq!(c, 0, "show failed: {es}");
+    assert!(os.contains("discovered"), "git-forge-created issue: {os}");
+}
+
+#[test]
 fn concurrent_comments_both_succeed() {
     let dir = tmpdir("concurrent");
     init_repo(&dir);

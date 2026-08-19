@@ -37,6 +37,9 @@ fn main() -> ExitCode {
 
 fn run_forge(argv: &[String]) -> Result<String, String> {
     match argv.first().map(|s| s.as_str()) {
+        // `git forge issue ...` → git runs `git-forge` with argv = ["issue", ...]
+        Some("issue") => git_forge::cli::run_issue(&argv[1..]),
+        // Direct binary form `git-forge forge issue ...` (used in tests).
         Some("forge") => match argv.get(1).map(|s| s.as_str()) {
             Some("issue") => git_forge::cli::run_issue(&argv[2..]),
             Some(other) => Err(format!("unknown forge subcommand '{other}'")),
