@@ -431,15 +431,6 @@ impl EventStore {
         Err(StoreError::Exhausted)
     }
 
-    /// Atomically allocate a PR id AND create its four refs
-    /// (head/meta/source/base) with expected absence, in ONE ref transaction.
-    ///
-    /// Fresh repo (absent counter): counter commit `{v:1,next:2}` + PR #1 refs
-    /// in one transaction. Existing counter: read `next`, write
-    /// `{v:1,next:next+1}` with the observed tip as parent (versioned chain),
-    /// CAS the counter, and create PR `next`'s four refs — all atomically.
-    /// A counter collision aborts the whole batch and is retried with a fresh
-    /// id; a pre-existing PR ref for the target id is `RefExists`.
     /// Atomically create a PR. Parameter order is fixed and documented:
     /// `(title, source_ref, base_ref, source_oid, base_oid, merge_base)` —
     /// title first (primary user input), then the two branch names, then the
