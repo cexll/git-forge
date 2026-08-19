@@ -798,17 +798,18 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
         ))
     };
     let mut tmp = mk(0);
+    // The lock handle is held until the worktree is removed AND verified gone,
+    // so no concurrent same-repo merge can reuse this path while we own it.
+    let mut lock_handle: Option<std::fs::File> = None;
     let (ok_wt, err_wt) = loop {
         let lock = tmp.with_extension("lock");
-        // Hold the lock through worktree registration: the lock, not the
-        // (removable) dir, arbitrates concurrent same-repo merges. Esteeming
-        // two writers to the same path — one must retry with a new suffix.
-        let lock_handle = std::fs::OpenOptions::new()
+        match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
-            .open(&lock);
-        match lock_handle {
-            Ok(_) => {
+            .open(&lock)
+        {
+            Ok(h) => {
+                lock_handle = Some(h);
                 let (ok, _, err) = git_in(
                     &repo_dir,
                     &[
@@ -819,8 +820,6 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
                         &detach_oid.to_string(),
                     ],
                 );
-                // Release the lock whether or not add succeeded.
-                let _ = std::fs::remove_file(&lock);
                 break (ok, err);
             }
             Err(_) if attempt < 16 => {
@@ -838,9 +837,8 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
         }
     };
     if !ok_wt {
-        // The lock file is the only path THIS invocation is guaranteed to own;
-        // `tmp` may already belong to a concurrent merge or be a pre-existing
-        // stale directory. Clean only our lock and report the real error.
+        // Release our own lock; the path was never registered to us.
+        drop(lock_handle.take());
         let _ = std::fs::remove_file(tmp.with_extension("lock"));
         return Err(format!("failed to create temporary worktree: {err_wt}"));
     }
@@ -940,7 +938,9 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
             tmp.display()
         ));
     }
-    let _ = std::fs::remove_dir_all(&tmp);
+    // `git worktree remove` already removed the directory; do NOT run a
+    // recursive delete here (each path is owned by whichever merge holds its
+    // sibling lock — deleting another process's worktree is never safe).
     // AC-005h: verify the disposable directory is actually gone.
     if tmp.exists() {
         let left = match store.delete_pending_result_ref(id, result_commit) {
@@ -991,6 +991,10 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
             tmp.display()
         ));
     }
+    // Worktree removed AND verified gone: release our path lock so a concurrent
+    // same-repo merge can reuse the path, then run barrier + final transaction.
+    drop(lock_handle.take());
+    let _ = std::fs::remove_file(tmp.with_extension("lock"));
 
     // Test-only pending-window barrier: not part of the user CLI contract.
     #[cfg(debug_assertions)]
@@ -1064,7 +1068,12 @@ fn cleanup_failed_worktree(
             tmp.to_str().unwrap_or("/tmp/none"),
         ],
     );
+    // The caller still holds this path's lock handle (cleanup runs from the
+    // strategy branches before the handle is dropped), so removing the
+    // directory here cannot race another merge on the same path. Delete the
+    // directory, then release the lock file so the suffix is reusable.
     let _ = std::fs::remove_dir_all(tmp);
+    let _ = std::fs::remove_file(tmp.with_extension("lock"));
     format!("git {kind} failed: {cause}; worktree cleaned up, no ref changes made")
 }
 
