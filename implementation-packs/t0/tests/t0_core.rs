@@ -1,0 +1,108 @@
+use git_forge::event::{
+    Event, EventKind, JsonValue, first_allocation, fold, is_uuid_v4,
+};
+use std::collections::HashMap;
+
+fn event(kind: EventKind, entity: &str, id: u64, actor: &str, body: &[(&str, JsonValue)]) -> Event {
+    let map: HashMap<String, JsonValue> = body
+        .iter()
+        .map(|(k, v)| (k.to_string(), v.clone()))
+        .collect();
+    let numeric = entity.bytes().fold(0u64, |acc, b| acc.wrapping_mul(31).wrapping_add(b as u64));
+    Event::new_with_id(
+        &format!("11111111-1111-4111-8111-{:012x}", (numeric << 8) ^ id),
+        kind,
+        entity,
+        id,
+        actor,
+        map,
+    )
+}
+
+#[test]
+fn serializes_all_l1_kinds() {
+    for kind in [
+        EventKind::IssueCreated,
+        EventKind::IssueComment,
+        EventKind::IssueClose,
+        EventKind::IssueReopen,
+        EventKind::PrCreated,
+        EventKind::PrComment,
+        EventKind::PrReview,
+        EventKind::PrMerge,
+    ] {
+        let e = event(kind, "issue", 1, "a@x", &[("title", JsonValue::String("x".into()))]);
+        let json = e.to_json();
+        let back = Event::from_json(&json).expect("round trip");
+        assert_eq!(back.v, 1);
+        assert_eq!(back.id, e.id);
+        assert_eq!(back.kind, e.kind);
+        assert_eq!(back.body.get("title"), e.body.get("title"));
+    }
+}
+
+#[test]
+fn generated_id_is_uuid_v4_shape() {
+    let e = Event::new(
+        EventKind::IssueCreated,
+        "issue",
+        1,
+        "a@x",
+        HashMap::new(),
+    );
+    assert!(is_uuid_v4(&e.id), "id={}", e.id);
+    assert!(!is_uuid_v4("not-a-uuid"));
+}
+
+#[test]
+fn folds_issue_and_pr_fields() {
+    let issue = event(
+        EventKind::IssueCreated,
+        "issue",
+        7,
+        "a",
+        &[
+            ("title", JsonValue::String("T".into())),
+            ("description", JsonValue::String("D".into())),
+        ],
+    );
+    let comment = event(EventKind::IssueComment, "issue", 7, "a", &[("body", JsonValue::String("first".into()))]);
+    let close = event(EventKind::IssueClose, "issue", 7, "a", &[]);
+    let pr = event(
+        EventKind::PrCreated,
+        "pr",
+        3,
+        "a",
+        &[
+            ("title", JsonValue::String("PR".into())),
+            ("source_ref", JsonValue::String("refs/heads/f".into())),
+            ("base_ref", JsonValue::String("refs/heads/main".into())),
+            ("source_head", JsonValue::String("s".into())),
+            ("base_head", JsonValue::String("b".into())),
+            ("merge_base", JsonValue::String("m".into())),
+        ],
+    );
+    let state = fold(&[issue, comment, close, pr]);
+    assert_eq!(state.issue.id, 7);
+    assert_eq!(state.issue.title.as_deref(), Some("T"));
+    assert_eq!(state.issue.comments, vec!["first"]);
+    assert!(!state.issue.open);
+    assert_eq!(state.pr.id, 3);
+    assert_eq!(state.pr.base_head.as_deref(), Some("b"));
+    assert_eq!(state.pr.merge_base.as_deref(), Some("m"));
+}
+
+#[test]
+fn effective_review_is_last_reachable() {
+    let approve = event(EventKind::PrReview, "pr", 1, "a", &[("decision", JsonValue::String("approve".into()))]);
+    let reject = event(EventKind::PrReview, "pr", 1, "a", &[("decision", JsonValue::String("reject".into()))]);
+    let state = fold(&[approve, reject]);
+    assert_eq!(state.pr.effective_decision.as_deref(), Some("reject"));
+}
+
+#[test]
+fn sequential_allocation_from_absent() {
+    let (id, next) = first_allocation();
+    assert_eq!(id, 1);
+    assert_eq!(next.next, 2);
+}
