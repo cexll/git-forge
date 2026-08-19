@@ -158,7 +158,7 @@ impl Event {
     }
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct IssueState {
     pub id: u64,
     pub title: Option<String>,
@@ -167,7 +167,7 @@ pub struct IssueState {
     pub open: bool,
 }
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct PrState {
     pub id: u64,
     pub title: Option<String>,
@@ -378,6 +378,7 @@ impl Store {
     }
 }
 EOF
+      printf 'pub mod store;\n' >> src/lib.rs
     fi
     if [[ ! -f tests/t1a_store.rs ]]; then
       mkdir -p tests
@@ -470,6 +471,7 @@ pub enum PrCmd {
     },
 }
 EOF
+      printf 'pub mod cli;\n' >> src/lib.rs
     fi
     # Replace stub main with real dispatch to show it is wired.
     cat > src/main.rs <<'EOF'
@@ -491,7 +493,7 @@ EOF
 use std::process::Command;
 
 fn run(args: &[&str]) -> String {
-    let out = Command::new(env!("CARGO_BIN_EXE_git-forge")).args(args).output().unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_git_forge")).args(args).output().unwrap();
     assert!(out.status.success());
     String::from_utf8(out.stdout).unwrap()
 }
