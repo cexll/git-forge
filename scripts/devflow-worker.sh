@@ -40,6 +40,10 @@ chrono = { version = "0.4", features = ["serde"] }
 
 [dev-dependencies]
 tempfile = "3"
+
+[[bin]]
+name = "git_forge"
+path = "src/main.rs"
 EOF
   mkdir -p src
   if [[ ! -f src/lib.rs ]]; then
@@ -77,7 +81,8 @@ submit_success() {
     --arg tests "$tests" \
     --arg issues "$issues" \
     --arg commit "$commit" \
-    '{successState:"success", validatorsPassed:true, commitId:$commit, repoPath:$WORKING_DIRECTORY, handoff:{salientSummary:$summary,whatWasImplemented:$impl,whatWasLeftUndone:$left,verification:$verification,tests:$tests,discoveredIssues:$issues}}')
+    --arg repo "$WORKING_DIRECTORY" \
+    '{successState:"success", validatorsPassed:true, commitId:$commit, repoPath:$repo, handoff:{salientSummary:$summary,whatWasImplemented:$impl,whatWasLeftUndone:$left,verification:$verification,tests:$tests,discoveredIssues:$issues}}')
   # For reportOnly, omit commitId/repoPath by deleting null keys.
   if [[ -n "${REPORT_ONLY:-}" ]]; then
     payload=$(echo "$payload" | jq 'del(.commitId) | del(.repoPath)')
