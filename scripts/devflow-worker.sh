@@ -55,5 +55,6 @@ PAYLOAD="$(jq -n \
   --arg feature "$FEATURE" \
   --arg diffstat "$DIFF_STAT" \
   --arg verification "cargo test --all-targets passed (post-copy, pre-commit)" \
-  '{successState:"success", validatorsPassed:true, commitId:$id, repoPath:$repo, handoff:{salientSummary:"Implemented feature " + $feature, whatWasImplemented:$diffstat, whatWasLeftUndone:"", verification:$verification, tests:"cargo test --all-targets", discoveredIssues:"none"}}')"
+  --arg summary "Implemented feature $FEATURE" \
+  '{successState:"success", validatorsPassed:true, commitId:$id, repoPath:$repo, handoff:{salientSummary:$summary, whatWasImplemented:$diffstat, whatWasLeftUndone:"", verification:$verification, tests:"cargo test --all-targets", discoveredIssues:"none"}}')"
 printf '%s\n' "$PAYLOAD" | "$DEVFLOW_CLI" end-feature
