@@ -430,6 +430,84 @@ impl EventStore {
         Err(StoreError::Exhausted)
     }
 
+    /// Atomically allocate a PR id AND create its four refs
+    /// (head/meta/source/base) with expected absence, in ONE ref transaction.
+    ///
+    /// Fresh repo (absent counter): counter commit `{v:1,next:2}` + PR #1 refs
+    /// in one transaction. Existing counter: read `next`, write
+    /// `{v:1,next:next+1}` with the observed tip as parent (versioned chain),
+    /// CAS the counter, and create PR `next`'s four refs — all atomically.
+    /// A counter collision aborts the whole batch and is retried with a fresh
+    /// id; a pre-existing PR ref for the target id is `RefExists`.
+    pub fn allocate_pr_id(
+        &self,
+        source_head: Oid,
+        base_head: Oid,
+        merge_base: Oid,
+    ) -> Result<u64, StoreError> {
+        for _ in 0..MAX_ALLOC_RETRIES {
+            let (counter_tip, counter_new, next, genesis): (Option<Oid>, Oid, u64, Oid) =
+                match self.current_tip(COUNTER_REF)? {
+                    None => (
+                        None,
+                        self.write_counter_commit(2, None)?,
+                        1,
+                        self.genesis_oid()?,
+                    ),
+                    Some(ct) => {
+                        let next = self.read_counter_next(ct)?;
+                        (
+                            Some(ct),
+                            self.write_counter_commit(next + 1, Some(ct))?,
+                            next,
+                            self.genesis_oid()?,
+                        )
+                    }
+                };
+            let plan = [
+                (pr_head_ref(next), genesis),
+                (pr_meta_ref(next), genesis),
+                (pr_source_ref(next), source_head),
+                (pr_base_ref(next), base_head),
+            ];
+            // Counter CAS line: expected old (or zeros to require absence).
+            let old = counter_tip
+                .map(|o| o.to_string())
+                .unwrap_or_else(|| ZERO_OID.to_string());
+            let mut lines = vec![format!("update {COUNTER_REF} {counter_new} {old}")];
+            for (r, oid) in &plan {
+                lines.push(format!("update {r} {oid} {ZERO_OID}"));
+            }
+            match self.run_update_ref_stdin(&lines) {
+                Ok(()) => {
+                    let _ = merge_base; // recorded in pr.created by the CLI
+                    return Ok(next);
+                }
+                Err(e) => {
+                    // Counter first: if it moved, a concurrent allocator won →
+                    // retry with a fresh id.
+                    if self.current_tip(COUNTER_REF)? != counter_tip {
+                        continue;
+                    }
+                    // Counter unchanged (batch rolled back): a pre-existing PR
+                    // ref is the stale-collision case.
+                    let mut any_preexisting = false;
+                    for (r, _) in &plan {
+                        if self.current_tip(r)?.is_some() {
+                            any_preexisting = true;
+                            break;
+                        }
+                    }
+                    if any_preexisting {
+                        return Err(StoreError::RefExists(pr_head_ref(next)));
+                    }
+                    return Err(e);
+                }
+            }
+        }
+        Err(StoreError::Exhausted)
+    }
+
     /// Atomically create the four PR refs (head/meta/source/base) with expected
     /// absence. head/meta point at a genesis root; source/base pin the
     /// immutable snapshot OIDs. Any pre-existing ref aborts the whole

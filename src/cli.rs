@@ -247,3 +247,372 @@ fn issue_help() -> String {
      \x20 reopen <n>"
         .to_string()
 }
+
+// ─────────────────────────── PR commands ───────────────────────────
+
+/// Resolve a `--source`/`--base` argument to a canonical local branch OID, or
+/// an Err with a clear message. Accepts only `refs/heads/<name>`: tags,
+/// remote-tracking refs, OIDs, and revision expressions are rejected.
+fn resolve_local_branch(store: &EventStore, arg: &str) -> Result<git2::Oid, String> {
+    if arg.is_empty() {
+        return Err("branch name must be non-empty".into());
+    }
+    if arg.starts_with("refs/heads/") {
+        return store
+            .repo()
+            .find_reference(arg)
+            .ok()
+            .and_then(|r| r.target())
+            .ok_or_else(|| format!("no such local branch '{arg}'"));
+    }
+    // Must be a bare local branch name (no refs/tags/, no remotes/, no /
+    // separator suggesting a rev expression, not a 40-hex OID).
+    if arg.contains('/') {
+        return Err(format!(
+            "'{arg}' is not a canonical local branch; use a plain branch name (tags, remote-tracking refs, OIDs, and revision expressions are rejected)"
+        ));
+    }
+    let full = format!("refs/heads/{arg}");
+    store
+        .repo()
+        .find_reference(&full)
+        .ok()
+        .and_then(|r| r.target())
+        .ok_or_else(|| format!("no such local branch '{arg}'"))
+}
+
+/// `git merge-base --all <a> <b>` count must be exactly 1. Zero covers
+/// unrelated/shallow histories (shallow → ask to deepen); multiple covers
+/// criss-cross. Returns the single merge-base OID.
+fn require_single_merge_base(
+    repo: &git2::Repository,
+    a: git2::Oid,
+    b: git2::Oid,
+) -> Result<git2::Oid, String> {
+    use std::process::Command;
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["merge-base", "--all", &a.to_string(), &b.to_string()])
+        .output()
+        .map_err(|e| format!("git merge-base failed: {e}"))?;
+    if !out.status.success() {
+        return Err("git merge-base failed".into());
+    }
+    let lines: Vec<&str> = std::str::from_utf8(&out.stdout)
+        .map_err(|_| "merge-base output not utf8".to_string())?
+        .trim()
+        .lines()
+        .filter(|l| !l.is_empty())
+        .collect();
+    if lines.len() != 1 {
+        if lines.is_empty() {
+            let shallow = repo.is_shallow();
+            if shallow {
+                return Err(
+                    "no merge base (shallow history) — deepen/unshallow the repository first"
+                        .into(),
+                );
+            }
+            return Err("no merge base — the source/base histories are unrelated, or history is shallow; deepen/unshallow before creating a PR".into());
+        }
+        return Err(format!(
+            "multiple merge bases ({}) suggest a criss-cross history; cannot create the PR",
+            lines.len()
+        ));
+    }
+    lines[0]
+        .trim()
+        .parse::<git2::Oid>()
+        .map_err(|_| "invalid merge-base oid".to_string())
+}
+
+/// `git forge pr create --source <branch> --base <branch> <title>`
+fn cmd_pr_create(store: &EventStore, args: &[String]) -> Result<String, String> {
+    let mut source = None;
+    let mut base = None;
+    let mut title = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--source" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--source requires a branch name".into());
+                }
+                source = Some(args[i].clone());
+            }
+            "--base" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--base requires a branch name".into());
+                }
+                base = Some(args[i].clone());
+            }
+            a if a.starts_with("--") || a.starts_with('-') => {
+                return Err(format!("unknown option '{a}'"));
+            }
+            t if title.is_none() => title = Some(t.to_string()),
+            _ => return Err("too many positional arguments; usage: git forge pr create --source <branch> --base <branch> <title>".into()),
+        }
+        i += 1;
+    }
+    let source = source.ok_or_else(|| {
+        String::from("usage: git forge pr create --source <branch> --base <branch> <title>")
+    })?;
+    let base = base.ok_or_else(|| {
+        String::from("usage: git forge pr create --source <branch> --base <branch> <title>")
+    })?;
+    let title = title.ok_or_else(|| {
+        String::from("usage: git forge pr create --source <branch> --base <branch> <title>")
+    })?;
+    if title.trim().is_empty() {
+        return Err("PR title is required and must be non-empty".into());
+    }
+
+    let source_oid = resolve_local_branch(store, &source)?;
+    let base_oid = resolve_local_branch(store, &base)?;
+    if source == base {
+        return Err("source and base branch must differ (no self-PR)".into());
+    }
+    if source_oid == base_oid {
+        return Err("source and base branches resolve to the same commit (no self-PR)".into());
+    }
+    let merge_base = require_single_merge_base(store.repo(), base_oid, source_oid)?;
+
+    let id = store
+        .allocate_pr_id(source_oid, base_oid, merge_base)
+        .map_err(|e| e.to_string())?;
+    // Append pr.created event on the PR head chain.
+    let mut body = HashMap::new();
+    body.insert("title".into(), json_str(title.trim()));
+    body.insert("source_ref".into(), json_str(&source));
+    body.insert("base_ref".into(), json_str(&base));
+    body.insert("source_head".into(), json_str(&source_oid.to_string()));
+    body.insert("base_head".into(), json_str(&base_oid.to_string()));
+    body.insert("merge_base".into(), json_str(&merge_base.to_string()));
+    let ev = Event::new(EventKind::PrCreated, "pr", id, "git-forge", body);
+    store
+        .append_event(&crate::store::pr_head_ref(id), &ev)
+        .map_err(|e| e.to_string())?;
+    Ok(format!("PR #{id} created: {title} ({source} -> {base})"))
+}
+
+/// `git forge pr show <n>`
+fn cmd_pr_show(store: &EventStore, args: &[String]) -> Result<String, String> {
+    let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
+    let r = crate::store::pr_head_ref(id);
+    if !store_has_ref(store, &r) {
+        return Err(format!("PR #{id} does not exist"));
+    }
+    let chain = store.read_chain(&r).map_err(|e| e.to_string())?;
+    if chain.is_empty() {
+        return Err(format!("PR #{id} has no events"));
+    }
+    let state = crate::event::fold(&chain).pr;
+    let mut out = format!(
+        "PR #{} {} — {}\n",
+        state.id,
+        state.title.as_deref().unwrap_or("(untitled)"),
+        state
+            .effective_decision
+            .as_deref()
+            .map(|d| format!("decision: {d}"))
+            .unwrap_or_else(|| "no review yet".into())
+    );
+    if let Some(r) = &state.base_ref {
+        out.push_str(&format!("base: {r}\n"));
+    }
+    if let Some(r) = &state.source_ref {
+        out.push_str(&format!("source: {r}\n"));
+    }
+    if let (Some(b), Some(s)) = (&state.base_head, &state.source_head) {
+        out.push_str(&format!("diff: {b}...{s}\n"));
+    }
+    for c in &state.comments {
+        out.push_str(&format!("comment: {c}\n"));
+    }
+    Ok(out.trim_end().to_string())
+}
+
+/// `git forge pr list`
+fn cmd_pr_list(store: &EventStore) -> Result<String, String> {
+    let bound = counter_next(store).ok().unwrap_or(1);
+    let mut out = String::new();
+    let mut found = 0usize;
+    for n in 1..bound {
+        let r = crate::store::pr_head_ref(n);
+        if !store_has_ref(store, &r) {
+            continue;
+        }
+        let chain = store.read_chain(&r).map_err(|e| e.to_string())?;
+        if chain.is_empty() {
+            continue;
+        }
+        let st = crate::event::fold(&chain).pr;
+        out.push_str(&format!(
+            "PR #{} {} ({})\n",
+            st.id,
+            st.title.as_deref().unwrap_or("(untitled)"),
+            st.effective_decision.as_deref().unwrap_or("no review")
+        ));
+        found += 1;
+    }
+    if found == 0 {
+        return Ok("(no pull requests)".into());
+    }
+    Ok(out.trim_end().to_string())
+}
+
+/// `git forge pr comment <n> <body>`
+fn cmd_pr_comment(store: &EventStore, args: &[String]) -> Result<String, String> {
+    if args.len() < 2 {
+        return Err("usage: git forge pr comment <n> <body>".into());
+    }
+    let id = parse_entity_id(&args[0])?;
+    let body = args[1..].join(" ").trim().to_string();
+    if body.is_empty() {
+        return Err("comment body must be non-empty".into());
+    }
+    let r = crate::store::pr_head_ref(id);
+    if !store_has_ref(store, &r) {
+        return Err(format!("PR #{id} does not exist"));
+    }
+    let ev = Event::new(
+        EventKind::PrComment,
+        "pr",
+        id,
+        "git-forge",
+        body_obj(&[("body", json_str(&body))]),
+    );
+    store.append_event(&r, &ev).map_err(|e| e.to_string())?;
+    Ok(format!("comment added to PR #{id}"))
+}
+
+/// `git forge pr review <n> --approve|--reject [--file <f> --line <l> --commit <c>]`
+fn cmd_pr_review(store: &EventStore, args: &[String]) -> Result<String, String> {
+    let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
+    let mut decision = None;
+    let mut file = None;
+    let mut line = None;
+    let mut commit = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--approve" => decision = Some("approve".to_string()),
+            "--reject" => decision = Some("reject".to_string()),
+            "--file" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--file requires a path".into());
+                }
+                file = Some(args[i].clone());
+            }
+            "--line" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--line requires a number".into());
+                }
+                line = Some(args[i].clone());
+            }
+            "--commit" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--commit requires a hash".into());
+                }
+                commit = Some(args[i].clone());
+            }
+            a if a.starts_with('-') => return Err(format!("unknown option '{a}'")),
+            _ => {}
+        }
+        i += 1;
+    }
+    let decision = decision
+        .ok_or_else(|| String::from("usage: git forge pr review <n> --approve|--reject"))?;
+    if let Some(anchor) = commit.clone() {
+        // anchored inline comment: body carries file/line/commit
+        let _ = anchor;
+    }
+    let r = crate::store::pr_head_ref(id);
+    if !store_has_ref(store, &r) {
+        return Err(format!("PR #{id} does not exist"));
+    }
+    let mut body = HashMap::new();
+    body.insert("decision".into(), json_str(&decision));
+    if let Some(f) = file {
+        body.insert("file".into(), json_str(&f));
+    }
+    if let Some(l) = line {
+        body.insert("line".into(), json_str(&l));
+    }
+    if let Some(c) = commit {
+        // Inline comment anchored to a commit (immutable; never follows later
+        // diff changes).
+        body.insert("commit".into(), json_str(&c));
+    }
+    let ev = Event::new(EventKind::PrReview, "pr", id, "git-forge", body);
+    store.append_event(&r, &ev).map_err(|e| e.to_string())?;
+    Ok(format!("reviewed PR #{id} ({decision})"))
+}
+
+/// `git forge pr diff <n>` — three-dot diff from the immutable snapshot refs.
+fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String, String> {
+    use std::process::Command;
+    let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
+    let head = crate::store::pr_head_ref(id);
+    if !store_has_ref(store, &head) {
+        return Err(format!("PR #{id} does not exist"));
+    }
+    // Resolve from the IMMUTABLE snapshot refs (survive branch deletion + gc).
+    let source = crate::store::pr_source_ref(id);
+    let base = crate::store::pr_base_ref(id);
+    let source_oid = store
+        .repo()
+        .find_reference(&source)
+        .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
+        .map_err(|_| format!("PR #{id} snapshot source ref missing"))?;
+    let base_oid = store
+        .repo()
+        .find_reference(&base)
+        .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
+        .map_err(|_| format!("PR #{id} snapshot base ref missing"))?;
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(store.repo().path())
+        .args(["diff", &format!("{base_oid}...{source_oid}")])
+        .output()
+        .map_err(|e| format!("git diff failed: {e}"))?;
+    if !out.status.success() {
+        return Err("git diff failed".into());
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+}
+
+/// Dispatch a `git forge pr` subcommand. `argv` excludes the `pr` token.
+pub fn run_pr(argv: &[String]) -> Result<String, String> {
+    let store = EventStore::open(".").map_err(|e| format!("{e}"))?;
+    let sub = argv.first().map(|s| s.as_str()).unwrap_or("");
+    match sub {
+        "create" => cmd_pr_create(&store, &argv[1..]),
+        "list" => cmd_pr_list(&store),
+        "show" => cmd_pr_show(&store, &argv[1..]),
+        "comment" => cmd_pr_comment(&store, &argv[1..]),
+        "review" => cmd_pr_review(&store, &argv[1..]),
+        "diff" => cmd_pr_diff(&store, &argv[1..]),
+        "help" | "-h" | "--help" => Ok(pr_help()),
+        "" => Ok(pr_help()),
+        other => Err(format!("unknown pr subcommand '{other}'")),
+    }
+}
+
+fn pr_help() -> String {
+    "usage: git forge pr <create|list|show|comment|review|diff> ...\n\
+     \nsubcommands:\n\
+     \x20 create --source <branch> --base <branch> <title>\n\
+     \x20 list\n\
+     \x20 show <n>\n\
+     \x20 comment <n> <body>\n\
+     \x20 review <n> --approve|--reject [--file <f> --line <l> --commit <c>]\n\
+     \x20 diff <n>"
+        .to_string()
+}
