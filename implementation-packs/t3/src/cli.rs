@@ -941,6 +941,22 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
         ));
     }
     let _ = std::fs::remove_dir_all(&tmp);
+    // AC-005h: verify the disposable directory is actually gone.
+    if tmp.exists() {
+        let left = match store.delete_pending_result_ref(id, result_commit) {
+            Ok(true) | Ok(false) => false,
+            Err(_) => true,
+        };
+        let pending = if left {
+            format!("; pending result ref refs/forge/prs/{id}/result left in place")
+        } else {
+            String::new()
+        };
+        return Err(format!(
+            "merge succeeded but temp worktree directory still exists at {}{pending}",
+            tmp.display()
+        ));
+    }
     let (ok_l, list_l, err_l) = git_in(&repo_dir, &["worktree", "list", "--porcelain"]);
     if !ok_l {
         // Best-effort: remove the pending result ref; cannot verify the
@@ -1078,7 +1094,7 @@ fn maybe_run_test_barrier() -> Result<(), String> {
         .open(&ready)
         .map_err(|e| format!("barrier ready sentinel: {e}"))?;
     writeln!(f, "ready").ok();
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(120);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while !release.exists() {
         if std::time::Instant::now() > deadline {
             let _ = std::fs::remove_file(&ready);

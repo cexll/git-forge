@@ -50,6 +50,9 @@ pub fn pr_source_ref(n: u64) -> String {
 pub fn pr_base_ref(n: u64) -> String {
     format!("refs/forge/prs/{n}/base")
 }
+pub fn pr_result_ref(n: u64) -> String {
+    format!("refs/forge/prs/{n}/result")
+}
 
 /// Store errors. `CasConflict`/`Exhausted` are the retry-signalling failures;
 /// `RefExists` guards entity creation collisions.
@@ -526,6 +529,96 @@ impl EventStore {
             }
         }
         Err(StoreError::Exhausted)
+    }
+
+    /// Atomically create the pending result ref `refs/forge/prs/<n>/result` →
+    /// `result_commit` (expected absence). It keeps the freshly-built merge
+    /// result reachable through `git gc` until the final completion
+    /// transaction (wire contract § Merge completion).
+    pub fn create_pending_result_ref(
+        &self,
+        pr_id: u64,
+        result_commit: Oid,
+    ) -> Result<(), StoreError> {
+        let r = pr_result_ref(pr_id);
+        self.run_update_ref_stdin(&[format!("update {r} {result_commit} {ZERO_OID}")])
+    }
+
+    /// Best-effort deletion of the pending result ref (CAS: it must hold
+    /// `result_commit`). Ok(true) deleted; Ok(false) ref was already absent
+    /// (nothing to clean); Err when the ref still exists but CAS failed.
+    pub fn delete_pending_result_ref(
+        &self,
+        pr_id: u64,
+        result_commit: Oid,
+    ) -> Result<bool, StoreError> {
+        let r = pr_result_ref(pr_id);
+        let line = format!("update {r} {ZERO_OID} {result_commit}");
+        match self.run_update_ref_stdin(&[line]) {
+            Ok(()) => Ok(true),
+            Err(_) => {
+                if self.current_tip(&r)?.is_none() {
+                    Ok(false) // already gone
+                } else {
+                    Err(StoreError::RefExists(r))
+                }
+            }
+        }
+    }
+
+    /// Write an unappended `pr.merge` event commit (dangling object, parent =
+    /// current head tip) so the PR chain can be CAS-moved to it in the same
+    /// transaction as the base branch and the pending-ref deletion.
+    fn write_unappended_pr_merge_commit(
+        &self,
+        pr_id: u64,
+        head_tip: Oid,
+        result_commit: Oid,
+        actor: &str,
+    ) -> Result<Oid, StoreError> {
+        let mut body = HashMap::new();
+        body.insert(
+            "result_commit".into(),
+            JsonValue::String(result_commit.to_string()),
+        );
+        let event = Event::new(EventKind::PrMerge, "pr", pr_id, actor, body);
+        let message = format!("forge:{}:{}", event.kind.as_str(), event.entity_id);
+        self.write_event_commit(&event, &[head_tip], &message)
+    }
+
+    /// Atomic merge completion (wire contract § Merge completion): write the
+    /// `pr.merge` event commit (dangling), then ONE `git update-ref --stdin`
+    /// transaction that (1) deletes the pending `/result` ref, (2) CAS-updates
+    /// `refs/heads/<base_ref>` from the PR's snapshot `base_head` to
+    /// `result_commit`, and (3) CAS-moves the PR `/head` chain to the
+    /// `pr.merge` event commit. The head chain tip is read here, and the
+    /// `pr.merge` event commit parented to it, both inside the same function
+    /// as the transaction — so head, base, and the pending-ref deletion move
+    /// as one atomic unit. On failure nothing moved; the caller reports the
+    /// leftover pending ref.
+    pub fn finalize_pr_merge(
+        &self,
+        pr_id: u64,
+        base_ref: &str,
+        base_expected: Oid,
+        result_commit: Oid,
+        actor: &str,
+    ) -> Result<(), StoreError> {
+        let head_ref = pr_head_ref(pr_id);
+        let head_tip = self.current_tip(&head_ref)?.ok_or(StoreError::MissingRef)?;
+        let head_new =
+            self.write_unappended_pr_merge_commit(pr_id, head_tip, result_commit, actor)?;
+        let result = pr_result_ref(pr_id);
+        let base_branch_ref = format!("refs/heads/{base_ref}");
+        let lines = vec![
+            // delete pending result ref (expected presence).
+            format!("update {result} {ZERO_OID} {result_commit}"),
+            // CAS base branch from snapshot base_head to result_commit.
+            format!("update {base_branch_ref} {result_commit} {base_expected}"),
+            // CAS PR head chain from old tip to pr.merge commit.
+            format!("update {head_ref} {head_new} {head_tip}"),
+        ];
+        self.run_update_ref_stdin(&lines)
     }
 
     /// Low-level accessor for tests and the CLI layer.
