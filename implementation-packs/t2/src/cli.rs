@@ -381,19 +381,14 @@ fn cmd_pr_create(store: &EventStore, args: &[String]) -> Result<String, String> 
     let merge_base = require_single_merge_base(store.repo(), base_oid, source_oid)?;
 
     let id = store
-        .allocate_pr_id(source_oid, base_oid, merge_base)
-        .map_err(|e| e.to_string())?;
-    // Append pr.created event on the PR head chain.
-    let mut body = HashMap::new();
-    body.insert("title".into(), json_str(title.trim()));
-    body.insert("source_ref".into(), json_str(&source));
-    body.insert("base_ref".into(), json_str(&base));
-    body.insert("source_head".into(), json_str(&source_oid.to_string()));
-    body.insert("base_head".into(), json_str(&base_oid.to_string()));
-    body.insert("merge_base".into(), json_str(&merge_base.to_string()));
-    let ev = Event::new(EventKind::PrCreated, "pr", id, "git-forge", body);
-    store
-        .append_event(&crate::store::pr_head_ref(id), &ev)
+        .create_pr(
+            title.trim(),
+            &source,
+            &base,
+            source_oid,
+            base_oid,
+            merge_base,
+        )
         .map_err(|e| e.to_string())?;
     Ok(format!("PR #{id} created: {title} ({source} -> {base})"))
 }

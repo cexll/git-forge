@@ -11,12 +11,13 @@
 //! Commit Layout, § Deterministic Single-Chain CAS Append, § Lazy
 //! initialization / Allocation is atomic).
 
+use std::collections::HashMap;
 use std::path::Path;
 use std::process::Command;
 
 use git2::{Commit, Error as GitError, Oid, Repository, Signature, TreeBuilder, TreeEntry};
 
-use crate::event::Event;
+use crate::event::{Event, EventKind, JsonValue};
 
 /// The single mutable counter ref holding the next sequential id.
 pub const COUNTER_REF: &str = "refs/forge/meta/counter";
@@ -439,36 +440,67 @@ impl EventStore {
     /// CAS the counter, and create PR `next`'s four refs — all atomically.
     /// A counter collision aborts the whole batch and is retried with a fresh
     /// id; a pre-existing PR ref for the target id is `RefExists`.
-    pub fn allocate_pr_id(
+    /// Atomically create a PR. Parameter order is fixed and documented:
+    /// `(title, source_ref, base_ref, source_oid, base_oid, merge_base)` —
+    /// title first (primary user input), then the two branch names, then the
+    /// three OIDs (distinct `Oid` type; cannot swap with the `&str`s). The
+    /// `pr.created` event commit (parent = genesis) is written first, then ONE
+    /// `git update-ref --stdin` transaction CASes the counter and creates
+    /// `/head` → event commit, `/meta` → same event commit (convenience
+    /// pointer), `/source` → `source_oid`, `/base` → `base_oid`, all with
+    /// expected absence. Any failure leaves counter and all four PR refs
+    /// unchanged; a pre-existing PR ref for the target id is `RefExists`.
+    pub fn create_pr(
         &self,
-        source_head: Oid,
-        base_head: Oid,
+        title: &str,
+        source_ref: &str,
+        base_ref: &str,
+        source_oid: Oid,
+        base_oid: Oid,
         merge_base: Oid,
     ) -> Result<u64, StoreError> {
         for _ in 0..MAX_ALLOC_RETRIES {
-            let (counter_tip, counter_new, next, genesis): (Option<Oid>, Oid, u64, Oid) =
-                match self.current_tip(COUNTER_REF)? {
-                    None => (
-                        None,
-                        self.write_counter_commit(2, None)?,
-                        1,
+            let (counter_tip, counter_new, next, genesis) = match self.current_tip(COUNTER_REF)? {
+                None => (
+                    None,
+                    self.write_counter_commit(2, None)?,
+                    1,
+                    self.genesis_oid()?,
+                ),
+                Some(ct) => {
+                    let next = self.read_counter_next(ct)?;
+                    (
+                        Some(ct),
+                        self.write_counter_commit(next + 1, Some(ct))?,
+                        next,
                         self.genesis_oid()?,
-                    ),
-                    Some(ct) => {
-                        let next = self.read_counter_next(ct)?;
-                        (
-                            Some(ct),
-                            self.write_counter_commit(next + 1, Some(ct))?,
-                            next,
-                            self.genesis_oid()?,
-                        )
-                    }
-                };
+                    )
+                }
+            };
+            let mut body = HashMap::new();
+            body.insert("title".into(), JsonValue::String(title.to_string()));
+            body.insert(
+                "source_ref".into(),
+                JsonValue::String(source_ref.to_string()),
+            );
+            body.insert("base_ref".into(), JsonValue::String(base_ref.to_string()));
+            body.insert(
+                "source_head".into(),
+                JsonValue::String(source_oid.to_string()),
+            );
+            body.insert("base_head".into(), JsonValue::String(base_oid.to_string()));
+            body.insert(
+                "merge_base".into(),
+                JsonValue::String(merge_base.to_string()),
+            );
+            let event = Event::new(EventKind::PrCreated, "pr", next, "git-forge", body);
+            let message = format!("forge:{}:{}", event.kind.as_str(), event.entity_id);
+            let event_oid = self.write_event_commit(&event, &[genesis], &message)?;
             let plan = [
-                (pr_head_ref(next), genesis),
-                (pr_meta_ref(next), genesis),
-                (pr_source_ref(next), source_head),
-                (pr_base_ref(next), base_head),
+                (pr_head_ref(next), event_oid),
+                (pr_meta_ref(next), event_oid),
+                (pr_source_ref(next), source_oid),
+                (pr_base_ref(next), base_oid),
             ];
             // Counter CAS line: expected old (or zeros to require absence).
             let old = counter_tip
@@ -479,10 +511,7 @@ impl EventStore {
                 lines.push(format!("update {r} {oid} {ZERO_OID}"));
             }
             match self.run_update_ref_stdin(&lines) {
-                Ok(()) => {
-                    let _ = merge_base; // recorded in pr.created by the CLI
-                    return Ok(next);
-                }
+                Ok(()) => return Ok(next),
                 Err(e) => {
                     // Counter first: if it moved, a concurrent allocator won →
                     // retry with a fresh id.
@@ -506,38 +535,6 @@ impl EventStore {
             }
         }
         Err(StoreError::Exhausted)
-    }
-
-    /// Atomically create the four PR refs (head/meta/source/base) with expected
-    /// absence. head/meta point at a genesis root; source/base pin the
-    /// immutable snapshot OIDs. Any pre-existing ref aborts the whole
-    /// transaction with `RefExists` — nothing is partially created.
-    pub fn pr_first_allocation(
-        &self,
-        pr_id: u64,
-        source_head: Oid,
-        base_head: Oid,
-        _merge_base: Oid,
-    ) -> Result<(), StoreError> {
-        let genesis = self.genesis_oid()?;
-        let plan = [
-            (pr_head_ref(pr_id), genesis),
-            (pr_meta_ref(pr_id), genesis),
-            (pr_source_ref(pr_id), source_head),
-            (pr_base_ref(pr_id), base_head),
-        ];
-        // Pre-flight: detect pre-existing refs so we can surface RefExists
-        // instead of a generic update-ref failure.
-        for (r, _) in &plan {
-            if self.current_tip(r)?.is_some() {
-                return Err(StoreError::RefExists(r.clone()));
-            }
-        }
-        let lines: Vec<String> = plan
-            .iter()
-            .map(|(r, oid)| format!("update {r} {oid} {ZERO_OID}"))
-            .collect();
-        self.run_update_ref_stdin(&lines)
     }
 
     /// Low-level accessor for tests and the CLI layer.

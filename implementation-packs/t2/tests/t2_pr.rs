@@ -102,17 +102,73 @@ fn pr_create_show_snapshot() {
     // Snapshot refs pinned atomically.
     assert!(ref_oid(&dir, "refs/forge/prs/1/head").is_some());
     assert!(ref_oid(&dir, "refs/forge/prs/1/meta").is_some());
+    let head_oid = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+    let meta_oid = ref_oid(&dir, "refs/forge/prs/1/meta").unwrap();
+    assert_eq!(
+        head_oid, meta_oid,
+        "head and meta must point at the same pr.created snapshot commit"
+    );
     let src = ref_oid(&dir, "refs/forge/prs/1/source").unwrap();
     let base = ref_oid(&dir, "refs/forge/prs/1/base").unwrap();
     assert_eq!(src, git(&dir, &["rev-parse", "refs/heads/feature"]).1);
     assert_eq!(base, git(&dir, &["rev-parse", "refs/heads/main"]).1);
 
-    let (cs, os, es) = forge(&dir, &["forge", "pr", "show", "1"]);
-    assert_eq!(cs, 0, "pr show failed: {es}");
-    assert!(os.contains("Add feature"), "show output: {os}");
-    assert!(os.contains("feature"), "show source: {os}");
-    assert!(os.contains("main"), "show base: {os}");
-    assert!(os.contains("no review yet"), "show decision: {os}");
+    let cs = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert_eq!(cs.0, 0, "pr show failed: {}", cs.2);
+    assert!(cs.1.contains("Add feature"), "show output: {}", cs.1);
+    assert!(cs.1.contains("feature"), "show source: {}", cs.1);
+    assert!(cs.1.contains("main"), "show base: {}", cs.1);
+    assert!(cs.1.contains("no review yet"), "show decision: {}", cs.1);
+
+    // The shared commit must carry a real pr.created event (not a bare genesis
+    // root): `.forge/event.json` is present and encodes kind=pr.created + title.
+    let (ct, ot, et) = git(&dir, &["show", &format!("{head_oid}:.forge/event.json")]);
+    assert_eq!(ct, 0, "head commit must carry .forge/event.json: {et}");
+    assert!(
+        ot.contains("\"pr.created\""),
+        "event kind must be pr.created: {ot}"
+    );
+    assert!(
+        ot.contains("Add feature"),
+        "event body must carry the PR title: {ot}"
+    );
+}
+
+#[test]
+fn pr_create_collision_leaves_no_partial_state() {
+    let dir = tmpdir("collision");
+    init_repo(&dir);
+    make_feature(&dir, "feature", "feat\n");
+    let src_oid = git(&dir, &["rev-parse", "refs/heads/feature"]).1;
+    // Pre-create the source ref PR #1 would target → forced collision.
+    let (cu, _, eu) = git(&dir, &["update-ref", "refs/forge/prs/1/source", &src_oid]);
+    assert_eq!(cu, 0, "pre-create update-ref failed: {eu}");
+
+    let (c, _, e) = forge(
+        &dir,
+        &[
+            "forge", "pr", "create", "--source", "feature", "--base", "main", "T",
+        ],
+    );
+    assert_ne!(c, 0, "pr create must fail on ref collision");
+    assert!(
+        e.contains("already exists") || e.contains("exist"),
+        "stderr: {e}"
+    );
+
+    // Counter untouched; head/meta/base absent; pre-existing source unchanged.
+    assert!(
+        ref_oid(&dir, "refs/forge/meta/counter").is_none(),
+        "counter must not be created on a failed create"
+    );
+    assert!(ref_oid(&dir, "refs/forge/prs/1/head").is_none());
+    assert!(ref_oid(&dir, "refs/forge/prs/1/meta").is_none());
+    assert!(ref_oid(&dir, "refs/forge/prs/1/base").is_none());
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/source").unwrap(),
+        src_oid,
+        "pre-existing source ref must be untouched"
+    );
 }
 
 #[test]

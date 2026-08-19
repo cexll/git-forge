@@ -323,7 +323,7 @@ fn counter_collision_aborts_without_partial_state() {
 }
 
 #[test]
-fn pr_first_allocation_creates_four_refs_atomically() {
+fn create_pr_creates_head_meta_source_base_atomically() {
     let dir = tmpdir("pralloc");
     let store = EventStore::init(&dir).unwrap();
     let repo = store.repo();
@@ -348,34 +348,87 @@ fn pr_first_allocation_creates_four_refs_atomically() {
     let merge_base = repo.merge_base(base, head).unwrap();
     assert_eq!(merge_base, base, "head descends from base; one merge base");
 
-    store
-        .pr_first_allocation(7, head, base, merge_base)
+    let id = store
+        .create_pr("PR title", "feature", "main", head, base, merge_base)
         .unwrap();
-    assert!(repo.find_reference(&pr_head_ref(7)).is_ok());
-    assert!(repo.find_reference(&pr_meta_ref(7)).is_ok());
-    assert!(repo.find_reference(&pr_source_ref(7)).is_ok());
-    assert!(repo.find_reference(&pr_base_ref(7)).is_ok());
+    assert_eq!(id, 1, "first PR gets id 1");
+
+    // head and meta point at the SAME pr.created event commit; source/base pin
+    // the immutable snapshot OIDs.
+    let head_tip = repo
+        .find_reference(&pr_head_ref(1))
+        .unwrap()
+        .target()
+        .unwrap();
+    let meta_tip = repo
+        .find_reference(&pr_meta_ref(1))
+        .unwrap()
+        .target()
+        .unwrap();
     assert_eq!(
-        repo.find_reference(&pr_source_ref(7)).unwrap().target(),
+        head_tip, meta_tip,
+        "head must equal meta (same snapshot commit)"
+    );
+    let head_commit = repo.find_commit(head_tip).unwrap();
+    assert_eq!(
+        head_commit.parent_ids().count(),
+        1,
+        "pr.created commit's parent is the genesis root"
+    );
+    // The event payload carries the snapshot fields.
+    let body = git_forge::event::Event::from_json(
+        std::str::from_utf8(
+            head_commit
+                .tree()
+                .unwrap()
+                .get_path(std::path::Path::new(".forge/event.json"))
+                .unwrap()
+                .to_object(repo)
+                .unwrap()
+                .as_blob()
+                .unwrap()
+                .content(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(body.kind, EventKind::PrCreated);
+    assert_eq!(body.entity_id, 1);
+    assert_eq!(body.body.get("title").unwrap().as_str(), Some("PR title"));
+    let source_head_s = head.to_string();
+    let base_head_s = base.to_string();
+    let merge_base_s = merge_base.to_string();
+    assert_eq!(
+        body.body.get("source_head").unwrap().as_str(),
+        Some(source_head_s.as_str())
+    );
+    assert_eq!(
+        body.body.get("base_head").unwrap().as_str(),
+        Some(base_head_s.as_str())
+    );
+    assert_eq!(
+        body.body.get("merge_base").unwrap().as_str(),
+        Some(merge_base_s.as_str())
+    );
+    assert_eq!(
+        repo.find_reference(&pr_source_ref(1)).unwrap().target(),
         Some(head)
     );
     assert_eq!(
-        repo.find_reference(&pr_base_ref(7)).unwrap().target(),
+        repo.find_reference(&pr_base_ref(1)).unwrap().target(),
         Some(base)
     );
 
-    let res = store.pr_first_allocation(7, head, base, merge_base);
-    assert!(res.is_err());
-    assert!(matches!(res, Err(StoreError::RefExists(_))));
-    assert_eq!(
-        repo.find_reference(&pr_source_ref(7)).unwrap().target(),
-        Some(head),
-        "refs unchanged after failed collision"
-    );
+    // Next allocation takes id 2; the counter advanced to {next:2}.
+    let id2 = store
+        .create_pr("second", "feature", "main", head, base, merge_base)
+        .unwrap();
+    assert_eq!(id2, 2, "second PR gets id 2");
+    assert!(repo.find_reference(&pr_head_ref(2)).is_ok());
 }
 
 #[test]
-fn pr_first_allocation_rejects_preexisting_ref() {
+fn create_pr_rejects_preexisting_ref_without_touching_counter() {
     let dir = tmpdir("prreject");
     let store = EventStore::init(&dir).unwrap();
     let repo = store.repo();
@@ -394,11 +447,30 @@ fn pr_first_allocation_rejects_preexisting_ref() {
         )
         .unwrap();
     let merge_base = repo.merge_base(base, head).unwrap();
-    repo.reference(&pr_head_ref(3), head, false, "pre").unwrap();
-    let res = store.pr_first_allocation(3, head, base, merge_base);
+    // Pre-create the ref the fresh counter would target (#1) → forced collision.
+    repo.reference(&pr_head_ref(1), head, false, "pre").unwrap();
+    let res = store.create_pr("T", "feature", "main", head, base, merge_base);
     assert!(res.is_err());
     assert!(matches!(res, Err(StoreError::RefExists(_))));
-    assert!(repo.find_reference(&pr_meta_ref(3)).is_err());
-    assert!(repo.find_reference(&pr_source_ref(3)).is_err());
-    assert!(repo.find_reference(&pr_base_ref(3)).is_err());
+    assert!(
+        repo.find_reference(COUNTER_REF).is_err(),
+        "counter must be untouched by a failed create"
+    );
+    assert!(
+        repo.find_reference(&pr_meta_ref(1)).is_err(),
+        "no partial meta ref after failed create"
+    );
+    assert!(
+        repo.find_reference(&pr_source_ref(1)).is_err(),
+        "no partial source ref after failed create"
+    );
+    assert!(
+        repo.find_reference(&pr_base_ref(1)).is_err(),
+        "no partial base ref after failed create"
+    );
+    // The pre-created head ref is untouched.
+    assert_eq!(
+        repo.find_reference(&pr_head_ref(1)).unwrap().target(),
+        Some(head)
+    );
 }

@@ -1,0 +1,12 @@
+[package]
+name = "git-forge"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+
+[dependencies]
+git2 = "0.20"
+
+[lib]
+name = "git_forge"
+path = "src/lib.rs"
