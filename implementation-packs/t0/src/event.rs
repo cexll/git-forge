@@ -157,9 +157,8 @@ impl Event {
         }
     }
 
-    /// Constructs an event with caller-supplied provenance. The caller owns
-    /// UUID validity; parse/serialize accept any string as long as round-trip
-    /// preserves it.
+    /// Constructs an event with caller-supplied provenance. Rejects non-UUID-v4
+    /// ids; the caller owns cryptographic provenance, the schema owner owns shape.
     pub fn new_with_id(
         id: &str,
         kind: EventKind,
@@ -167,8 +166,11 @@ impl Event {
         entity_id: u64,
         actor: &str,
         body: HashMap<String, JsonValue>,
-    ) -> Self {
-        Self {
+    ) -> Option<Self> {
+        if !is_uuid_v4(id) {
+            return None;
+        }
+        Some(Self {
             v: 1,
             id: id.to_string(),
             kind,
@@ -177,14 +179,20 @@ impl Event {
             ts: "1970-01-01T00:00:00Z".to_string(),
             actor: actor.to_string(),
             body,
-        }
+        })
     }
 
     pub fn from_json(input: &str) -> Option<Self> {
         let root = parse_json_value(input)?;
         let object = root.as_object()?;
         let v = object.get("v")?.as_u64()?;
+        if v != 1 {
+            return None;
+        }
         let id = object.get("id")?.as_str()?.to_string();
+        if !is_uuid_v4(&id) {
+            return None;
+        }
         let kind = EventKind::from_str(object.get("kind")?.as_str()?)?;
         let entity = object.get("entity")?.as_str()?.to_string();
         let entity_id = object.get("entity_id")?.as_u64()?;

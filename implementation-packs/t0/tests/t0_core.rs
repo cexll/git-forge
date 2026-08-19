@@ -17,6 +17,7 @@ fn event(kind: EventKind, entity: &str, id: u64, actor: &str, body: &[(&str, Jso
         actor,
         map,
     )
+    .expect("fixture id is uuid v4")
 }
 
 #[test]
@@ -52,6 +53,35 @@ fn generated_id_is_uuid_v4_shape() {
     );
     assert!(is_uuid_v4(&e.id), "id={}", e.id);
     assert!(!is_uuid_v4("not-a-uuid"));
+}
+
+#[test]
+fn rejects_non_v1_schema_and_bad_uuid() {
+    let good = event(
+        EventKind::IssueCreated,
+        "issue",
+        1,
+        "a@x",
+        &[("title", JsonValue::String("T".into()))],
+    );
+    let bad_version = good.to_json().replacen("\"v\":1", "\"v\":2", 1);
+    assert!(Event::from_json(&bad_version).is_none());
+
+    // Variant nibble '1' (4th group) is outside RFC 4122 variant [89ab];
+    // note "badbadbadbad" would NOT be a valid negative fixture: b/a/d are all
+    // hex digits, so it is a well-formed v4 shape and must be accepted.
+    let bad_id = good.to_json().replacen(&good.id, "11111111-1111-4111-1111-111111111111", 1);
+    assert!(Event::from_json(&bad_id).is_none());
+
+    assert!(Event::new_with_id(
+        "not-a-uuid",
+        EventKind::IssueCreated,
+        "issue",
+        1,
+        "a@x",
+        HashMap::new(),
+    )
+    .is_none());
 }
 
 #[test]
