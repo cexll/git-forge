@@ -21,13 +21,16 @@ repository. Forge-state sync/refspec wiring across clones is L2.
 ## Install
 
 ```sh
-cargo build --release
-# put git-forge itself on PATH so `git forge ...` dispatches (git runs
-# `git-forge` found on PATH)
-ln -s "$(pwd)/target/release/git-forge" /usr/local/bin/git-forge
-# optional: thin wrappers — git finds git-<cmd> on PATH too
-ln -s "$(pwd)/target/release/git-forge" /usr/local/bin/git-issue
-ln -s "$(pwd)/target/release/git-forge" /usr/local/bin/git-pr
+# Build and install `git-forge` itself so `git forge ...` dispatches.
+# Cargo installs into ~/.cargo/bin by default (already on your PATH when
+# rustup/cargo is set up).
+cargo install --path .
+
+# Optional: thin wrappers in a user-writable PATH dir (git finds git-<cmd>
+# on PATH). Choose one already on PATH, e.g.:
+mkdir -p "$HOME/.local/bin"
+ln -s "$HOME/.cargo/bin/git-forge" "$HOME/.local/bin/git-issue"
+ln -s "$HOME/.cargo/bin/git-forge" "$HOME/.local/bin/git-pr"
 ```
 
 `git forge ...` is the single real namespace; `git issue`/`git pr` are thin
