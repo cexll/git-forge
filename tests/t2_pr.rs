@@ -283,6 +283,42 @@ fn pr_create_rejects_self_and_same_commit() {
 }
 
 #[test]
+fn pr_create_zero_merge_bases_asks_to_deepen_or_marks_unrelated() {
+    let dir = tmpdir("zerobase");
+    init_repo(&dir);
+    // Two truly unrelated roots (orphan histories, no common ancestor).
+    let (c0, _, e0) = git(&dir, &["checkout", "--orphan", "z1"]);
+    assert!(c0 == 0, "orphan z1: {e0}");
+    let _ = std::fs::remove_file(dir.join("base.txt"));
+    std::fs::write(dir.join("a.txt"), "a\n").unwrap();
+    let (c, _, e) = git(&dir, &["add", "a.txt"]);
+    assert!(c == 0, "add: {e}");
+    let (c, _, e) = git(&dir, &["commit", "-q", "-m", "z1"]);
+    assert!(c == 0, "commit z1: {e}");
+    let (c0, _, e0) = git(&dir, &["checkout", "--orphan", "z2"]);
+    assert!(c0 == 0, "orphan z2: {e0}");
+    let _ = std::fs::remove_file(dir.join("a.txt"));
+    std::fs::write(dir.join("b.txt"), "b\n").unwrap();
+    let (c, _, e) = git(&dir, &["add", "b.txt"]);
+    assert!(c == 0, "add: {e}");
+    let (c, _, e) = git(&dir, &["commit", "-q", "-m", "z2"]);
+    assert!(c == 0, "commit z2: {e}");
+
+    let (c, _, e) = forge(
+        &dir,
+        &[
+            "forge", "pr", "create", "--source", "z1", "--base", "z2", "T",
+        ],
+    );
+    assert_ne!(c, 0, "zero merge-base must be rejected");
+    assert!(
+        e.contains("deepen") || e.contains("unrelated"),
+        "stderr must guide the user: {e}"
+    );
+    assert!(ref_oid(&dir, "refs/forge/prs/1/head").is_none());
+}
+
+#[test]
 fn pr_create_rejects_multiple_merge_bases() {
     let dir = tmpdir("crisscross");
     init_repo(&dir);

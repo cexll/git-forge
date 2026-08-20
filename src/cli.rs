@@ -296,25 +296,25 @@ fn require_single_merge_base(
         .args(["merge-base", "--all", &a.to_string(), &b.to_string()])
         .output()
         .map_err(|e| format!("git merge-base failed: {e}"))?;
+    let stdout =
+        std::str::from_utf8(&out.stdout).map_err(|_| "merge-base output not utf8".to_string())?;
+    let lines: Vec<&str> = stdout.trim().lines().filter(|l| !l.is_empty()).collect();
+    // `git merge-base --all` exits 1 with EMPTY stdout when the two commits
+    // share no common ancestor (unrelated histories, or shallow/incomplete
+    // history). Exit 128 (nonempty stderr) is a genuine git failure. Without
+    // this classification the deepen/unshallow guidance below is dead code.
     if !out.status.success() {
-        return Err("git merge-base failed".into());
+        if out.status.code() == Some(1) && lines.is_empty() {
+            return Err(zero_merge_base_error(repo));
+        }
+        return Err(format!(
+            "git merge-base failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        ));
     }
-    let lines: Vec<&str> = std::str::from_utf8(&out.stdout)
-        .map_err(|_| "merge-base output not utf8".to_string())?
-        .trim()
-        .lines()
-        .filter(|l| !l.is_empty())
-        .collect();
     if lines.len() != 1 {
         if lines.is_empty() {
-            let shallow = repo.is_shallow();
-            if shallow {
-                return Err(
-                    "no merge base (shallow history) — deepen/unshallow the repository first"
-                        .into(),
-                );
-            }
-            return Err("no merge base — the source/base histories are unrelated, or history is shallow; deepen/unshallow before creating a PR".into());
+            return Err(zero_merge_base_error(repo));
         }
         return Err(format!(
             "multiple merge bases ({}) suggest a criss-cross history; cannot create the PR",
@@ -325,6 +325,16 @@ fn require_single_merge_base(
         .trim()
         .parse::<git2::Oid>()
         .map_err(|_| "invalid merge-base oid".to_string())
+}
+
+/// User-facing error for zero merge bases: unrelated histories (no common
+/// ancestor) vs shallow/incomplete history (must deepen/unshallow).
+fn zero_merge_base_error(repo: &git2::Repository) -> String {
+    if repo.is_shallow() {
+        "no merge base (shallow history) — deepen/unshallow the repository first".to_string()
+    } else {
+        "no merge base — the source/base histories are unrelated, or history is shallow; deepen/unshallow before creating a PR".to_string()
+    }
 }
 
 /// `git forge pr create --source <branch> --base <branch> <title>`
@@ -843,6 +853,15 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
         return Err(format!("failed to create temporary worktree: {err_wt}"));
     }
 
+    // Release the path lock (drop handle + remove file) so a concurrent
+    // same-repo merge can reuse the path. Must run on EVERY early return after
+    // the worktree was added (strategy failures go through cleanup_failed_worktree
+    // which also drops the file; removal/list/barrier/finalize returns call this).
+    let release_lock = |lock_handle: &mut Option<std::fs::File>, path: &std::path::Path| {
+        *lock_handle = None;
+        let _ = std::fs::remove_file(path.with_extension("lock"));
+    };
+
     // Execute the strategy inside the worktree. result_commit = worktree HEAD.
     let result_commit = match strategy {
         "rebase" => {
@@ -910,6 +929,22 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
 
     // Remove the temporary worktree, then verify it is gone. worktree
     // remove/list run from the repository.
+    // Debug-only test seam (VAL-027): lock the temp worktree so
+    // `git worktree remove --force` fails deterministically, exercising the
+    // removal-failure branch (leftover report + best-effort pending-ref
+    // cleanup). Inert in release builds and when the env var is unset.
+    #[cfg(debug_assertions)]
+    if std::env::var("GIT_FORGE_TEST_FAIL_WORKTREE_REMOVE").as_deref() == Ok("1") {
+        let (lock_ok, _, lock_err) = git_in(
+            &repo_dir,
+            &["worktree", "lock", tmp.to_str().unwrap_or("/tmp/none")],
+        );
+        if !lock_ok {
+            return Err(format!(
+                "test seam: failed to lock temp worktree for removal-failure injection: {lock_err}"
+            ));
+        }
+    }
     let (ok_rm, _o, err_rm) = git_in(
         &repo_dir,
         &[
@@ -923,6 +958,7 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
         // Best-effort: remove the pending result ref (CAS expected OID); the
         // worktree itself stays (can't force-clean a failed removal safely).
         // Report only if the pending ref remains.
+        release_lock(&mut lock_handle, &tmp);
         let left = match store.delete_pending_result_ref(id, result_commit) {
             Ok(true) | Ok(false) => false,
             Err(_) => true,
@@ -943,6 +979,7 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
     // sibling lock — deleting another process's worktree is never safe).
     // AC-005h: verify the disposable directory is actually gone.
     if tmp.exists() {
+        release_lock(&mut lock_handle, &tmp);
         let left = match store.delete_pending_result_ref(id, result_commit) {
             Ok(true) | Ok(false) => false,
             Err(_) => true,
@@ -961,6 +998,7 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
     if !ok_l {
         // Best-effort: remove the pending result ref; cannot verify the
         // worktree is gone → hard abort before any ref update.
+        release_lock(&mut lock_handle, &tmp);
         let left = match store.delete_pending_result_ref(id, result_commit) {
             Ok(true) | Ok(false) => false,
             Err(_) => true,
@@ -993,8 +1031,7 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
     }
     // Worktree removed AND verified gone: release our path lock so a concurrent
     // same-repo merge can reuse the path, then run barrier + final transaction.
-    drop(lock_handle.take());
-    let _ = std::fs::remove_file(tmp.with_extension("lock"));
+    release_lock(&mut lock_handle, &tmp);
 
     // Test-only pending-window barrier: not part of the user CLI contract.
     #[cfg(debug_assertions)]
@@ -1083,7 +1120,7 @@ fn cleanup_failed_worktree(
 /// pending `/result` ref exists (and the temp worktree is gone) but before the
 /// final transaction:
 ///   1. atomically create `<dir>/ready` (O_CREAT|O_EXCL);
-///   2. poll for `<dir>/release` (bounded 120s deadline);
+///   2. poll for `<dir>/release` (bounded 30s deadline);
 ///   3. on success, delete `<dir>/release` and continue;
 ///   4. on deadline, remove both sentinels best-effort and fail the merge with
 ///      no ref updates.

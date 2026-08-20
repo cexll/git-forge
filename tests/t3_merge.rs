@@ -523,6 +523,80 @@ fn merge_flag_parser_accepts_explicit_and_rejects_conflicts() {
 }
 
 #[test]
+fn worktree_removal_failure_reports_and_cleans_pending_ref() {
+    let dir = tmpdir("rmfail");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "rm fail PR");
+    checkout(&dir, "feature");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    // The seam locks the temp worktree so `worktree remove --force` fails.
+    let out = Command::new(bin)
+        .args(["forge", "pr", "merge", "1"])
+        .current_dir(&dir)
+        .env("GIT_FORGE_TEST_FAIL_WORKTREE_REMOVE", "1")
+        .output()
+        .unwrap();
+    let code = out.status.code().unwrap_or(-1);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(code, 0, "merge must fail on removal failure");
+    assert!(
+        stderr.contains("removal failed")
+            || stderr.contains("still registered")
+            || stderr.contains("worktree"),
+        "stderr must report the leftover: {stderr}"
+    );
+    // No ref changes: base and PR chain unchanged; result ref best-effort cleaned.
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged"
+    );
+    let (cs, os, _) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert!(cs == 0, "pr show must succeed after failed removal");
+    assert!(
+        !os.contains("merged"),
+        "no pr.merge on removal failure: {os}"
+    );
+    // On removal failure: best-effort delete of pending /result (CAS expected
+    // oid) succeeds, so the ref is gone; base/PR chain unchanged.
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_none(),
+        "pending result ref must be cleaned best-effort after removal failure"
+    );
+    // Hygiene: unlock + remove the intentionally locked temp worktree, then
+    // verify the EXACT sibling lock file for that path was released.
+    let (wl, out2, _) = git(&dir, &["worktree", "list", "--porcelain"]);
+    assert_eq!(wl, 0);
+    let mut removed_any = false;
+    let mut temp_path: Option<std::path::PathBuf> = None;
+    for line in out2.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            if p.contains("git-forge-pr1-merge") {
+                temp_path = Some(std::path::PathBuf::from(p));
+                let (u, _, eu) = git(&dir, &["worktree", "unlock", p]);
+                assert!(u == 0, "unlock failed: {eu}");
+                let (r, _, er) = git(&dir, &["worktree", "remove", "--force", p]);
+                assert!(r == 0, "remove failed: {er}");
+                removed_any = true;
+            }
+        }
+    }
+    assert!(
+        removed_any,
+        "expected the locked temp worktree to be cleaned"
+    );
+    if let Some(tp) = temp_path {
+        let lock = std::path::PathBuf::from(format!("{}.lock", tp.display()));
+        assert!(
+            !lock.exists(),
+            "sibling lock file must be released on removal failure: {}",
+            lock.display()
+        );
+    }
+}
+
+#[test]
 fn nonexistent_pr_merge_is_clean_error() {
     let dir = tmpdir("nopr");
     init_repo(&dir);
