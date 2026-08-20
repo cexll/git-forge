@@ -250,35 +250,43 @@ fn issue_help() -> String {
 
 // ─────────────────────────── PR commands ───────────────────────────
 
-/// Resolve a `--source`/`--base` argument to a canonical local branch OID, or
-/// an Err with a clear message. Accepts only `refs/heads/<name>`: tags,
-/// remote-tracking refs, OIDs, and revision expressions are rejected.
-fn resolve_local_branch(store: &EventStore, arg: &str) -> Result<git2::Oid, String> {
+/// Resolve a `--source`/`--base` argument to its canonical bare local branch
+/// name and OID. Accepts `refs/heads/<name>` (full form) and `<name>` (bare
+/// form; slashes are legal inside branch names, e.g. `feat/foo`); rejects
+/// tags, remote-tracking refs, OIDs, and revision expressions. The returned
+/// name is always the bare branch name, so downstream construction of
+/// `refs/heads/{name}` (merge, checked-out guard) is always correct.
+fn resolve_local_branch(store: &EventStore, arg: &str) -> Result<(String, git2::Oid), String> {
     if arg.is_empty() {
         return Err("branch name must be non-empty".into());
     }
-    if arg.starts_with("refs/heads/") {
-        return store
-            .repo()
-            .find_reference(arg)
-            .ok()
-            .and_then(|r| r.target())
-            .ok_or_else(|| format!("no such local branch '{arg}'"));
-    }
-    // Must be a bare local branch name (no refs/tags/, no remotes/, no /
-    // separator suggesting a rev expression, not a 40-hex OID).
-    if arg.contains('/') {
-        return Err(format!(
-            "'{arg}' is not a canonical local branch; use a plain branch name (tags, remote-tracking refs, OIDs, and revision expressions are rejected)"
-        ));
-    }
-    let full = format!("refs/heads/{arg}");
-    store
+    let (name, full) = if let Some(stripped) = arg.strip_prefix("refs/heads/") {
+        // Full form: must be a real refs/heads ref; the canonical name is the
+        // stripped remainder (may itself contain slashes, e.g. feat/foo).
+        if stripped.is_empty() {
+            return Err(format!(
+                "'{arg}' is not a canonical local branch; use a plain branch name (tags, remote-tracking refs, OIDs, and revision expressions are rejected)"
+            ));
+        }
+        (stripped.to_string(), arg.to_string())
+    } else {
+        // Bare form: resolve as refs/heads/<arg>. Slashes are legal inside
+        // branch names, so no early '/' rejection — a name that does not
+        // resolve is rejected below. `refs/tags/...`, `refs/remotes/...`,
+        // OIDs, and revision expressions all fail resolution and are rejected.
+        (arg.to_string(), format!("refs/heads/{arg}"))
+    };
+    let oid = store
         .repo()
         .find_reference(&full)
         .ok()
         .and_then(|r| r.target())
-        .ok_or_else(|| format!("no such local branch '{arg}'"))
+        .ok_or_else(|| {
+            format!(
+                "'{arg}' is not a canonical local branch; use a plain branch name (tags, remote-tracking refs, OIDs, and revision expressions are rejected)"
+            )
+        })?;
+    Ok((name, oid))
 }
 
 /// `git merge-base --all <a> <b>` count must be exactly 1. Zero covers
@@ -380,8 +388,8 @@ fn cmd_pr_create(store: &EventStore, args: &[String]) -> Result<String, String> 
         return Err("PR title is required and must be non-empty".into());
     }
 
-    let source_oid = resolve_local_branch(store, &source)?;
-    let base_oid = resolve_local_branch(store, &base)?;
+    let (source, source_oid) = resolve_local_branch(store, &source)?;
+    let (base, base_oid) = resolve_local_branch(store, &base)?;
     if source == base {
         return Err("source and base branch must differ (no self-PR)".into());
     }

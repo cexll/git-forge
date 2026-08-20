@@ -253,6 +253,84 @@ fn pr_create_rejects_non_local_refs() {
 }
 
 #[test]
+fn pr_create_accepts_slashed_local_branch() {
+    let dir = tmpdir("slashbranch");
+    init_repo(&dir);
+    // Hierarchical local branch name with a slash (refs/heads/feat/thing)
+    make_feature(&dir, "feat/thing", "feat\n");
+    let (c, o, e) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "create",
+            "--source",
+            "feat/thing",
+            "--base",
+            "main",
+            "T",
+        ],
+    );
+    assert_eq!(c, 0, "slashed local branch must be accepted: {e} {o}");
+    let (cs, os, _) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert_eq!(cs, 0);
+    assert!(os.contains("feat/thing"), "source_ref shown: {os}");
+    // A slashed name that is NOT a local branch is still rejected.
+    let (c2, _, e2) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "create",
+            "--source",
+            "nope/thing",
+            "--base",
+            "main",
+            "T2",
+        ],
+    );
+    assert_ne!(c2, 0, "nonexistent slashed branch must error: {e2}");
+    assert!(
+        e2.contains("branch") || e2.contains("local"),
+        "stderr: {e2}"
+    );
+    assert!(ref_oid(&dir, "refs/forge/prs/2/head").is_none());
+
+    // Full-form refs/heads/... must canonicalize to the bare name for BOTH
+    // storage and the merge path (merge builds refs/heads/{base_ref}).
+    let (c3, _, e3) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "create",
+            "--source",
+            "refs/heads/feat/thing",
+            "--base",
+            "refs/heads/main",
+            "T3",
+        ],
+    );
+    assert_eq!(c3, 0, "full-form refs must be accepted: {e3}");
+    let (cs3, os3, _) = forge(&dir, &["forge", "pr", "show", "2"]);
+    assert_eq!(cs3, 0);
+    assert!(
+        os3.contains("source: feat/thing"),
+        "canonical bare source stored: {os3}"
+    );
+    assert!(
+        os3.contains("base: main"),
+        "canonical bare base stored: {os3}"
+    );
+    let (cr, _, er) = forge(&dir, &["forge", "pr", "review", "2", "--approve"]);
+    assert_eq!(cr, 0, "review full-form PR: {er}");
+    let (ch, _, eh) = git(&dir, &["checkout", "-q", "feat/thing"]);
+    assert_eq!(ch, 0, "checkout feat/thing: {eh}");
+    let (cm, _, em) = forge(&dir, &["forge", "pr", "merge", "2"]);
+    assert_eq!(cm, 0, "merge full-form PR: {em}");
+}
+
+#[test]
 fn pr_create_rejects_self_and_same_commit() {
     let dir = tmpdir("selfpr");
     init_repo(&dir);
