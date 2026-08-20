@@ -537,6 +537,10 @@ fn cmd_pr_review(store: &EventStore, args: &[String]) -> Result<String, String> 
     }
     let decision = decision
         .ok_or_else(|| String::from("usage: git forge pr review <n> --approve|--reject"))?;
+    let r = crate::store::pr_head_ref(id);
+    if !store_has_ref(store, &r) {
+        return Err(format!("PR #{id} does not exist"));
+    }
     // FR-005: inline review comments anchor to a commit hash. --file/--line
     // are only meaningful as inline comments, so they require the anchor;
     // an unanchored inline review would not reference anything immutable.
@@ -568,10 +572,6 @@ fn cmd_pr_review(store: &EventStore, args: &[String]) -> Result<String, String> 
         ),
         None => None,
     };
-    let r = crate::store::pr_head_ref(id);
-    if !store_has_ref(store, &r) {
-        return Err(format!("PR #{id} does not exist"));
-    }
     let mut body = HashMap::new();
     body.insert("decision".into(), json_str(&decision));
     if let Some(f) = file {

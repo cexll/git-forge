@@ -589,6 +589,41 @@ fn inline_review_requires_commit_anchor() {
 }
 
 #[test]
+fn review_precedence_nonexistent_pr_before_invalid_anchor() {
+    let dir = tmpdir("reviewprec");
+    init_repo(&dir);
+    make_feature(&dir, "feature", "feat\n");
+    // Nonexistent PR + bogus anchor: the entity error wins (established
+    // behavior for every other pr subcommand); never resolve/validate the
+    // anchor for a PR that does not exist.
+    let (c, _, e) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "review",
+            "99",
+            "--approve",
+            "--file",
+            "feature.txt",
+            "--line",
+            "1",
+            "--commit",
+            "not-a-commit",
+        ],
+    );
+    assert_ne!(c, 0, "nonexistent PR must be rejected");
+    assert!(
+        e.contains("PR #99 does not exist"),
+        "entity error must precede anchor validation: {e}"
+    );
+    assert!(
+        !e.contains("does not resolve to a commit"),
+        "anchor must not be resolved for a nonexistent PR: {e}"
+    );
+}
+
+#[test]
 fn snapshot_survives_branch_deletion_and_gc() {
     let dir = tmpdir("gc");
     init_repo(&dir);
