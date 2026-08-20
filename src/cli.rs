@@ -1096,7 +1096,7 @@ fn cleanup_failed_worktree(
         _ => {}
     }
     let _ = git_in(tmp, &["clean", "-fd"]);
-    let _ = git_in(
+    let (ok_rm, _o, err_rm) = git_in(
         repo_dir,
         &[
             "worktree",
@@ -1105,11 +1105,24 @@ fn cleanup_failed_worktree(
             tmp.to_str().unwrap_or("/tmp/none"),
         ],
     );
-    // The caller still holds this path's lock handle (cleanup runs from the
-    // strategy branches before the handle is dropped), so removing the
-    // directory here cannot race another merge on the same path. Delete the
-    // directory, then release the lock file so the suffix is reusable.
-    let _ = std::fs::remove_dir_all(tmp);
+    if !ok_rm {
+        // The registration is still live (e.g. the worktree is locked), so
+        // deleting the directory underneath it would leave git's registration
+        // pointing at a path that no longer exists — a dangling worktree
+        // (AC-005d: no registration without its directory). Preserve the
+        // leftover and report it so the operator can unlock/remove it.
+        // Release the sibling lock so the suffix stays reusable.
+        let _ = std::fs::remove_file(tmp.with_extension("lock"));
+        return format!(
+            "git {kind} failed: {cause}; temp worktree removal failed and the \
+             worktree is left at \"{}\" ({err_rm}) — unlock and remove it manually",
+            tmp.display()
+        );
+    }
+    // `git worktree remove` already removed the directory; do NOT run a
+    // recursive delete here (each path is owned by whichever merge holds its
+    // sibling lock — deleting another process's worktree is never safe).
+    // AC-005h: verify the disposable directory is actually gone.
     let _ = std::fs::remove_file(tmp.with_extension("lock"));
     format!("git {kind} failed: {cause}; worktree cleaned up, no ref changes made")
 }

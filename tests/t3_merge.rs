@@ -450,6 +450,90 @@ fn failing_hook_aborts_merge_cleans_worktree() {
 }
 
 #[test]
+fn locked_temp_worktree_on_hook_failure_is_preserved_and_reported() {
+    let dir = tmpdir("lockedhook");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "locked hook PR");
+    checkout(&dir, "feature");
+    // failing pre-merge-commit hook that LOCKS its own (temp) worktree before
+    // failing: `git worktree remove --force` cannot remove a locked worktree,
+    // so the cleanup path must preserve the leftover and report it instead of
+    // deleting the directory under a live registration (AC-005d).
+    let hooks = dir.join(".git").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook_path = hooks.join("pre-merge-commit");
+    std::fs::write(
+        &hook_path,
+        "#!/usr/bin/env bash\ngit worktree lock --reason 'test' \"$(pwd)\"\nexit 1\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let (cm, _, em) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_ne!(cm, 0, "failing hook must abort merge: {em}");
+    assert!(
+        em.contains("worktree is left at"),
+        "stderr must report the leftover worktree path: {em}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged"
+    );
+    // The locked temp worktree must still be REGISTERED with its directory
+    // intact (never a dangling registration), and reported as leftover.
+    let (wl, out, _) = git(&dir, &["worktree", "list", "--porcelain"]);
+    assert_eq!(wl, 0);
+    let mut leftover: Option<String> = None;
+    for line in out.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            if p.contains("git-forge-pr1-merge") {
+                assert!(
+                    std::path::Path::new(p).is_dir(),
+                    "leftover worktree directory must still exist: {p}"
+                );
+                leftover = Some(p.to_string());
+            }
+        }
+    }
+    assert!(
+        leftover.is_some(),
+        "locked temp worktree must remain registered after cleanup: {out}"
+    );
+    // The stderr message must carry the EXACT leftover path, delimited by
+    // quotes (actionable contract: an operator can unlock/remove it without
+    // re-deriving it; quoting keeps paths with spaces parseable). macOS /var
+    // is a symlink to /private/var; git canonicalizes the registration while
+    // temp_dir() does not, so compare canonical forms.
+    let reported = em
+        .split("worktree is left at ")
+        .nth(1)
+        .and_then(|s| s.split('"').nth(1))
+        .unwrap_or_default();
+    let canon = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
+    assert_eq!(
+        canon(reported),
+        canon(leftover.as_deref().unwrap_or("")),
+        "reported leftover path must match the registered worktree: {em}"
+    );
+    // No pr.merge; hygiene: unlock + remove the leftover to leave no residue.
+    let (_cs, os, _) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert!(!os.contains("merged"), "no pr.merge on hook failure: {os}");
+    let p = leftover.unwrap();
+    let (u, _, eu) = git(&dir, &["worktree", "unlock", &p]);
+    assert!(u == 0, "unlock failed: {eu}");
+    let (r, _, er) = git(&dir, &["worktree", "remove", "--force", &p]);
+    assert!(r == 0, "remove failed: {er}");
+    let lock = std::path::PathBuf::from(format!("{p}.lock"));
+    assert!(
+        !lock.exists(),
+        "sibling lock file must be released on cleanup failure: {}",
+        lock.display()
+    );
+}
+
+#[test]
 fn squash_failing_hook_resets_worktree_no_refs() {
     let dir = tmpdir("squashhook");
     init_repo(&dir);
