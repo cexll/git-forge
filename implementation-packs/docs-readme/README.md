@@ -3,8 +3,8 @@
 A local, git-native forge: issues, pull requests, review, and merge inside an
 ordinary git repository — git protocol only, zero resident processes, no
 GitHub synchronization, no second protocol. Forge state lives as event chains
-under `refs/forge/*`, so code and forge state travel through the same
-push/pull refspecs.
+under `refs/forge/*`, so code and forge state can be stored in the same
+repository. Forge-state sync/refspec wiring across clones is L2.
 
 ## What it does
 
@@ -22,7 +22,10 @@ push/pull refspecs.
 
 ```sh
 cargo build --release
-# optional: surface the thin wrappers on PATH (git finds git-<cmd> on PATH)
+# put git-forge itself on PATH so `git forge ...` dispatches (git runs
+# `git-forge` found on PATH)
+ln -s "$(pwd)/target/release/git-forge" /usr/local/bin/git-forge
+# optional: thin wrappers — git finds git-<cmd> on PATH too
 ln -s "$(pwd)/target/release/git-forge" /usr/local/bin/git-issue
 ln -s "$(pwd)/target/release/git-forge" /usr/local/bin/git-pr
 ```
@@ -43,15 +46,18 @@ git forge issue close 1 && git forge issue reopen 1
 # pull requests (both branches must be canonical local refs/heads/*)
 git checkout -b feature
 git commit ...
-git checkout main
 git forge pr create --source feature --base main "add feature"
+git checkout feature          # L1 refuses to merge while the base is checked out
 git forge pr show 1
 git forge pr diff 1                      # base_head...source_head
 git forge pr review 1 --approve
-git forge pr review 1 --reject --file src/lib.rs --line 42 --commit <hash>   # anchored inline
-git forge pr merge 1                     # merge commit
-git forge pr merge 1 --squash
-git forge pr merge 1 --rebase
+git forge pr review 1 --approve --file src/lib.rs --line 42 --commit <hash>   # anchored inline
+# A reject would set the effective decision to reject and block merge; the
+# last review must be an approve before `pr merge` succeeds.
+# Merge strategies are mutually exclusive — a merged PR is terminal:
+git forge pr merge 1                     # merge commit (default)
+# or: git forge pr merge 1 --squash      # single commit
+# or: git forge pr merge 1 --rebase      # linear replay onto the base tip
 ```
 
 The merge runs in a disposable temporary worktree (so a dirty main worktree
