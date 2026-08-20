@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use git_forge::event::{Event, EventKind, JsonValue};
 use git_forge::store::{
@@ -9,15 +10,14 @@ use git_forge::store::{
     COUNTER_REF,
 };
 
+// Process-local monotonic suffix: two tests in this binary may share a `tag`
+// (e.g. "chain") and would collide on pid+nanos alone, racing .git/config.lock
+// when both init the same temp dir in the same instant.
+static NEXT_TMPDIR: AtomicU64 = AtomicU64::new(0);
+
 fn tmpdir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "gf-t1a-{tag}-{}-{:?}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos()
-    ));
+    let n = NEXT_TMPDIR.fetch_add(1, Ordering::Relaxed);
+    let d = std::env::temp_dir().join(format!("gf-t1a-{tag}-{}-{n}", std::process::id()));
     std::fs::create_dir_all(&d).unwrap();
     d
 }

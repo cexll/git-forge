@@ -44,12 +44,24 @@ fn run_forge(argv: &[String]) -> Result<String, String> {
         Some("forge") => match argv.get(1).map(|s| s.as_str()) {
             Some("issue") => git_forge::cli::run_issue(&argv[2..]),
             Some("pr") => git_forge::cli::run_pr(&argv[2..]),
+            Some("help") | Some("-h") | Some("--help") => Ok(top_help()),
             Some(other) => Err(format!("unknown forge subcommand '{other}'")),
             None => Ok("usage: git forge <issue|pr> ...".to_string()),
         },
+        // `git-forge --help` (verify-cli contract): exit 0 with usage.
+        Some("help") | Some("-h") | Some("--help") => Ok(top_help()),
         Some(other) => Err(format!("unknown command '{other}'")),
         None => Ok("usage: git forge <issue|pr> ...".to_string()),
     }
+}
+
+fn top_help() -> String {
+    "usage: git forge <issue|pr> ...\n\
+     \nsubcommands:\n\
+     \x20 issue  new|list|show|comment|close|reopen\n\
+     \x20 pr     create|list|show|comment|review|diff|merge\n\
+     \x20 run `git forge issue --help` / `git forge pr --help` for per-subcommand usage"
+        .to_string()
 }
 
 fn run_wrapper(argv: &[String]) -> Result<String, String> {

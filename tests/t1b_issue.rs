@@ -218,3 +218,13 @@ fn concurrent_comments_both_succeed() {
     assert!(os.contains("from A"), "A comment folded: {os}");
     assert!(os.contains("from B"), "B comment folded: {os}");
 }
+
+#[test]
+fn top_level_help_exits_zero_with_usage() {
+    // AGENTS verification matrix: `just verify-cli` runs the built binary with
+    // `--help` and requires exit 0 with usage output.
+    let dir = tmpdir("help");
+    let (c, o, e) = forge(&dir, &["--help"]);
+    assert_eq!(c, 0, "top-level --help failed: {e}");
+    assert!(o.contains("usage: git forge"), "help output: {o}");
+}
