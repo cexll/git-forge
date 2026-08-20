@@ -501,14 +501,15 @@ fn locked_temp_worktree_on_hook_failure_is_preserved_and_reported() {
         leftover.is_some(),
         "locked temp worktree must remain registered after cleanup: {out}"
     );
-    // The stderr message must carry the EXACT leftover path (actionable
-    // contract: an operator can unlock/remove it without re-deriving it).
-    // macOS /var is a symlink to /private/var; git canonicalizes the
-    // registration while temp_dir() does not, so compare canonical forms.
+    // The stderr message must carry the EXACT leftover path, delimited by
+    // quotes (actionable contract: an operator can unlock/remove it without
+    // re-deriving it; quoting keeps paths with spaces parseable). macOS /var
+    // is a symlink to /private/var; git canonicalizes the registration while
+    // temp_dir() does not, so compare canonical forms.
     let reported = em
         .split("worktree is left at ")
         .nth(1)
-        .and_then(|s| s.split_whitespace().next())
+        .and_then(|s| s.split('"').nth(1))
         .unwrap_or_default();
     let canon = |p: &str| std::fs::canonicalize(p).unwrap_or_else(|_| std::path::PathBuf::from(p));
     assert_eq!(

@@ -1115,7 +1115,7 @@ fn cleanup_failed_worktree(
         let _ = std::fs::remove_file(tmp.with_extension("lock"));
         return format!(
             "git {kind} failed: {cause}; temp worktree removal failed and the \
-             worktree is left at {} ({err_rm}) — unlock and remove it manually",
+             worktree is left at \"{}\" ({err_rm}) — unlock and remove it manually",
             tmp.display()
         );
     }
