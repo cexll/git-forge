@@ -547,6 +547,27 @@ fn cmd_pr_review(store: &EventStore, args: &[String]) -> Result<String, String> 
                 .into(),
         );
     }
+    // The anchor must resolve to a real commit object. It is intentionally NOT
+    // constrained to the PR snapshot: spec.md explicitly permits inline
+    // comments on commits outside the PR snapshot (anchored reference). The
+    // resolved commit OID is what gets stored — never the raw input — so a
+    // mutable ref like `main` cannot smuggle a moving anchor into the event.
+    let commit = match commit {
+        Some(c) => Some(
+            store
+                .repo()
+                .revparse_single(&c)
+                .and_then(|o| o.peel_to_commit())
+                .map(|c| c.id().to_string())
+                .map_err(|_| {
+                    format!(
+                        "inline review --commit '{c}' does not resolve to a commit \
+                         (FR-005 anchor must be a real commit)"
+                    )
+                })?,
+        ),
+        None => None,
+    };
     let r = crate::store::pr_head_ref(id);
     if !store_has_ref(store, &r) {
         return Err(format!("PR #{id} does not exist"));

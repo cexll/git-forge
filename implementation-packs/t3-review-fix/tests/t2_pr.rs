@@ -522,6 +522,67 @@ fn inline_review_requires_commit_anchor() {
     );
     let after = git(&dir, &["rev-parse", "refs/forge/prs/1/head"]).1;
     assert_eq!(before, after, "no pr.review appended without anchor");
+    // FR-005: the anchor must resolve to a real commit object — a bogus hash
+    // or non-commit text is rejected, and no pr.review is appended.
+    for bogus in ["deadbeef", "not-a-commit"] {
+        let (cb, _, eb) = forge(
+            &dir,
+            &[
+                "forge",
+                "pr",
+                "review",
+                "1",
+                "--approve",
+                "--file",
+                "feature.txt",
+                "--line",
+                "1",
+                "--commit",
+                bogus,
+            ],
+        );
+        assert_ne!(cb, 0, "bogus anchor '{bogus}' must be rejected");
+        assert!(
+            eb.contains("does not resolve to a commit"),
+            "error must explain the bad anchor '{bogus}': {eb}"
+        );
+        assert_eq!(
+            git(&dir, &["rev-parse", "refs/forge/prs/1/head"]).1,
+            after,
+            "no pr.review appended for bogus anchor '{bogus}'"
+        );
+    }
+    // FR-005 immutability: a ref name like `main` is accepted as an anchor
+    // input but the EVENT must store the peeled commit OID, never the mutable
+    // ref name.
+    let main_oid = git(&dir, &["rev-parse", "refs/heads/main"]).1;
+    let (cr, _, er) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "review",
+            "1",
+            "--approve",
+            "--file",
+            "feature.txt",
+            "--line",
+            "1",
+            "--commit",
+            "main",
+        ],
+    );
+    assert_eq!(cr, 0, "ref-name anchor must be accepted: {er}");
+    let head_tip = git(&dir, &["rev-parse", "refs/forge/prs/1/head"]).1;
+    let event = git(&dir, &["show", &format!("{head_tip}:.forge/event.json")]).1;
+    assert!(
+        event.contains(&main_oid),
+        "event must store the peeled commit OID: {event}"
+    );
+    assert!(
+        !event.contains("\"main\""),
+        "event must not store the mutable ref name: {event}"
+    );
     // Plain approve (no inline options) still works.
     let (c2, _, e2) = forge(&dir, &["forge", "pr", "review", "1", "--approve"]);
     assert_eq!(c2, 0, "plain approve must still work: {e2}");
