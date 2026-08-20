@@ -75,7 +75,6 @@ git-forge/
 │   └── architecture/git-forge.md   # WIRE CONTRACT — normative
 ├── src/                  # lands per devflow feature (event/fold t0, store t1a, cli t1b, …)
 ├── tests/                # lands per devflow feature (t0_core, e2e_*)
-├── implementation-packs/ # devflow slice source; copied into src/ by workers
 └── .specs/git-forge/     # plan + validation contract (committed); missions/ is gitignored
 ```
 
