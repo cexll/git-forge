@@ -537,14 +537,41 @@ fn cmd_pr_review(store: &EventStore, args: &[String]) -> Result<String, String> 
     }
     let decision = decision
         .ok_or_else(|| String::from("usage: git forge pr review <n> --approve|--reject"))?;
-    if let Some(anchor) = commit.clone() {
-        // anchored inline comment: body carries file/line/commit
-        let _ = anchor;
-    }
     let r = crate::store::pr_head_ref(id);
     if !store_has_ref(store, &r) {
         return Err(format!("PR #{id} does not exist"));
     }
+    // FR-005: inline review comments anchor to a commit hash. --file/--line
+    // are only meaningful as inline comments, so they require the anchor;
+    // an unanchored inline review would not reference anything immutable.
+    if (file.is_some() || line.is_some()) && commit.is_none() {
+        return Err(
+            "inline review requires --commit <hash> to anchor the comment (FR-005); \
+             add --commit or drop --file/--line"
+                .into(),
+        );
+    }
+    // The anchor must resolve to a real commit object. It is intentionally NOT
+    // constrained to the PR snapshot: spec.md explicitly permits inline
+    // comments on commits outside the PR snapshot (anchored reference). The
+    // resolved commit OID is what gets stored — never the raw input — so a
+    // mutable ref like `main` cannot smuggle a moving anchor into the event.
+    let commit = match commit {
+        Some(c) => Some(
+            store
+                .repo()
+                .revparse_single(&c)
+                .and_then(|o| o.peel_to_commit())
+                .map(|c| c.id().to_string())
+                .map_err(|_| {
+                    format!(
+                        "inline review --commit '{c}' does not resolve to a commit \
+                         (FR-005 anchor must be a real commit)"
+                    )
+                })?,
+        ),
+        None => None,
+    };
     let mut body = HashMap::new();
     body.insert("decision".into(), json_str(&decision));
     if let Some(f) = file {

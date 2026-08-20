@@ -486,6 +486,144 @@ fn inline_review_anchors_commit() {
 }
 
 #[test]
+fn inline_review_requires_commit_anchor() {
+    let dir = tmpdir("inlinereq");
+    init_repo(&dir);
+    make_feature(&dir, "feature", "feat\n");
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+    let before = git(&dir, &["rev-parse", "refs/forge/prs/1/head"]).1;
+    // FR-005: file/line without a commit anchor must be rejected, and no
+    // pr.review event may be appended (head ref unchanged).
+    let (c, _, e) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "review",
+            "1",
+            "--approve",
+            "--file",
+            "feature.txt",
+            "--line",
+            "1",
+        ],
+    );
+    assert_ne!(c, 0, "unanchored inline review must be rejected");
+    assert!(
+        e.contains("--commit"),
+        "error must ask for --commit anchor: {e}"
+    );
+    let after = git(&dir, &["rev-parse", "refs/forge/prs/1/head"]).1;
+    assert_eq!(before, after, "no pr.review appended without anchor");
+    // FR-005: the anchor must resolve to a real commit object — a bogus hash
+    // or non-commit text is rejected, and no pr.review is appended.
+    for bogus in ["deadbeef", "not-a-commit"] {
+        let (cb, _, eb) = forge(
+            &dir,
+            &[
+                "forge",
+                "pr",
+                "review",
+                "1",
+                "--approve",
+                "--file",
+                "feature.txt",
+                "--line",
+                "1",
+                "--commit",
+                bogus,
+            ],
+        );
+        assert_ne!(cb, 0, "bogus anchor '{bogus}' must be rejected");
+        assert!(
+            eb.contains("does not resolve to a commit"),
+            "error must explain the bad anchor '{bogus}': {eb}"
+        );
+        assert_eq!(
+            git(&dir, &["rev-parse", "refs/forge/prs/1/head"]).1,
+            after,
+            "no pr.review appended for bogus anchor '{bogus}'"
+        );
+    }
+    // FR-005 immutability: a ref name like `main` is accepted as an anchor
+    // input but the EVENT must store the peeled commit OID, never the mutable
+    // ref name.
+    let main_oid = git(&dir, &["rev-parse", "refs/heads/main"]).1;
+    let (cr, _, er) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "review",
+            "1",
+            "--approve",
+            "--file",
+            "feature.txt",
+            "--line",
+            "1",
+            "--commit",
+            "main",
+        ],
+    );
+    assert_eq!(cr, 0, "ref-name anchor must be accepted: {er}");
+    let head_tip = git(&dir, &["rev-parse", "refs/forge/prs/1/head"]).1;
+    let event = git(&dir, &["show", &format!("{head_tip}:.forge/event.json")]).1;
+    assert!(
+        event.contains(&main_oid),
+        "event must store the peeled commit OID: {event}"
+    );
+    assert!(
+        !event.contains("\"main\""),
+        "event must not store the mutable ref name: {event}"
+    );
+    // Plain approve (no inline options) still works.
+    let (c2, _, e2) = forge(&dir, &["forge", "pr", "review", "1", "--approve"]);
+    assert_eq!(c2, 0, "plain approve must still work: {e2}");
+}
+
+#[test]
+fn review_precedence_nonexistent_pr_before_invalid_anchor() {
+    let dir = tmpdir("reviewprec");
+    init_repo(&dir);
+    make_feature(&dir, "feature", "feat\n");
+    // Nonexistent PR + bogus anchor: the entity error wins (established
+    // behavior for every other pr subcommand); never resolve/validate the
+    // anchor for a PR that does not exist.
+    let (c, _, e) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "review",
+            "99",
+            "--approve",
+            "--file",
+            "feature.txt",
+            "--line",
+            "1",
+            "--commit",
+            "not-a-commit",
+        ],
+    );
+    assert_ne!(c, 0, "nonexistent PR must be rejected");
+    assert!(
+        e.contains("PR #99 does not exist"),
+        "entity error must precede anchor validation: {e}"
+    );
+    assert!(
+        !e.contains("does not resolve to a commit"),
+        "anchor must not be resolved for a nonexistent PR: {e}"
+    );
+}
+
+#[test]
 fn snapshot_survives_branch_deletion_and_gc() {
     let dir = tmpdir("gc");
     init_repo(&dir);
