@@ -36,5 +36,48 @@ else
   echo "FAIL  guard: clean path rejected"; fail=$((fail+1))
 fi
 
+# 4. F-015 regression: size-gate must stay immune to a hostile user/root tokei
+# config. Run from an OWNED temp project (never the real repo): a synthetic
+# over-800-line src file plus a hostile tokei.toml must make `just size-gate`
+# exit non-zero, and a clean project must exit zero. The gate runs against the
+# temp project's cwd, so even a repo-root tokei.toml in the temp dir must not
+# hide the file. guardrail does not claim tokei is installed here — the gate
+# itself reports 'tokei missing' loudly; we assert that it either fails closed
+# (missing tokei => nonzero) or correctly detects the over-limit file.
+guard_tmp="$(mktemp -d)"
+trap 'rm -rf "$guard_tmp" "$tmp"' EXIT
+# size-gate is a REQUIRED prereq (AGENTS: brew install tokei); a missing tokei
+# must fail the guardrail, not pass as a false 'rejected'.
+if ! command -v tokei >/dev/null 2>&1; then
+  echo "FAIL  gate: tokei missing (required prereq for size-gate)"; fail=$((fail+1))
+else
+  mkdir -p "$guard_tmp/src"
+  probe="$guard_tmp/src/_size_probe.rs"
+  for i in $(seq 1 801); do echo "x"; done > "$probe"
+  # Hostile root config (current-directory lookup channel, F-015) and a hostile
+  # HOME bracket.
+  printf 'types = ["Python"]\n' > "$guard_tmp/tokei.toml"
+  hostile_home="$guard_tmp/home"
+  mkdir -p "$hostile_home"
+  # Run the repo's OWN size-gate recipe against the temp project's cwd (so a
+  # repo-root tokei.toml there is the gate's current-directory config channel)
+  # with a hostile HOME/XDG bracket: the gate must still count the 801-line src
+  # file and reject it with the exact diagnostic (F-015 isolation regression).
+  gate_out="$(HOME="$hostile_home" XDG_CONFIG_HOME="$hostile_home" just --justfile "$repo_root/justfile" --working-directory "$guard_tmp" size-gate 2>&1)" && gate_rc=0 || gate_rc=$?
+  if [ "$gate_rc" -eq 0 ]; then
+    echo "FAIL  gate: size-gate passed with an 801-line src file + hostile tokei config"; fail=$((fail+1))
+  elif ! echo "$gate_out" | grep -q "exceeds 800 code lines (801)"; then
+    echo "FAIL  gate: size-gate rejected without the expected 801 diagnostic: $(echo "$gate_out" | head -1)"; fail=$((fail+1))
+  else
+    echo "PASS  gate: size-gate rejects 801-line src under hostile config"; pass=$((pass+1))
+  fi
+  rm -f "$probe"
+  if HOME="$hostile_home" XDG_CONFIG_HOME="$hostile_home" just --justfile "$repo_root/justfile" --working-directory "$guard_tmp" size-gate >/dev/null 2>&1; then
+    echo "PASS  gate: size-gate accepts clean temp project"; pass=$((pass+1))
+  else
+    echo "FAIL  gate: size-gate rejected a clean temp project"; fail=$((fail+1))
+  fi
+fi
+
 echo "guardrail self-test: $pass passed, $fail failed"
 [ "$fail" -eq 0 ]
