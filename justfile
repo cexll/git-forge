@@ -89,6 +89,14 @@ e2e:
 dogfood:
     bash scripts/gf-dogfood.sh
 
+# Owned F-033 regression: the same 45-check dogfood flow against a MAIN-default
+# source (scripts/gf-dogfood-main-default.sh builds a throwaway `git init -b
+# main` repo with PLAN.md, exports GDOGFOOD_SRC at it, and runs the FULL real
+# scripts/gf-dogfood.sh, asserting the summary reports pass=45 fail=0). RED
+# against a gf-dogfood.sh that hardcodes master; GREEN after the fix.
+dogfood-main-default:
+    bash scripts/gf-dogfood-main-default.sh
+
 # ── Coverage (L3: 80% lines, block; standalone until qualified) ──
 coverage:
     @if [ -f Cargo.toml ]; then cargo llvm-cov --all-targets --fail-under-lines 80; else echo "coverage: no Cargo.toml yet — lands with devflow t0"; fi
