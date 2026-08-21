@@ -11,26 +11,47 @@
 
 use std::path::Path;
 
-/// Run `git` in the given working directory, returning (exit status, stdout,
-/// stderr). The ONLY place that constructs `Command::new("git")`.
-fn git_in_with_status(dir: &Path, args: &[&str]) -> (Option<i32>, String, String) {
+/// Result of running `git`: exit status (None = could not spawn), stdout,
+/// stderr, and — on spawn failure only — the raw io error so callers can
+/// format it per their baseline error contract. `stderr` is the raw
+/// (trimmed) stderr for nonzero exits; on spawn failure it carries the
+/// synthesized `failed to spawn git: …` message (consumed by `git_in`
+/// callers), while `raw_spawn_error` holds the underlying error unformatted.
+/// The single git Command construction lives in `git_in_with_status`.
+struct GitResult {
+    status: Option<i32>,
+    stdout: String,
+    stderr: String,
+    raw_spawn_error: Option<std::io::Error>,
+}
+
+/// Run `git` in the given working directory, returning the exit status,
+/// stdout, stderr and raw spawn error. The ONLY function that constructs a
+/// git Command (no other `Command` construction exists in this crate).
+fn git_in_with_status(dir: &Path, args: &[&str]) -> GitResult {
     use std::process::Command;
     let out = Command::new("git").arg("-C").arg(dir).args(args).output();
     match out {
-        Ok(o) => (
-            o.status.code(),
-            String::from_utf8_lossy(&o.stdout).trim().to_string(),
-            String::from_utf8_lossy(&o.stderr).trim().to_string(),
-        ),
-        Err(e) => (None, String::new(), format!("failed to spawn git: {e}")),
+        Ok(o) => GitResult {
+            status: o.status.code(),
+            stdout: String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            stderr: String::from_utf8_lossy(&o.stderr).trim().to_string(),
+            raw_spawn_error: None,
+        },
+        Err(e) => GitResult {
+            status: None,
+            stdout: String::new(),
+            stderr: format!("failed to spawn git: {e}"),
+            raw_spawn_error: Some(e),
+        },
     }
 }
 
 /// Run `git` in the given working directory, returning (success, stdout,
 /// stderr). Used for worktree merge/rebase execution and cleanup.
 fn git_in(dir: &Path, args: &[&str]) -> (bool, String, String) {
-    let (status, out, err) = git_in_with_status(dir, args);
-    (status == Some(0), out, err)
+    let r = git_in_with_status(dir, args);
+    (r.status == Some(0), r.stdout, r.stderr)
 }
 
 /// True if `git rebase` is mid-flight in the worktree (either rebase-merge or
@@ -106,13 +127,19 @@ pub(crate) fn worktree_remove(repo_dir: &Path, path: &Path) -> Result<(), String
 }
 
 /// List registered worktrees (`git worktree list --porcelain`), from the
-/// repository. Err carries git's stderr.
+/// repository. Error contract (baseline): spawn failure -> `git worktree
+/// list failed: {raw io error}`; nonzero git exit -> exactly `git worktree
+/// list failed` (stderr never appended).
 pub(crate) fn worktree_list(repo_dir: &Path) -> Result<String, String> {
-    let (ok, out, err) = git_in(repo_dir, &["worktree", "list", "--porcelain"]);
-    if ok {
-        Ok(out)
-    } else {
-        Err(err)
+    let r = git_in_with_status(repo_dir, &["worktree", "list", "--porcelain"]);
+    match r.status {
+        Some(0) => Ok(r.stdout),
+        None => Err(format!(
+            "git worktree list failed: {}",
+            r.raw_spawn_error
+                .expect("spawn failure always carries the raw io error")
+        )),
+        Some(_) => Err("git worktree list failed".to_string()),
     }
 }
 
@@ -281,21 +308,29 @@ pub(crate) fn require_single_merge_base(
     a: git2::Oid,
     b: git2::Oid,
 ) -> Result<git2::Oid, String> {
-    let (status, out, err) = git_in_with_status(
+    let r = git_in_with_status(
         repo.path(),
         &["merge-base", "--all", &a.to_string(), &b.to_string()],
     );
-    let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
+    let lines: Vec<&str> = r.stdout.lines().filter(|l| !l.is_empty()).collect();
     // `git merge-base --all` exits 1 with EMPTY stdout when the two commits
     // share no common ancestor (unrelated histories, or shallow/incomplete
     // history). Any other failure exit (e.g. 128) is a genuine git failure,
     // regardless of stderr content — classification is by EXIT STATUS, not
-    // stderr heuristics.
-    if status != Some(0) {
-        if status == Some(1) && lines.is_empty() {
-            return Err(zero_merge_base_error(repo));
+    // stderr heuristics. Spawn failure formats the raw io error (baseline);
+    // nonzero exits append the raw (unprefixed) stderr.
+    if r.status != Some(0) {
+        match r.status {
+            None => {
+                return Err(format!(
+                    "git merge-base failed: {}",
+                    r.raw_spawn_error
+                        .expect("spawn failure always carries the raw io error")
+                ));
+            }
+            Some(1) if lines.is_empty() => return Err(zero_merge_base_error(repo)),
+            Some(_) => return Err(format!("git merge-base failed: {}", r.stderr.trim())),
         }
-        return Err(format!("git merge-base failed: {}", err.trim()));
     }
     if lines.len() != 1 {
         if lines.is_empty() {
