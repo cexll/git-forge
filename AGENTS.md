@@ -52,6 +52,7 @@ Local, git-native forge: issues, pull requests, review, and merge inside an ordi
 | Coverage | cargo-llvm-cov | installed | L3 80% gate |
 | Linter | clippy | rustup | `-D warnings` |
 | Formatter | rustfmt | rustup | `--check` |
+| Line counter | tokei | Homebrew (`brew install tokei`) | per-file 800-code-line gate (`just size-gate`) |
 
 ### Dependency policy
 
@@ -106,6 +107,12 @@ just setup        # cargo fetch
 git config core.hooksPath .git-hooks   # one-time hook install
 ```
 
+> **Prerequisite — tokei (required, not auto-installed):** the blocking `just size-gate`
+> drives off [tokei](https://github.com/XAMPPRocky/tokei), which must be installed explicitly:
+> `brew install tokei`. `just setup` stays `cargo fetch` and does **not** install it; a missing
+> tokei makes `size-gate` exit 1 with `tokei missing — run brew install tokei` so a fresh clone
+> fails loudly instead of silently passing the size gate.
+
 ### Daily commands
 
 | Task | Command |
@@ -117,6 +124,7 @@ git config core.hooksPath .git-hooks   # one-time hook install
 | All tests | `just test` |
 | CLI e2e | `just e2e` |
 | Coverage (L3: ≥80% lines) | `just coverage` |
+| Size gate (≤800 code lines/src file) | `just size-gate` |
 | Build | `just build` |
 | Guardrail self-test | `just test-guardrails` |
 | Decision-record check | `just decisions-check` |
@@ -140,6 +148,7 @@ All commands route through `justfile`. Do not invent ad-hoc commands; add missin
 | CLI e2e | tests/e2e_workflow.rs + e2e_counter.rs | `just e2e` | exit 0; fails loudly if files exist but fail |
 | Coverage | llvm-cov ≥80% lines | `just coverage` | report ≥ threshold |
 | Guardrails | scripts/test-guardrails.sh | `just test-guardrails` | 3/3 pass (accept clean, reject violation) |
+| Size gate | tokei per-file code lines over src/ | `just size-gate` | exit 0; non-zero if any src/ file exceeds 800 code lines (wired into `just check`) |
 | Decision records | scripts/check-decisions.py | `just decisions-check` | exit 0 |
 | CLI surface | built binary run | `just verify-cli` | exit code + --help output |
 
@@ -190,10 +199,11 @@ White-box review required for changes touching these (L3): `src/store.rs` (git2 
 | Naming guard (forbidden suffixes, scratchpad dirs) | pre-commit | `.git-hooks/pre-commit` runs `.git-hooks/check-naming.sh` | block |
 | Guardrail self-test | just check | `just test-guardrails` (accept clean, reject violation) | block |
 | Decision-record structure | just check | `just decisions-check` (scripts/check-decisions.py) | block |
+| File ≤800 code lines (src/) | just check | `just size-gate` (tokei) | block |
 | Devflow receipt integrity | devflow scheduler | `just devflow ARGS=end-feature` (git hard checks) | block |
 | Coverage ≥80% lines | standalone | `just coverage` (llvm-cov) | review-only |
 | TDD red→green | review | Code Review Self-Check | review-only |
-| File ≤800 lines / complexity ≤15 / fn ≤150 lines | review | review checklist | review-only |
+| Complexity ≤15 / fn ≤150 lines | review | review checklist | review-only |
 | PR diff ≤400 lines | review | review checklist | review-only |
 | Conventional commits | review | review checklist | review-only |
 | Duplicate/dead code | review | review checklist | review-only |

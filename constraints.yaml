@@ -12,17 +12,14 @@ strictness_profile:
     # L3 profile-blocked limits that are NOT machine-enforced in this repo —
     # recorded honestly as review-only rather than falsely claimed as blocking.
     # These are tool-availability gaps, not user relaxations; all are repo-correctable
-    # (add a CI line counter / complexity gate / commitlint) without changing the profile.
+    # (add a complexity gate / commitlint / PR CI) without changing the profile.
+    # size_limits.max_file_lines is NOT listed: converted review-only → block in f3
+    # (just size-gate + tokei wired into just check; removal trigger fulfilled).
     - control: testing.min_line_coverage
       profile_default: block (80)
       chosen: review-only
       reason: "llvm-cov is a slow instrumented build unsuitable for pre-commit/just-check; empty scaffold has nothing to measure until the first product commit lands"
       removal_trigger: "first product commit (t0/event/fold) lands real code; then wire coverage into just check and promote to block"
-    - control: size_limits.max_file_lines
-      profile_default: block (800)
-      chosen: review-only
-      reason: "no automated line counter installed; clippy has no per-file line gate"
-      removal_trigger: "install a CI line counter (tokei, cloc) and wire into just check"
     - control: size_limits.max_complexity
       profile_default: block (15)
       chosen: review-only
@@ -121,14 +118,15 @@ code_canonicality:
     enforced_by: ".git-hooks/check-naming.sh + .gitignore"
 
 # ── Size Limits (L3) ───────────────────────────────────────────
-# Honest severity: only clippy lint checks actually run and block (-D warnings
-# fails the build). File-line count has no CI counter installed, so it is
-# review-only, not block.
+# Honest severity: clippy -D warnings blocks; file-line count is now
+# machine-enforced by just size-gate (tokei, wired into just check). Complexity
+# and function-line limits remain review-only — clippy::cognitive_complexity /
+# too_many_lines are not gated.
 size_limits:
   max_file_lines:
     value: 800
-    severity: "review-only"          # no automated line counter — honest gap
-    enforced_by: "PR review only (no tool wired)"
+    severity: "block"              # machine-enforced: tokei required prereq (brew) + just size-gate wired into just check
+    enforced_by: "just size-gate (tokei)"
   max_complexity:
     value: 15
     severity: "review-only"          # clippy::cognitive_complexity is allow-by-default; not gated
@@ -225,6 +223,11 @@ verification:
     decisions:
       command: "just decisions-check"
       evidence: "structural verify of docs/decisions tree; wired into just check (block)"
+      required_at: "L3"
+      level: "block"
+    size:
+      command: "just size-gate"
+      evidence: "tokei json over src/; exit 0 iff every src/ file <= 800 code lines; wired into just check (block)"
       required_at: "L3"
       level: "block"
   enforced_by: "Stage 4 matrix-to-target check over constraints.yaml + AGENTS.md Verification Matrix"

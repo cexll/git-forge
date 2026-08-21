@@ -9,11 +9,12 @@ setup:
 
 # ── Checks (fast gates; exit non-zero on any failure) ───────────
 # Blocking aggregate: fmt, clippy, tests, guardrail self-test, decision-record
-# structure all fail `just check`. Coverage is intentionally EXCLUDED — it is a
-# slow llvm-cov instrumented build unsuitable for pre-commit and currently has
-# nothing to measure (empty scaffold); it is a standalone review-only gate until
-# the first product commit qualifies it (see constraints.yaml downgrades).
-check: fmt-check lint test test-guardrails decisions-check
+# structure, and the size gate all fail `just check`. Coverage is intentionally
+# EXCLUDED — it is a slow llvm-cov instrumented build unsuitable for pre-commit
+# and currently has nothing to measure (empty scaffold); it is a standalone
+# review-only gate until the first product commit qualifies it (see
+# constraints.yaml downgrades).
+check: fmt-check lint test test-guardrails decisions-check size-gate
     echo "fast checks passed"
 
 # Format
@@ -26,6 +27,22 @@ fmt:
 # Lint (L3 block)
 lint:
     @if [ -f Cargo.toml ]; then cargo clippy --all-targets -- -D warnings; else echo "lint: no Cargo.toml yet — lands with devflow t0"; fi
+
+# ── Size gate (L3: block) ───────────────────────────────────────
+# Per-file cap: every src/ file must stay at or under 800 code lines
+# (constraints.yaml size_limits.max_file_lines). Chosen tokei invocation
+# (deterministic): `tokei --output json src/`, piped into a python3 reader over
+# the per-file `reports[]` (python3 is already the repo's parser — decisions-check
+# uses it; passing paths to tokei pins the report `name` as a repo-relative path).
+# tokei is a REQUIRED local prerequisite — `just setup` stays `cargo fetch` per
+# AGENTS.md and does NOT auto-install it; a missing tokei makes this gate fail
+# loudly with `tokei missing — run brew install tokei`.
+size-gate:
+    @if ! command -v tokei >/dev/null 2>&1; then \
+        echo "tokei missing — run brew install tokei" >&2; \
+        exit 1; \
+    fi; \
+    tokei --output json src/ | python3 -c 'import json,sys; data=json.load(sys.stdin); bad=[(r["name"],r["stats"]["code"]) for v in data.values() for r in v.get("reports",[]) if r["name"].startswith("src/") and r["stats"]["code"]>800]; [print("size-gate: %s exceeds 800 code lines (%d)"%(n,c), file=sys.stderr) for n,c in sorted(bad)]; sys.exit(1 if bad else 0)'
 
 # ── Tests ────────────────────────────────────────────────────────
 test:
