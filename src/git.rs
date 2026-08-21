@@ -17,7 +17,9 @@ use std::path::Path;
 /// (trimmed) stderr for nonzero exits; on spawn failure it carries the
 /// synthesized `failed to spawn git: …` message (consumed by `git_in`
 /// callers), while `raw_spawn_error` holds the underlying error unformatted.
-/// The single git Command construction lives in `git_in_with_status`.
+/// `git_in_with_status` is the primary `git` Command constructor; the
+/// exceptions are `store.rs`'s `run_update_ref_stdin` and `cli.rs`'s
+/// `cmd_pr_diff`.
 struct GitResult {
     status: Option<i32>,
     stdout: String,
