@@ -834,8 +834,8 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
             tmp.display()
         ));
     }
-    match crate::git::worktree_list(&repo_dir) {
-        Err(err_l) => {
+    match crate::git::worktree_list_raw(&repo_dir) {
+        (false, _, err_l) => {
             // Best-effort: remove the pending result ref; cannot verify the
             // worktree is gone → hard abort before any ref update.
             let pending = cleanup_pending_result(store, id, result_commit, &mut lock_handle, &tmp);
@@ -843,7 +843,7 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
                 "merge succeeded but worktree verification failed (git worktree list: {err_l}){pending}"
             ));
         }
-        Ok(list_l) if list_l.contains(&tmp.to_string_lossy().to_string()) => {
+        (true, list_l, _) if list_l.contains(&tmp.to_string_lossy().to_string()) => {
             // Best-effort: remove the pending result ref; the stale registration
             // is reported but the result commit is not left dangling.
             let pending = cleanup_pending_result(store, id, result_commit, &mut lock_handle, &tmp);
@@ -852,7 +852,7 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
                 tmp.display()
             ));
         }
-        Ok(_) => {}
+        (true, _, _) => {}
     }
     // Worktree removed AND verified gone: release our path lock so a concurrent
     // same-repo merge can reuse the path, then run barrier + final transaction.

@@ -681,6 +681,91 @@ fn worktree_removal_failure_reports_and_cleans_pending_ref() {
 }
 
 #[test]
+fn worktree_verification_failure_surfaces_raw_git_stderr() {
+    let dir = tmpdir("verifyfail");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "verify fail PR");
+    checkout(&dir, "feature");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+
+    // Deterministic seam (F-008): a PATH shim around `git` that fails the
+    // SECOND `git worktree list --porcelain` invocation with a distinctive
+    // raw stderr. In `cmd_pr_merge` the worktree-list call order is fixed:
+    // #1 = checked-out base guard (must succeed), #2 = post-removal
+    // verification (must fail, surfacing the raw stderr). Every other git
+    // invocation execs the real binary unchanged.
+    let shim = tmpdir("verifyfail-shim");
+    let counter = shim.join("counter");
+    let which = Command::new("sh")
+        .arg("-c")
+        .arg("command -v git")
+        .output()
+        .unwrap();
+    assert!(which.status.success(), "command -v git failed");
+    let real_git = String::from_utf8_lossy(&which.stdout).trim().to_string();
+    assert!(!real_git.is_empty(), "could not resolve real git path");
+    let shim_script = format!(
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"-C\" ] && [ \"$3\" = \"worktree\" ] && [ \"$4\" = \"list\" ]; then\n\
+         \x20 n=0\n\
+         \x20 [ -f \"$COUNTER\" ] && n=$(cat \"$COUNTER\")\n\
+         \x20 n=$((n+1))\n\
+         \x20 echo \"$n\" > \"$COUNTER\"\n\
+         \x20 if [ \"$n\" -ge 2 ]; then\n\
+         \x20   echo \"fatal: worktree list disabled by test shim\" >&2\n\
+         \x20   exit 128\n\
+         \x20 fi\n\
+         fi\n\
+         exec \"{real_git}\" \"$@\"\n"
+    );
+    std::fs::write(shim.join("git"), shim_script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(shim.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut path = shim.display().to_string();
+    if let Ok(p) = std::env::var("PATH") {
+        path.push(':');
+        path.push_str(&p);
+    }
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let out = Command::new(bin)
+        .args(["forge", "pr", "merge", "1"])
+        .current_dir(&dir)
+        .env("PATH", &path)
+        .env("COUNTER", &counter)
+        .output()
+        .unwrap();
+    let code = out.status.code().unwrap_or(-1);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(
+        code, 0,
+        "merge must fail when post-removal verification cannot run"
+    );
+    assert!(
+        stderr.contains(
+            "merge succeeded but worktree verification failed (git worktree list: fatal: worktree list disabled by test shim)"
+        ),
+        "verification-path error must surface RAW git stderr: {stderr}"
+    );
+    // No ref changes: base and PR chain unchanged; result ref best-effort cleaned.
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged"
+    );
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_none(),
+        "pending result ref must be cleaned best-effort after verification failure"
+    );
+    let (cs, os, _) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert!(cs == 0, "pr show must succeed after verification failure");
+    assert!(
+        !os.contains("merged"),
+        "no pr.merge on verification failure: {os}"
+    );
+}
+
+#[test]
 fn nonexistent_pr_merge_is_clean_error() {
     let dir = tmpdir("nopr");
     init_repo(&dir);

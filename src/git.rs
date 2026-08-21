@@ -126,9 +126,20 @@ pub(crate) fn worktree_remove(repo_dir: &Path, path: &Path) -> Result<(), String
     }
 }
 
+/// Raw `git worktree list --porcelain` executor, `git_in`-compatible:
+/// returns (status-ok, stdout, stderr) with stderr as the raw (trimmed)
+/// stderr for nonzero exits and the synthesized `failed to spawn git: …`
+/// on spawn failure. Used by `cmd_pr_merge`'s post-removal verification,
+/// which surfaces the raw diagnostic (baseline 6904cd3 behavior). Runs
+/// from the repository, never from a worktree's parent.
+pub(crate) fn worktree_list_raw(repo_dir: &Path) -> (bool, String, String) {
+    git_in(repo_dir, &["worktree", "list", "--porcelain"])
+}
+
 /// List registered worktrees (`git worktree list --porcelain`), from the
-/// repository. Error contract (baseline): spawn failure -> `git worktree
-/// list failed: {raw io error}`; nonzero git exit -> exactly `git worktree
+/// repository. Thin base-guard wrapper over `worktree_list_raw` mapping to
+/// the bare baseline messages: spawn failure -> `git worktree list
+/// failed: {raw io error}`; nonzero git exit -> exactly `git worktree
 /// list failed` (stderr never appended).
 pub(crate) fn worktree_list(repo_dir: &Path) -> Result<String, String> {
     let r = git_in_with_status(repo_dir, &["worktree", "list", "--porcelain"]);
