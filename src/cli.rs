@@ -75,11 +75,8 @@ fn cmd_new(store: &EventStore, args: &[String]) -> Result<String, String> {
 
 /// `git forge issue list`
 fn cmd_list(store: &EventStore) -> Result<String, String> {
-    // Enumerate issues by walking allocated ids is not possible without a
-    // registry; instead we read known refs by scanning counter state is not
-    // part of t1a. L1 lists issues by presenting the event chains discoverable
-    // via a best-effort scan of refs/forge/issues/*. We implement a documented
-    // approximation: read the counter's next to bound the scan.
+    // Issue list is a bounded scan of refs/forge/issues/1..counter_next
+    // (best-effort when the counter is unreadable).
     let mut out = String::new();
     let mut found = 0usize;
     // Bound the scan by the counter's next value (best-effort).

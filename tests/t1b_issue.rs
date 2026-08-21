@@ -1,20 +1,69 @@
 //! t1b issue CLI integration tests. Run the built `git-forge` binary as a
 //! subprocess inside an isolated temp git repository (the store opens ".").
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+// Process-local monotonic suffix: two tests in this binary may share a `tag`
+// and would collide on pid+nanos alone. Same convention as t1a_store.rs.
+static NEXT_TMPDIR: AtomicU64 = AtomicU64::new(0);
+
+fn candidate_name(root: &Path, tag: &str, pid: u32, seq: u64) -> PathBuf {
+    root.join(format!("gf-t1b-{tag}-{pid}-{seq}"))
+}
+
+/// Create a fresh isolated temp dir under `root`, starting the candidate scan
+/// at `start_seq`. Creation is exclusive (`create_dir`): a candidate that
+/// already exists — a stale dir left in /tmp by a prior run after PID reuse,
+/// or a parallel test's directory — is skipped, never reopened as the test
+/// repo. Mirrors t1a_store.rs's make_tmpdir convention.
+fn make_tmpdir(root: &Path, tag: &str, pid: u32, start_seq: u64) -> PathBuf {
+    let mut seq = start_seq;
+    loop {
+        let d = candidate_name(root, tag, pid, seq);
+        match std::fs::create_dir(&d) {
+            Ok(()) => return d,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => seq += 1,
+            Err(e) => panic!("cannot create temp dir {d:?}: {e}"),
+        }
+    }
+}
 
 fn tmpdir(tag: &str) -> PathBuf {
-    let d = std::env::temp_dir().join(format!(
-        "gf-t1b-{tag}-{}-{:?}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .subsec_nanos()
-    ));
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    // fetch_add gives each test a distinct candidate range within this process;
+    // exclusivity across processes (and across runs) comes from create_dir.
+    let start_seq = NEXT_TMPDIR.fetch_add(1, Ordering::Relaxed);
+    make_tmpdir(&std::env::temp_dir(), tag, std::process::id(), start_seq)
+}
+
+#[test]
+fn tmpdir_skips_stale_directory_from_prior_run() {
+    // Cross-run PID-reuse regression (mirrors t1a_store.rs): a prior run may
+    // leave stale candidate dirs in /tmp (this suite never cleans up).
+    // make_tmpdir must skip an existing candidate and exclusively create a
+    // later one, never reopen the stale repo.
+    struct TempDirGuard(PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    // Owned, exclusively-created root: the test only ever manipulates paths
+    // it created itself, never global /tmp entries.
+    let root = make_tmpdir(&std::env::temp_dir(), "stale-root", std::process::id(), 0);
+    let _root_guard = TempDirGuard(root.clone());
+    let stale = candidate_name(&root, "stale", 1, 0);
+    std::fs::create_dir(&stale).unwrap();
+    let d = make_tmpdir(&root, "stale", 1, 0);
+    assert_ne!(
+        d, stale,
+        "tmpdir must not reuse an existing directory: {d:?}"
+    );
+    // An interrupted run may also have left later candidates (seq >= 1); the
+    // invariant is "never reuse an existing directory", not "exactly seq 1".
+    assert!(d.file_name().is_some());
 }
 
 fn init_repo(dir: &PathBuf) {
