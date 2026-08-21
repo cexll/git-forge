@@ -8,13 +8,16 @@
 #   * Source repo under test: $GDOGFOOD_SRC (default dsh-deepwork). The forge
 #     under test is NEVER the live worktree — everything runs against a
 #     disposable clone.
-#   * Preflight: GDOGFOOD_SRC must exist, be a git repository, and hold the
+#   * Preflight: GDOGFOOD_SRC must exist, resolve to the CANONICAL git worktree
+#     root (the top-level reported by git must equal the physical path — a
+#     subdirectory that merely contains PLAN.md is rejected), and hold the
 #     working files the checks use (PLAN.md); a clear one-line error otherwise.
 #   * Binary: builds/refreshes the release binary from the git-forge checkout
 #     that contains this script (never a stale binary) into a controlled temp
-#     --target-dir (immune to CARGO_TARGET_DIR / cargo target-dir config), then
-#     copies it plus the git-issue/git-pr dispatch wrappers into a private temp
-#     bin dir.
+#     --target-dir (immune to CARGO_TARGET_DIR / cargo target-dir config),
+#     with --locked and --offline so the oracle is deterministic and never
+#     needs the network; then copies it plus the git-issue/git-pr dispatch
+#     wrappers into a private temp bin dir.
 #   * Temp dirs: mktemp -d, removed on EXIT via trap. Nothing escapes.
 set -eu
 
@@ -32,9 +35,21 @@ if [ ! -e "$SRC" ]; then
   echo "gf-dogfood: GDOGFOOD_SRC '$SRC' does not exist" >&2; exit 1
 elif [ ! -d "$SRC" ]; then
   echo "gf-dogfood: GDOGFOOD_SRC '$SRC' is not a directory" >&2; exit 1
-elif ! git -C "$SRC" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+fi
+# The clone source must be the CANONICAL worktree root. `rev-parse
+# --is-inside-work-tree` alone would accept a subdirectory, whose clone would
+# lack the root layout the checks exercise (F-016). Compute the physical root
+# and the git top-level; they must agree exactly.
+SRC_CANON="$(cd -P "$SRC" && pwd)" || {
+  echo "gf-dogfood: GDOGFOOD_SRC '$SRC' cannot be resolved" >&2; exit 1
+}
+TOP="$(git -C "$SRC_CANON" rev-parse --show-toplevel 2>/dev/null)" || {
   echo "gf-dogfood: GDOGFOOD_SRC '$SRC' is not a git repository" >&2; exit 1
-elif [ ! -f "$SRC/PLAN.md" ]; then
+}
+if [ "$SRC_CANON" != "$TOP" ]; then
+  echo "gf-dogfood: GDOGFOOD_SRC '$SRC' must be the git worktree root (top-level '$TOP'), not a subdirectory" >&2; exit 1
+fi
+if [ ! -f "$SRC_CANON/PLAN.md" ]; then
   echo "gf-dogfood: GDOGFOOD_SRC '$SRC' is missing the expected working file PLAN.md" >&2; exit 1
 fi
 
@@ -47,14 +62,16 @@ mkdir -p "$BIN"
 # Build/refresh the release binary from THIS checkout into a controlled temp
 # target dir. --target-dir overrides CARGO_TARGET_DIR and cargo target-dir
 # config, so the checkout never gains a git-visible target/ and we never build
-# elsewhere / consume a stale or externally redirected binary.
-( cd "$REPO_ROOT" && cargo build --release --target-dir "$TGT" ) >/dev/null
+# elsewhere / consume a stale or externally redirected binary. --locked pins
+# the build to the committed Cargo.lock; --offline forbids network access, so
+# the oracle cannot silently drift with the crates index (F-017).
+( cd "$REPO_ROOT" && cargo build --release --locked --offline --target-dir "$TGT" ) >/dev/null
 cp "$TGT/release/git-forge" "$BIN/git-forge"
 cp "$TGT/release/git-forge" "$BIN/git-issue"
 cp "$TGT/release/git-forge" "$BIN/git-pr"
 
-git clone -q "$SRC" "$T/dogfood"
-git clone -q "$SRC" "$T/dogfood2"
+git clone -q "$SRC_CANON" "$T/dogfood"
+git clone -q "$SRC_CANON" "$T/dogfood2"
 export PATH="$BIN:$PATH"
 PASS=0; FAIL=0
 ck() { # ck <name> <expected_exit 0|nonzero> <cmd...>
