@@ -11,19 +11,26 @@
 
 use std::path::Path;
 
-/// Run `git` in the given working directory, returning (success, stdout,
-/// stderr). Used for worktree merge/rebase execution and cleanup.
-fn git_in(dir: &Path, args: &[&str]) -> (bool, String, String) {
+/// Run `git` in the given working directory, returning (exit status, stdout,
+/// stderr). The ONLY place that constructs `Command::new("git")`.
+fn git_in_with_status(dir: &Path, args: &[&str]) -> (Option<i32>, String, String) {
     use std::process::Command;
     let out = Command::new("git").arg("-C").arg(dir).args(args).output();
     match out {
         Ok(o) => (
-            o.status.success(),
+            o.status.code(),
             String::from_utf8_lossy(&o.stdout).trim().to_string(),
             String::from_utf8_lossy(&o.stderr).trim().to_string(),
         ),
-        Err(e) => (false, String::new(), format!("failed to spawn git: {e}")),
+        Err(e) => (None, String::new(), format!("failed to spawn git: {e}")),
     }
+}
+
+/// Run `git` in the given working directory, returning (success, stdout,
+/// stderr). Used for worktree merge/rebase execution and cleanup.
+fn git_in(dir: &Path, args: &[&str]) -> (bool, String, String) {
+    let (status, out, err) = git_in_with_status(dir, args);
+    (status == Some(0), out, err)
 }
 
 /// True if `git rebase` is mid-flight in the worktree (either rebase-merge or
@@ -274,17 +281,18 @@ pub(crate) fn require_single_merge_base(
     a: git2::Oid,
     b: git2::Oid,
 ) -> Result<git2::Oid, String> {
-    let (ok, out, err) = git_in(
+    let (status, out, err) = git_in_with_status(
         repo.path(),
         &["merge-base", "--all", &a.to_string(), &b.to_string()],
     );
     let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
     // `git merge-base --all` exits 1 with EMPTY stdout when the two commits
     // share no common ancestor (unrelated histories, or shallow/incomplete
-    // history). Exit 128 (nonempty stderr) is a genuine git failure. Without
-    // this classification the deepen/unshallow guidance below is dead code.
-    if !ok {
-        if err.is_empty() && lines.is_empty() {
+    // history). Any other failure exit (e.g. 128) is a genuine git failure,
+    // regardless of stderr content — classification is by EXIT STATUS, not
+    // stderr heuristics.
+    if status != Some(0) {
+        if status == Some(1) && lines.is_empty() {
             return Err(zero_merge_base_error(repo));
         }
         return Err(format!("git merge-base failed: {}", err.trim()));
