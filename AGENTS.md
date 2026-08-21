@@ -122,7 +122,8 @@ git config core.hooksPath .git-hooks   # one-time hook install
 | Lint (L3 block) | `just lint` |
 | Unit tests | `just unit` |
 | All tests | `just test` |
-| CLI e2e | `just e2e` |
+| E2E placeholder (no real files) | `just e2e` |
+| Dogfood e2e (45/45, disposable clone) | `just dogfood` |
 | Coverage (L3: ≥80% lines) | `just coverage` |
 | Size gate (≤800 code lines/src file) | `just size-gate` |
 | Build | `just build` |
@@ -145,7 +146,8 @@ All commands route through `justfile`. Do not invent ad-hoc commands; add missin
 | Lint | clippy `-D warnings` | `just lint` | exit 0 |
 | Unit tests | cargo test --lib | `just unit` | exit 0 + test names |
 | All tests | cargo test --all-targets | `just test` | exit 0 |
-| CLI e2e | tests/e2e_workflow.rs + e2e_counter.rs | `just e2e` | exit 0; fails loudly if files exist but fail |
+| E2E (real surfaces) | tests/t2_pr.rs + tests/t3_merge.rs integration + scripts/gf-dogfood.sh | `just test` + `just dogfood` | exit 0; dogfood prints `DOGFOOD SUMMARY pass=45 fail=0` |
+| E2E placeholder | tests/e2e_workflow.rs + e2e_counter.rs (do NOT exist) | `just e2e` | exit 0; honest note naming the real surfaces above |
 | Coverage | llvm-cov ≥80% lines | `just coverage` | report ≥ threshold |
 | Guardrails | scripts/test-guardrails.sh | `just test-guardrails` | 3/3 pass (accept clean, reject violation) |
 | Size gate | tokei per-file code lines over src/ | `just size-gate` | exit 0; non-zero if any src/ file exceeds 800 code lines (wired into `just check`) |

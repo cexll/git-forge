@@ -52,14 +52,25 @@ test:
 unit:
     @if [ -f Cargo.toml ]; then cargo test --lib; else echo "unit: no Cargo.toml yet — lands with devflow t0"; fi
 
-# Integration / CLI e2e. Fails LOUDLY if the test files exist but the suite
-# fails; reports "not yet" only when the files are genuinely absent.
+# Integration / CLI e2e. Placeholder ONLY: tests/e2e_workflow.rs and
+# tests/e2e_counter.rs do NOT exist (the real e2e surfaces are the t2_pr/t3_merge
+# integration tests wired into `just test` and the 45-check dogfood via
+# `just dogfood`, scripts/gf-dogfood.sh). Kept for compatibility: fails loudly
+# if the old files ever exist but fail; otherwise exits 0 with this honest note.
 e2e:
     @if [ -f tests/e2e_workflow.rs ] || [ -f tests/e2e_counter.rs ]; then \
         cargo test --test e2e_workflow --test e2e_counter; \
     else \
-        echo "e2e: no e2e test files yet (land with t1b/t2/t3)"; \
+        echo "e2e: placeholder only — tests/e2e_workflow.rs / e2e_counter.rs do not exist; real e2e surfaces are tests/t2_pr.rs + tests/t3_merge.rs (just test) and scripts/gf-dogfood.sh (just dogfood)"; \
     fi
+
+# Full 45-check dogfood e2e (scripts/gf-dogfood.sh). Self-contained:
+# builds/refreshes the release binary from THIS checkout (never a stale one),
+# clones GDOGFOOD_SRC (default dsh-deepwork) into a mktemp -d disposable area,
+# runs the 45 checks from a non-base checkout, and exits 0 iff the dogfood
+# summary reports pass=45 fail=0. Temp dirs are trap-cleaned on exit.
+dogfood:
+    bash scripts/gf-dogfood.sh
 
 # ── Coverage (L3: 80% lines, block; standalone until qualified) ──
 coverage:
