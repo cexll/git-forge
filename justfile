@@ -30,23 +30,26 @@ lint:
 
 # ── Size gate (L3: block) ───────────────────────────────────────
 # Per-file cap: every src/ file must stay at or under 800 code lines
-# (constraints.yaml size_limits.max_file_lines). Chosen tokei invocation
-# (deterministic): `tokei --output json src/`, piped into a python3 reader over
-# the per-file `reports[]` (python3 is already the repo's parser — decisions-check
-# uses it; passing paths to tokei pins the report `name` as a repo-relative path).
-# tokei is a REQUIRED local prerequisite — `just setup` stays `cargo fetch` per
-# AGENTS.md and does NOT auto-install it; a missing tokei makes this gate fail
-# loudly with `tokei missing — run brew install tokei`.
+# (constraints.yaml size_limits.max_file_lines). The recipe captures the
+# repository root, creates a fresh temporary directory, and runs from that
+# empty cwd (`cd "$T"`). Its actual tokei invocation is
+# `HOME="$T" XDG_CONFIG_HOME="$T" tokei --no-ignore --output json "$REPO/src/"`:
+# it counts the source tree through an absolute path, keeps the output
+# machine-readable, and disables .gitignore/.ignore/.tokeignore suppression
+# so an ignore rule cannot hide a source file from the gate. `set -o pipefail`
+# propagates either tokei or python3 failures, and the EXIT trap cleans up the
+# temporary directory.
+# tokei is a required local prerequisite; `just setup` remains `cargo fetch`
+# and does not install it. A missing binary fails loudly with
+# `tokei missing — run brew install tokei`.
 #
-# CONFIG ISOLATION (F-015): tokei loads a user config from $HOME/tokei.toml
-# (and $XDG_CONFIG_HOME/tokei/config.toml). A hostile config like
-# `types = ["Python"]` removes Rust from its language table and makes an
-# over-limit file invisible (tokei counts 0 files for src/), so the gate would
-# silently pass. The invocation therefore runs tokei with HOME and
-# XDG_CONFIG_HOME pointed at a fresh empty directory (mktemp -d) so no user
-# config can load, and --no-ignore disables .gitignore/.ignore/.tokeignore
-# suppression so a file cannot be hidden from the gate by ignore rules;
-# `--output json` keeps the count machine-readable.
+# CONFIG ISOLATION (F-015): tokei loads user configuration from
+# $HOME/tokei.toml and $XDG_CONFIG_HOME/tokei/config.toml. A hostile config
+# such as `types = ["Python"]` can remove Rust from its language table and make
+# an over-limit file invisible. Pointing HOME and XDG_CONFIG_HOME at the fresh
+# temporary directory prevents user configuration from loading. The python3
+# reader receives the same absolute `$REPO/src` prefix as argv and evaluates
+# the per-file `reports[]` against that prefix.
 size-gate:
     @set -o pipefail; \
     if ! command -v tokei >/dev/null 2>&1; then \
