@@ -217,7 +217,7 @@ verification:
       level: "review-only"
     guardrails:
       command: "just test-guardrails"
-      evidence: "3/3 guard assertions pass; wired into just check (block)"
+      evidence: "5/5 guard assertions pass (incl. size-gate hostile-config regression); wired into just check (block)"
       required_at: "L3"
       level: "block"
     decisions:

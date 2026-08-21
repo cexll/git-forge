@@ -16,13 +16,16 @@ silently return as a bypass.
 `scripts/test-guardrails.sh` gains a fourth check (still wired into `just check`
 via `test-guardrails`): run the repo's own `size-gate` recipe
 (`just --justfile <repo>/justfile --working-directory <temp>`) against an
-OWNED temp project whose `src/` holds a synthetic 801-line Rust file and whose
-root holds a hostile `tokei.toml` (`types = ["Python"]`), under a hostile
-HOME/XDG bracket. The gate must exit non-zero WITH the exact diagnostic
-`exceeds 800 code lines (801)` (a missing tokei or a broken recipe is a FAIL,
-not a false pass); after removing the probe, the gate must exit zero on the
-same clean project. Fixtures live in `mktemp -d` dirs created and removed by
-the script — the real repo tree is never touched.
+OWNED temp project holding a synthetic 801-line Rust file plus hostile config
+on every channel tokei consults — the project's own `tokei.toml` (current
+directory), `$HOME/tokei.toml` and `$HOME/tokei/config.toml` (HOME/XDG), and a
+project `.tokeignore` excluding the probe (ignore-rule channel; a gate that
+lost `--no-ignore` would silently skip it). The gate must exit non-zero WITH
+the exact diagnostic `exceeds 800 code lines (801)`; after removing the probe
+and `.tokeignore`, the gate must exit zero on the same clean project. tokei and
+just are required prereqs — their absence is a FAIL, not a false pass. Fixtures
+live in `mktemp -d` dirs created and removed by the script — the real repo tree
+is never touched.
 
 ## Alternatives considered
 
@@ -40,7 +43,10 @@ the script — the real repo tree is never touched.
 
 - `test-guardrails.sh` now 5 checks (3 naming + 2 gate), all passing;
   `just check` (which runs test-guardrails) exits 0.
-- A missing tokei now fails the guardrail (it is a required prereq per AGENTS)
-  rather than silently passing as "rejected".
-- A regression in the size-gate isolation or counting fails the guardrail
-  loudly on a clean machine instead of silently passing.
+- `AGENTS.md` Verification Matrix and `constraints.yaml` guardrails evidence
+  updated to `5/5` (they previously stated 3/3).
+- A missing tokei in the gate's prereq now fails the guardrail (it is a
+  required prereq per AGENTS); a missing `just` likewise.
+- A regression in the size-gate isolation (empty-dir execution, `--no-ignore`,
+  HOME/XDG override) or counting fails the guardrail loudly on a clean machine
+  instead of silently passing.

@@ -155,7 +155,7 @@ All commands route through `justfile`. Do not invent ad-hoc commands; add missin
 | E2E (real surfaces) | tests/t2_pr.rs + tests/t3_merge.rs integration + scripts/gf-dogfood.sh | `just test` + `just dogfood` | exit 0; dogfood prints `DOGFOOD SUMMARY pass=45 fail=0` |
 | E2E placeholder | tests/e2e_workflow.rs + e2e_counter.rs (do NOT exist) | `just e2e` | exit 0; honest note naming the real surfaces above |
 | Coverage | llvm-cov ≥80% lines | `just coverage` | report ≥ threshold |
-| Guardrails | scripts/test-guardrails.sh | `just test-guardrails` | 3/3 pass (accept clean, reject violation) |
+| Guardrails | scripts/test-guardrails.sh | `just test-guardrails` | 5/5 pass (accept clean, reject violation, size-gate hostile-config regression) |
 | Size gate | tokei per-file code lines over src/ | `just size-gate` | exit 0; non-zero if any src/ file exceeds 800 code lines (wired into `just check`) |
 | Decision records | scripts/check-decisions.py | `just decisions-check` | exit 0 |
 | CLI surface | built binary run | `just verify-cli` | exit code + --help output |

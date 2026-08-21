@@ -38,18 +38,17 @@ fi
 
 # 4. F-015 regression: size-gate must stay immune to a hostile user/root tokei
 # config. Run from an OWNED temp project (never the real repo): a synthetic
-# over-800-line src file plus a hostile tokei.toml must make `just size-gate`
-# exit non-zero, and a clean project must exit zero. The gate runs against the
-# temp project's cwd, so even a repo-root tokei.toml in the temp dir must not
-# hide the file. guardrail does not claim tokei is installed here — the gate
-# itself reports 'tokei missing' loudly; we assert that it either fails closed
-# (missing tokei => nonzero) or correctly detects the over-limit file.
+# over-800-line src file plus hostile tokei.toml (cwd, $HOME, XDG) and a
+# .tokeignore must make `just size-gate` exit non-zero with the exact
+# 'exceeds 800 code lines (801)' diagnostic, and a clean project must exit
+# zero. tokei/just are required prereqs (AGENTS) — their absence is a FAIL,
+# not a fail-closed pass.
 guard_tmp="$(mktemp -d)"
 trap 'rm -rf "$guard_tmp" "$tmp"' EXIT
-# size-gate is a REQUIRED prereq (AGENTS: brew install tokei); a missing tokei
-# must fail the guardrail, not pass as a false 'rejected'.
 if ! command -v tokei >/dev/null 2>&1; then
   echo "FAIL  gate: tokei missing (required prereq for size-gate)"; fail=$((fail+1))
+elif ! command -v just >/dev/null 2>&1; then
+  echo "FAIL  gate: just missing (required to run size-gate)"; fail=$((fail+1))
 else
   mkdir -p "$guard_tmp/src"
   probe="$guard_tmp/src/_size_probe.rs"
@@ -59,6 +58,15 @@ else
   printf 'types = ["Python"]\n' > "$guard_tmp/tokei.toml"
   hostile_home="$guard_tmp/home"
   mkdir -p "$hostile_home"
+  # Hostile HOME/XDG channels too: configs in $HOME/tokei.toml and
+  # $HOME/tokei/config.toml (both tokei lookup locations) must not hide the
+  # over-limit file, so the F-015 isolation cannot regress on that axis.
+  mkdir -p "$hostile_home/tokei"
+  printf 'types = ["Python"]\n' > "$hostile_home/tokei.toml"
+  printf 'types = ["Python"]\n' > "$hostile_home/tokei/config.toml"
+  # Hostile IGNORE channel: a project .tokeignore excluding the probe lets a
+  # gate that lost --no-ignore silently skip it; the guardrail catches that.
+  printf 'src/_size_probe.rs\n' > "$guard_tmp/.tokeignore"
   # Run the repo's OWN size-gate recipe against the temp project's cwd (so a
   # repo-root tokei.toml there is the gate's current-directory config channel)
   # with a hostile HOME/XDG bracket: the gate must still count the 801-line src
@@ -71,7 +79,7 @@ else
   else
     echo "PASS  gate: size-gate rejects 801-line src under hostile config"; pass=$((pass+1))
   fi
-  rm -f "$probe"
+  rm -f "$probe" "$guard_tmp/.tokeignore"
   if HOME="$hostile_home" XDG_CONFIG_HOME="$hostile_home" just --justfile "$repo_root/justfile" --working-directory "$guard_tmp" size-gate >/dev/null 2>&1; then
     echo "PASS  gate: size-gate accepts clean temp project"; pass=$((pass+1))
   else
