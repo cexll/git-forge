@@ -874,13 +874,13 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
     Ok(format!("merged PR #{id} into {base_ref} ({result_commit})"))
 }
 
-/// Shared best-effort pending-result cleanup, used by all five early-return
-/// sites in `cmd_pr_merge` (removal failed / dir still exists / list failed /
-/// still registered / barrier deadline): release the temp-path sibling lock,
-/// CAS-delete `refs/forge/prs/<id>/result` (expected `result_commit`), and
-/// return the user-facing "pending result ref left in place" suffix (empty
-/// when the ref was deleted or already absent). Each call site keeps its own
-/// distinct error message string.
+/// Shared best-effort pending-result cleanup, used by all six early-return
+/// sites in `cmd_pr_merge` (seam worktree-lock failure / removal failed / dir
+/// still exists / list failed / still registered / barrier deadline): release
+/// the temp-path sibling lock, CAS-delete `refs/forge/prs/<id>/result`
+/// (expected `result_commit`), and return the user-facing "pending result ref
+/// left in place" suffix (empty when the ref was deleted or already absent).
+/// Each call site keeps its own distinct error message string.
 fn cleanup_pending_result(
     store: &EventStore,
     id: u64,
