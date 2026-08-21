@@ -180,7 +180,9 @@ fn cmd_state(store: &EventStore, kind: EventKind, args: &[String]) -> Result<Str
     Ok(format!("issue #{id} {verb}"))
 }
 
-/// Read the counter's next value (best-effort) to bound `list`.
+/// True if the given ref exists in this repo (store-level existence check,
+/// used by issue/PR commands before operating). Not a counter read — the
+/// counter is owned by `EventStore` (see `counter_next`).
 fn store_has_ref(store: &EventStore, r: &str) -> bool {
     store.repo().find_reference(r).is_ok()
 }
