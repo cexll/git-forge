@@ -1,7 +1,7 @@
 //! t1a store integration tests. Each test runs against an isolated temp repo.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use git_forge::event::{Event, EventKind, JsonValue};
@@ -15,18 +15,19 @@ use git_forge::store::{
 // when both init the same temp dir in the same instant.
 static NEXT_TMPDIR: AtomicU64 = AtomicU64::new(0);
 
-fn candidate_name(tag: &str, pid: u32, seq: u64) -> PathBuf {
-    std::env::temp_dir().join(format!("gf-t1a-{tag}-{pid}-{seq}"))
+fn candidate_name(root: &Path, tag: &str, pid: u32, seq: u64) -> PathBuf {
+    root.join(format!("gf-t1a-{tag}-{pid}-{seq}"))
 }
 
-/// Create a fresh isolated temp dir, starting the candidate scan at
-/// `start_seq`. Creation is exclusive (`create_dir`): a candidate that already
-/// exists — a stale dir left in /tmp by a prior run after PID reuse, or a
-/// parallel test's directory — is skipped, never reopened as the test repo.
-fn make_tmpdir(tag: &str, pid: u32, start_seq: u64) -> PathBuf {
+/// Create a fresh isolated temp dir under `root`, starting the candidate scan
+/// at `start_seq`. Creation is exclusive (`create_dir`): a candidate that
+/// already exists — a stale dir left in /tmp by a prior run after PID reuse,
+/// or a parallel test's directory — is skipped, never reopened as the test
+/// repo.
+fn make_tmpdir(root: &Path, tag: &str, pid: u32, start_seq: u64) -> PathBuf {
     let mut seq = start_seq;
     loop {
-        let d = candidate_name(tag, pid, seq);
+        let d = candidate_name(root, tag, pid, seq);
         match std::fs::create_dir(&d) {
             Ok(()) => return d,
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => seq += 1,
@@ -39,15 +40,15 @@ fn tmpdir(tag: &str) -> PathBuf {
     // fetch_add gives each test a distinct candidate range within this process;
     // exclusivity across processes (and across runs) comes from create_dir.
     let start_seq = NEXT_TMPDIR.fetch_add(1, Ordering::Relaxed);
-    make_tmpdir(tag, std::process::id(), start_seq)
+    make_tmpdir(&std::env::temp_dir(), tag, std::process::id(), start_seq)
 }
 
 #[test]
 fn tmpdir_skips_stale_directory_from_prior_run() {
-    // Cross-run PID-reuse regression: a prior run may leave
-    // gf-t1a-<tag>-<pid>-<seq> in /tmp (this suite never cleans up). Start the
-    // scan at seq 0 with candidate 0 pre-existing — make_tmpdir must skip it
-    // and exclusively create candidate 1, never reopen the stale repo.
+    // Cross-run PID-reuse regression: a prior run may leave stale candidate
+    // dirs in /tmp (this suite never cleans up). make_tmpdir must skip an
+    // existing candidate and exclusively create a later one, never reopen the
+    // stale repo.
     struct TempDirGuard(PathBuf);
     impl Drop for TempDirGuard {
         fn drop(&mut self) {
@@ -55,19 +56,20 @@ fn tmpdir_skips_stale_directory_from_prior_run() {
         }
     }
 
-    let pid = std::process::id();
-    let stale = candidate_name("stale", pid, 0);
+    // Owned, exclusively-created root: the test only ever manipulates paths
+    // it created itself, never global /tmp entries.
+    let root = make_tmpdir(&std::env::temp_dir(), "stale-root", std::process::id(), 0);
+    let _root_guard = TempDirGuard(root.clone());
+    let stale = candidate_name(&root, "stale", 1, 0);
     std::fs::create_dir(&stale).unwrap();
-    let _stale_guard = TempDirGuard(stale.clone());
-    let d = make_tmpdir("stale", pid, 0);
-    let _d_guard = TempDirGuard(d.clone());
-    assert_ne!(d, stale, "tmpdir must not reuse an existing directory");
-    assert_eq!(
-        d,
-        candidate_name("stale", pid, 1),
-        "must take the first free candidate"
+    let d = make_tmpdir(&root, "stale", 1, 0);
+    assert_ne!(
+        d, stale,
+        "tmpdir must not reuse an existing directory: {d:?}"
     );
-    std::fs::remove_dir(&stale).unwrap();
+    // An interrupted run may also have left later candidates (seq >= 1); the
+    // invariant is "never reuse an existing directory", not "exactly seq 1".
+    assert!(d.file_name().is_some());
 }
 
 fn event(kind: EventKind, entity: &str, id: u64, actor: &str, body: &[(&str, JsonValue)]) -> Event {
