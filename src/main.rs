@@ -46,12 +46,12 @@ fn run_forge(argv: &[String]) -> Result<String, String> {
             Some("pr") => git_forge::cli::run_pr(&argv[2..]),
             Some("help") | Some("-h") | Some("--help") => Ok(top_help()),
             Some(other) => Err(format!("unknown forge subcommand '{other}'")),
-            None => Ok("usage: git forge <issue|pr> ...".to_string()),
+            None => Ok(top_help()),
         },
         // `git-forge --help` (verify-cli contract): exit 0 with usage.
         Some("help") | Some("-h") | Some("--help") => Ok(top_help()),
         Some(other) => Err(format!("unknown command '{other}'")),
-        None => Ok("usage: git forge <issue|pr> ...".to_string()),
+        None => Ok(top_help()),
     }
 }
 

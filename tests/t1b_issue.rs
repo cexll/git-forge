@@ -228,3 +228,15 @@ fn top_level_help_exits_zero_with_usage() {
     assert_eq!(c, 0, "top-level --help failed: {e}");
     assert!(o.contains("usage: git forge"), "help output: {o}");
 }
+
+#[test]
+fn bare_invocation_and_help_share_usage() {
+    // The usage line must not be duplicated across separate code paths.
+    let dir = tmpdir("usage");
+    init_repo(&dir);
+    let (c0, o0, e0) = forge(&dir, &[]);
+    let (c1, o1, e1) = forge(&dir, &["--help"]);
+    assert_eq!(c0, 0, "bare invocation failed: {e0}");
+    assert_eq!(c1, 0, "--help failed: {e1}");
+    assert_eq!(o0, o1, "bare invocation usage must equal --help usage");
+}
