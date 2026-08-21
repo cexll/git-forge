@@ -21,25 +21,28 @@ Must-not-haves (L1): CI execution, web UI, single-file export, GitHub bridge, ac
 
 | Module | Interface (what callers must know) | Behind the seam | Depth |
 |---|---|---|---|
-| `core` (event model + folding) | `Event` types, `fold(events) -> State`, `gate(state) -> Result` | Event schema, deterministic ordering, issue/PR state derivation, merge-gate rule | Deep: pure, no I/O, fully testable; deletion would scatter state logic across CLI and store |
-| `store` (git refs) | `append(entity, event) -> EventId`, `read_chain(entity) -> Vec<Event>`, `list(kind) -> Vec<EntityRef>`, `allocate_id() -> u64` (versioned counter CAS) | Ref naming under `refs/forge/*`, commit creation, packed-ref-safe reads, counter commit chain | Deep: hides all git plumbing; callers never touch refs directly |
-| `sync` (application, L2) | `forge_push(remote)`, `forge_pull(remote)`, `ensure_refspecs(remote)` | Explicit forge refspec push, additive fetch refspec into remote-tracking namespace, per-entity DAG merge convergence (single merge commit, UUID-stable events), refspec validation/repair | Deep: convergence logic lives here, one place; not built in L1 |
-| `git` (adapter) | `merge(base, head, strategy)`, `push(remote, refspec)`, `fetch(remote)`, `worktree_add(pr)` | git2 + `git` binary shell-outs | Deep: protocol correctness delegated to git itself |
-| `cli` (entry) | `git forge <subcommand>` parsing and dispatch | clap wiring, thin `git-issue`/`git-pr` wrappers | Shallow by design: no logic, only dispatch |
-| `hooks` (installer) | `install(repo)` | Writes pre-receive/post-receive hooks (L2 enforcement), validates refspec config | Shallow; L2 grows it |
+| `event` (model) | `Event`, `EventKind`, `JsonValue`, `is_uuid_v4` | Event schema v1, UUID generation, kind/body validation | Deep: pure, no I/O, fully testable; deletion would scatter state logic across CLI and store |
+| `fold` (state derivation) | `fold(events) -> FoldState`, `IssueState`/`PrState`/`SeqState`, `first_allocation` | Deterministic ordering, issue/PR state derivation, effective review decision | Pure, no I/O |
+| `store` (git refs) | `EventStore`: `append_event`, `read_chain`, `create_pr`, `allocate_id` (versioned counter CAS), `create_pending_result_ref`/`delete_pending_result_ref`, `finalize_pr_merge` | Ref naming under `refs/forge/*`, commit creation, packed-ref-safe reads, counter commit chain, one-transaction merge completion | Deep: hides all git plumbing; callers never touch refs directly |
+| `git` (adapter) | `worktree_add`/`worktree_remove`/`worktree_list`, `base_checked_out_elsewhere`, `execute_strategy` (merge/squash/rebase), `cleanup_failed_worktree`, `require_single_merge_base` | `git` binary shell-outs for merge execution: strategy commands, abort/reset/clean failure cleanup, merge-base --all, worktree plumbing | Deep: protocol correctness delegated to git itself; the merge-gate predicate stays in `cli` |
+| `cli` (entry) | `run_issue`, `run_pr`, `run_*` dispatch; `cmd_pr_merge` orchestration (gate + temp worktree lifecycle + atomic finalize); `cmd_pr_diff`'s `git diff` shell-out | Command parsing, merge-gate predicate, pending-result cleanup helper | Shallow by design: dispatch and orchestration only; the one exception is `cmd_pr_diff`'s `git diff` |
+| `sync` (L2) | — | Explicit forge refspec push, additive fetch refspec, per-entity DAG merge convergence | Not built in L1; no `src/sync.rs` yet |
+| `hooks` (L2) | — | Pre-receive/post-receive hooks, refspec validation | Not built in L1; no `src/hooks.rs` yet |
 
 ## Dependency Rules
 
 ```
-cli → store → core
+cli → store → event/fold
 cli → git
-core: zero external dependencies (no git, no I/O)
+git → git2 (no core, no store)
+event/fold: zero external dependencies (no git, no I/O)
 ```
 
-- `core` never imports git2 or performs I/O; tests run with no infrastructure.
-- `store` depends on `core` types only.
-- `cli` is the only module that parses user input.
-- `sync` (L2) depends on `store`, `core`, and `git`; it is not wired in L1.
+- `event`/`fold` never import git2 or perform I/O; tests run with no infrastructure.
+- `store` depends on `event`/`fold` types only.
+- `cli` is the only module that parses user input and hosts the merge-gate predicate.
+- `git` is the only module that shells out for merge execution; it does not import `cli` or `store`.
+- `sync` (L2) will depend on `store`, `event`/`fold`, and `git`; it is not wired in L1.
 
 ## Directory Structure
 
@@ -48,24 +51,28 @@ Flat, feature-first (complexity ladder: solo dev / MVP — layers not earned yet
 ```
 git-forge/
 ├── Cargo.toml
+├── AGENTS.md
 ├── CONTEXT.md
+├── constraints.yaml
+├── justfile
 ├── docs/
 │   ├── adr/0001-…0006-…
 │   └── architecture/git-forge.md
 ├── src/
-│   ├── main.rs          # git forge entry
-│   ├── cli.rs           # clap commands + wrapper dispatch
-│   ├── event.rs         # event model + JSON schema
+│   ├── main.rs          # `git forge` entry binary
+│   ├── lib.rs           # module root: declares cli, event, fold, git, store
+│   ├── cli.rs           # command parsing + dispatch; cmd_pr_merge orchestration, merge-gate predicate, pending-result cleanup, cmd_pr_diff git diff
+│   ├── event.rs         # event model + JSON schema (pure)
 │   ├── fold.rs          # state derivation (pure)
-│   ├── gate.rs          # merge gate rule (pure)
-│   ├── store.rs         # refs read/write via git2
-│   ├── sync.rs          # forge push/pull, refspec, rebase-retry
-│   ├── git.rs           # git binary adapter
-│   └── hooks.rs         # hook installer
+│   ├── git.rs           # git binary adapter: merge-execution shell-outs (worktree, strategies, cleanup, merge-base)
+│   └── store.rs         # refs read/write via git2
 └── tests/
-    ├── e2e_workflow.rs  # issue → PR → review → gate → merge
-    ├── e2e_counter.rs   # concurrent issue new → distinct sequential ids (CAS)
-    └── (L2) e2e_push_pull.rs, e2e_converge.rs  # refspec sync, DAG convergence
+    ├── t0_core.rs       # event/fold unit tests
+    ├── t1a_store.rs     # store layer tests
+    ├── t1b_issue.rs     # issue CLI tests
+    ├── t2_pr.rs         # PR create/show/review/diff tests
+    └── t3_merge.rs      # merge strategy + failure-cleanup tests
+    (L2) e2e_push_pull.rs, e2e_converge.rs  # refspec sync, DAG convergence (not built)
 ```
 
 ## Data Flow

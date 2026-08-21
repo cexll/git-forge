@@ -73,8 +73,15 @@ git-forge/
 │   ├── adr/0001..0006    # legacy decision history (frozen)
 │   ├── decisions/        # four-zone decision-record lifecycle (NEW decisions)
 │   └── architecture/git-forge.md   # WIRE CONTRACT — normative
-├── src/                  # lands per devflow feature (event/fold t0, store t1a, cli t1b, …)
-├── tests/                # lands per devflow feature (t0_core, e2e_*)
+├── src/
+│   ├── main.rs           # `git forge` entry binary
+│   ├── lib.rs            # module root: declares cli, event, fold, git, store
+│   ├── cli.rs            # command parsing + dispatch; cmd_pr_merge orchestration, merge-gate predicate, pending-result cleanup
+│   ├── event.rs          # event model + JSON schema (pure)
+│   ├── fold.rs           # state derivation (pure)
+│   ├── git.rs            # git binary adapter: merge-execution shell-outs (worktree, strategies, cleanup, merge-base)
+│   └── store.rs          # refs read/write via git2
+├── tests/                # t0_core, t1a_store, t1b_issue, t2_pr, t3_merge
 └── .specs/git-forge/     # plan + validation contract (committed); missions/ is gitignored
 ```
 
@@ -82,9 +89,9 @@ git-forge/
 
 | Layer | Path | May import from | Must NOT import |
 |-------|------|-----------------|-----------------|
-| core (pure) | `src/event.rs`, `src/fold.rs`, `src/gate.rs` | std only | git2, I/O |
+| core (pure) | `src/event.rs`, `src/fold.rs` | std only | git2, I/O |
 | store | `src/store.rs` | core | — |
-| git adapter | `src/git.rs` | — | core (except merge gate types via cli) |
+| git adapter | `src/git.rs` | git2 only | core, cli (merge-gate predicate stays in cli) |
 | cli | `src/cli.rs`, `src/main.rs` | core, store, git | — |
 
 - `core` has zero external dependencies and no I/O — enforced by clippy? No: enforced by review; `Cargo.toml` stays dep-free for the core slice.
@@ -161,7 +168,7 @@ Before submitting or accepting a review, verify:
 
 ## Critical Paths
 
-White-box review required for changes touching these (L3): `src/store.rs` (git2 ref transactions, counter CAS, immutable snapshot refs) and merge gate/merge execution (`src/gate.rs`, merge strategies, temporary worktree handling, pending-result ref). These are irreversible operations — ref writes and merges mutate the repository. Any diff touching a critical path is flagged for human review.
+White-box review required for changes touching these (L3): `src/store.rs` (git2 ref transactions, counter CAS, immutable snapshot refs) and merge gate/merge execution (`src/cli.rs` merge-gate predicate, merge strategies in `src/git.rs`, temporary worktree handling, pending-result ref). These are irreversible operations — ref writes and merges mutate the repository. Any diff touching a critical path is flagged for human review.
 
 ## Agent Operating Rules
 

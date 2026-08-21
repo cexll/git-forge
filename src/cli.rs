@@ -289,62 +289,6 @@ fn resolve_local_branch(store: &EventStore, arg: &str) -> Result<(String, git2::
     Ok((name, oid))
 }
 
-/// `git merge-base --all <a> <b>` count must be exactly 1. Zero covers
-/// unrelated/shallow histories (shallow → ask to deepen); multiple covers
-/// criss-cross. Returns the single merge-base OID.
-fn require_single_merge_base(
-    repo: &git2::Repository,
-    a: git2::Oid,
-    b: git2::Oid,
-) -> Result<git2::Oid, String> {
-    use std::process::Command;
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo.path())
-        .args(["merge-base", "--all", &a.to_string(), &b.to_string()])
-        .output()
-        .map_err(|e| format!("git merge-base failed: {e}"))?;
-    let stdout =
-        std::str::from_utf8(&out.stdout).map_err(|_| "merge-base output not utf8".to_string())?;
-    let lines: Vec<&str> = stdout.trim().lines().filter(|l| !l.is_empty()).collect();
-    // `git merge-base --all` exits 1 with EMPTY stdout when the two commits
-    // share no common ancestor (unrelated histories, or shallow/incomplete
-    // history). Exit 128 (nonempty stderr) is a genuine git failure. Without
-    // this classification the deepen/unshallow guidance below is dead code.
-    if !out.status.success() {
-        if out.status.code() == Some(1) && lines.is_empty() {
-            return Err(zero_merge_base_error(repo));
-        }
-        return Err(format!(
-            "git merge-base failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
-    }
-    if lines.len() != 1 {
-        if lines.is_empty() {
-            return Err(zero_merge_base_error(repo));
-        }
-        return Err(format!(
-            "multiple merge bases ({}) suggest a criss-cross history; cannot create the PR",
-            lines.len()
-        ));
-    }
-    lines[0]
-        .trim()
-        .parse::<git2::Oid>()
-        .map_err(|_| "invalid merge-base oid".to_string())
-}
-
-/// User-facing error for zero merge bases: unrelated histories (no common
-/// ancestor) vs shallow/incomplete history (must deepen/unshallow).
-fn zero_merge_base_error(repo: &git2::Repository) -> String {
-    if repo.is_shallow() {
-        "no merge base (shallow history) — deepen/unshallow the repository first".to_string()
-    } else {
-        "no merge base — the source/base histories are unrelated, or history is shallow; deepen/unshallow before creating a PR".to_string()
-    }
-}
-
 /// `git forge pr create --source <branch> --base <branch> <title>`
 fn cmd_pr_create(store: &EventStore, args: &[String]) -> Result<String, String> {
     let mut source = None;
@@ -396,7 +340,7 @@ fn cmd_pr_create(store: &EventStore, args: &[String]) -> Result<String, String> 
     if source_oid == base_oid {
         return Err("source and base branches resolve to the same commit (no self-PR)".into());
     }
-    let merge_base = require_single_merge_base(store.repo(), base_oid, source_oid)?;
+    let merge_base = crate::git::require_single_merge_base(store.repo(), base_oid, source_oid)?;
 
     let id = store
         .create_pr(
@@ -631,74 +575,6 @@ fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
 }
 
-/// Run `git` in the given working directory, returning (success, stdout,
-/// stderr). Used for worktree merge/rebase execution and cleanup.
-fn git_in(dir: &std::path::Path, args: &[&str]) -> (bool, String, String) {
-    use std::process::Command;
-    let out = Command::new("git").arg("-C").arg(dir).args(args).output();
-    match out {
-        Ok(o) => (
-            o.status.success(),
-            String::from_utf8_lossy(&o.stdout).trim().to_string(),
-            String::from_utf8_lossy(&o.stderr).trim().to_string(),
-        ),
-        Err(e) => (false, String::new(), format!("failed to spawn git: {e}")),
-    }
-}
-
-/// True if `git rebase` is mid-flight in the worktree (either rebase-merge or
-/// rebase-apply state dir exists, resolved via `git rev-parse --git-path`).
-fn rebase_in_progress(dir: &std::path::Path) -> bool {
-    for sub in ["rebase-merge", "rebase-apply"] {
-        let (ok, out, _) = git_in(dir, &["rev-parse", "--git-path", sub]);
-        if ok {
-            let p = out.trim();
-            if !p.is_empty() {
-                let abs = if p.starts_with('/') || dir.is_absolute() {
-                    let base = std::path::Path::new(p);
-                    if base.is_absolute() {
-                        base.to_path_buf()
-                    } else {
-                        dir.join(base)
-                    }
-                } else {
-                    dir.join(p)
-                };
-                if abs.exists() {
-                    return true;
-                }
-            }
-        }
-    }
-    false
-}
-
-/// True if `base_ref` is checked out in a non-temporary worktree (main or a
-/// linked one). Refuses advancing a checked-out branch without updating its
-/// working tree (wire contract § Checked-out base guard). Aborts (Err) if the
-/// worktree list cannot be enumerated — a failed guard must not silently
-/// bypass the check.
-fn base_checked_out_elsewhere(store: &EventStore, base_ref: &str) -> Result<bool, String> {
-    use std::process::Command;
-    let repo_dir = store
-        .repo()
-        .workdir()
-        .map(|p| p.to_path_buf())
-        .ok_or_else(|| "cannot resolve repository working directory".to_string())?;
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(&repo_dir)
-        .args(["worktree", "list", "--porcelain"])
-        .output()
-        .map_err(|e| format!("git worktree list failed: {e}"))?;
-    if !out.status.success() {
-        return Err("git worktree list failed".into());
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
-    let want = format!("branch refs/heads/{base_ref}");
-    Ok(text.lines().any(|l| l.trim() == want))
-}
-
 /// `git forge pr merge [<n>] [--squash|--rebase]`
 ///
 /// Fold the PR chain, require effective review decision = approve, then merge
@@ -800,14 +676,6 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
         ));
     }
 
-    // Checked-out base guard: refuse if base is checked out anywhere.
-    if base_checked_out_elsewhere(store, &base_ref)? {
-        return Err(format!(
-            "base branch '{base_ref}' is checked out in a worktree; \
-             run the merge from/against an un-checked-out base"
-        ));
-    }
-
     // Temporary worktree, detached at the immutable base OID. worktree
     // add/remove/list are REPOSITORY-level commands: run them from the main
     // worktree, never from the temp dir's parent.
@@ -816,6 +684,14 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
         .workdir()
         .map(|p| p.to_path_buf())
         .ok_or_else(|| "cannot resolve repository working directory".to_string())?;
+
+    // Checked-out base guard: refuse if base is checked out anywhere.
+    if crate::git::base_checked_out_elsewhere(&repo_dir, &base_ref)? {
+        return Err(format!(
+            "base branch '{base_ref}' is checked out in a worktree; \
+             run the merge from/against an un-checked-out base"
+        ));
+    }
     // Repo-specific temp worktree path: hash the canonical workdir so parallel
     // test repos (same pid) never collide on the global temp dir.
     use std::hash::{Hash, Hasher};
@@ -855,17 +731,10 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
         {
             Ok(h) => {
                 lock_handle = Some(h);
-                let (ok, _, err) = git_in(
-                    &repo_dir,
-                    &[
-                        "worktree",
-                        "add",
-                        "--detach",
-                        tmp.to_str().unwrap_or("/tmp/none"),
-                        &detach_oid.to_string(),
-                    ],
-                );
-                break (ok, err);
+                match crate::git::worktree_add(&repo_dir, &tmp, &detach_oid) {
+                    Ok(()) => break (true, String::new()),
+                    Err(err) => break (false, err),
+                }
             }
             Err(_) if attempt < 16 => {
                 attempt += 1;
@@ -898,69 +767,39 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
     };
 
     // Execute the strategy inside the worktree. result_commit = worktree HEAD.
-    let result_commit = match strategy {
-        "rebase" => {
-            let (ok, _o, e) = git_in(
+    // The squash path commits with the PR title (a state field, checked here);
+    // all git shell-outs run in the adapter.
+    let title = if strategy == "squash" {
+        state.title.as_deref().ok_or_else(|| {
+            crate::git::cleanup_failed_worktree(
+                &repo_dir,
                 &tmp,
-                &[
-                    "rebase",
-                    "--onto",
-                    &base_oid.to_string(),
-                    &merge_base.to_string(),
-                ],
-            );
-            if !ok {
-                return Err(cleanup_failed_worktree(&repo_dir, &tmp, "rebase", e));
-            }
-            let (ok2, out2, e2) = git_in(&tmp, &["rev-parse", "HEAD"]);
-            if !ok2 {
-                return Err(cleanup_failed_worktree(&repo_dir, &tmp, "rebase", e2));
-            }
-            out2
-        }
-        "squash" => {
-            let (ok, _o, e) = git_in(&tmp, &["merge", "--squash", &source_oid.to_string()]);
-            if !ok {
-                return Err(cleanup_failed_worktree(&repo_dir, &tmp, "squash", e));
-            }
-            let title = state.title.as_deref().ok_or_else(|| {
-                cleanup_failed_worktree(&repo_dir, &tmp, "squash", "PR has no title".to_string())
-            })?;
-            let (ok2, _o2, e2) = git_in(&tmp, &["commit", "-m", title]);
-            if !ok2 {
-                return Err(cleanup_failed_worktree(&repo_dir, &tmp, "squash", e2));
-            }
-            let (ok3, out3, e3) = git_in(&tmp, &["rev-parse", "HEAD"]);
-            if !ok3 {
-                return Err(cleanup_failed_worktree(&repo_dir, &tmp, "squash", e3));
-            }
-            out3
-        }
-        _ => {
-            // default merge commit; --no-ff --no-edit, never opens an editor.
-            let (ok, _o, e) = git_in(
-                &tmp,
-                &["merge", "--no-ff", "--no-edit", &source_oid.to_string()],
-            );
-            if !ok {
-                return Err(cleanup_failed_worktree(&repo_dir, &tmp, "merge", e));
-            }
-            let (ok2, out2, e2) = git_in(&tmp, &["rev-parse", "HEAD"]);
-            if !ok2 {
-                return Err(cleanup_failed_worktree(&repo_dir, &tmp, "merge", e2));
-            }
-            out2
-        }
+                "squash",
+                "PR has no title".to_string(),
+            )
+        })?
+    } else {
+        ""
     };
+    let result_commit = crate::git::execute_strategy(
+        &repo_dir, &tmp, strategy, source_oid, base_oid, merge_base, title,
+    )?;
     let result_commit = result_commit.parse::<git2::Oid>().map_err(|_| {
-        cleanup_failed_worktree(&repo_dir, &tmp, "merge", "invalid result commit".into())
+        crate::git::cleanup_failed_worktree(
+            &repo_dir,
+            &tmp,
+            "merge",
+            "invalid result commit".into(),
+        )
     })?;
 
     // Keep result_commit reachable across worktree removal (GC could prune the
     // merge commit before the final transaction pins it).
     store
         .create_pending_result_ref(id, result_commit)
-        .map_err(|e| cleanup_failed_worktree(&repo_dir, &tmp, "merge", e.to_string()))?;
+        .map_err(|e| {
+            crate::git::cleanup_failed_worktree(&repo_dir, &tmp, "merge", e.to_string())
+        })?;
 
     // Remove the temporary worktree, then verify it is gone. worktree
     // remove/list run from the repository.
@@ -970,39 +809,17 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
     // cleanup). Inert in release builds and when the env var is unset.
     #[cfg(debug_assertions)]
     if std::env::var("GIT_FORGE_TEST_FAIL_WORKTREE_REMOVE").as_deref() == Ok("1") {
-        let (lock_ok, _, lock_err) = git_in(
-            &repo_dir,
-            &["worktree", "lock", tmp.to_str().unwrap_or("/tmp/none")],
-        );
-        if !lock_ok {
+        if let Err(lock_err) = crate::git::worktree_lock(&repo_dir, &tmp) {
             return Err(format!(
                 "test seam: failed to lock temp worktree for removal-failure injection: {lock_err}"
             ));
         }
     }
-    let (ok_rm, _o, err_rm) = git_in(
-        &repo_dir,
-        &[
-            "worktree",
-            "remove",
-            "--force",
-            tmp.to_str().unwrap_or("/tmp/none"),
-        ],
-    );
-    if !ok_rm {
+    if let Err(err_rm) = crate::git::worktree_remove(&repo_dir, &tmp) {
         // Best-effort: remove the pending result ref (CAS expected OID); the
         // worktree itself stays (can't force-clean a failed removal safely).
         // Report only if the pending ref remains.
-        release_lock(&mut lock_handle, &tmp);
-        let left = match store.delete_pending_result_ref(id, result_commit) {
-            Ok(true) | Ok(false) => false,
-            Err(_) => true,
-        };
-        let pending = if left {
-            format!("; pending result ref refs/forge/prs/{id}/result left in place")
-        } else {
-            String::new()
-        };
+        let pending = cleanup_pending_result(store, id, result_commit, &mut lock_handle, &tmp);
         return Err(format!(
             "merge succeeded but temp worktree removal failed: {err_rm} \
              (worktree left at {}{pending})",
@@ -1014,55 +831,31 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
     // sibling lock — deleting another process's worktree is never safe).
     // AC-005h: verify the disposable directory is actually gone.
     if tmp.exists() {
-        release_lock(&mut lock_handle, &tmp);
-        let left = match store.delete_pending_result_ref(id, result_commit) {
-            Ok(true) | Ok(false) => false,
-            Err(_) => true,
-        };
-        let pending = if left {
-            format!("; pending result ref refs/forge/prs/{id}/result left in place")
-        } else {
-            String::new()
-        };
+        let pending = cleanup_pending_result(store, id, result_commit, &mut lock_handle, &tmp);
         return Err(format!(
             "merge succeeded but temp worktree directory still exists at {}{pending}",
             tmp.display()
         ));
     }
-    let (ok_l, list_l, err_l) = git_in(&repo_dir, &["worktree", "list", "--porcelain"]);
-    if !ok_l {
-        // Best-effort: remove the pending result ref; cannot verify the
-        // worktree is gone → hard abort before any ref update.
-        release_lock(&mut lock_handle, &tmp);
-        let left = match store.delete_pending_result_ref(id, result_commit) {
-            Ok(true) | Ok(false) => false,
-            Err(_) => true,
-        };
-        let pending = if left {
-            format!("; pending result ref refs/forge/prs/{id}/result left in place")
-        } else {
-            String::new()
-        };
-        return Err(format!(
-            "merge succeeded but worktree verification failed (git worktree list: {err_l}){pending}"
-        ));
-    }
-    if list_l.contains(&tmp.to_string_lossy().to_string()) {
-        // Best-effort: remove the pending result ref; the stale registration
-        // is reported but the result commit is not left dangling.
-        let left = match store.delete_pending_result_ref(id, result_commit) {
-            Ok(true) | Ok(false) => false,
-            Err(_) => true,
-        };
-        let pending = if left {
-            format!("; pending result ref refs/forge/prs/{id}/result left in place")
-        } else {
-            String::new()
-        };
-        return Err(format!(
-            "merge succeeded but temp worktree still registered at {}{pending}",
-            tmp.display()
-        ));
+    match crate::git::worktree_list(&repo_dir) {
+        Err(err_l) => {
+            // Best-effort: remove the pending result ref; cannot verify the
+            // worktree is gone → hard abort before any ref update.
+            let pending = cleanup_pending_result(store, id, result_commit, &mut lock_handle, &tmp);
+            return Err(format!(
+                "merge succeeded but worktree verification failed (git worktree list: {err_l}){pending}"
+            ));
+        }
+        Ok(list_l) if list_l.contains(&tmp.to_string_lossy().to_string()) => {
+            // Best-effort: remove the pending result ref; the stale registration
+            // is reported but the result commit is not left dangling.
+            let pending = cleanup_pending_result(store, id, result_commit, &mut lock_handle, &tmp);
+            return Err(format!(
+                "merge succeeded but temp worktree still registered at {}{pending}",
+                tmp.display()
+            ));
+        }
+        Ok(_) => {}
     }
     // Worktree removed AND verified gone: release our path lock so a concurrent
     // same-repo merge can reuse the path, then run barrier + final transaction.
@@ -1073,11 +866,8 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
     if let Err(b) = maybe_run_test_barrier() {
         // Deadline failed: remove the pending ref best-effort (CAS expected
         // OID); report only if it remains.
-        let left = match store.delete_pending_result_ref(id, result_commit) {
-            Ok(true) | Ok(false) => false,
-            Err(_) => true,
-        };
-        if left {
+        let pending = cleanup_pending_result(store, id, result_commit, &mut lock_handle, &tmp);
+        if !pending.is_empty() {
             return Err(format!(
                 "{b} (pending result ref refs/forge/prs/{id}/result left in place)"
             ));
@@ -1099,67 +889,34 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
     Ok(format!("merged PR #{id} into {base_ref} ({result_commit})"))
 }
 
-/// Clean up a failed strategy execution: abort merge/rebase (rebase only when
-/// state exists), run `git clean -fd`, remove the temp worktree. Returns the
-/// user-facing error message.
-fn cleanup_failed_worktree(
-    repo_dir: &std::path::Path,
+/// Shared best-effort pending-result cleanup, used by all five early-return
+/// sites in `cmd_pr_merge` (removal failed / dir still exists / list failed /
+/// still registered / barrier deadline): release the temp-path sibling lock,
+/// CAS-delete `refs/forge/prs/<id>/result` (expected `result_commit`), and
+/// return the user-facing "pending result ref left in place" suffix (empty
+/// when the ref was deleted or already absent). Each call site keeps its own
+/// distinct error message string.
+fn cleanup_pending_result(
+    store: &EventStore,
+    id: u64,
+    result_commit: git2::Oid,
+    lock_handle: &mut Option<std::fs::File>,
     tmp: &std::path::Path,
-    kind: &str,
-    cause: String,
 ) -> String {
-    match kind {
-        // Squash failure: `git merge --squash` stages without a MERGE_HEAD,
-        // so `merge --abort` cannot reset. Reset the detached worktree back to
-        // HEAD (= the /base OID it was added at), then clean + remove.
-        "squash" => {
-            let _ = git_in(tmp, &["reset", "--hard", "HEAD"]);
-        }
-        // Default merge failure: abort the in-flight merge (MERGE_HEAD state).
-        "merge" => {
-            let (state_ok, _, _) = git_in(tmp, &["rev-parse", "--verify", "-q", "MERGE_HEAD"]);
-            if state_ok {
-                let _ = git_in(tmp, &["merge", "--abort"]);
-            }
-        }
-        // Rebase failure: abort only when rebase state exists.
-        "rebase" => {
-            if rebase_in_progress(tmp) {
-                let _ = git_in(tmp, &["rebase", "--abort"]);
-            }
-        }
-        _ => {}
-    }
-    let _ = git_in(tmp, &["clean", "-fd"]);
-    let (ok_rm, _o, err_rm) = git_in(
-        repo_dir,
-        &[
-            "worktree",
-            "remove",
-            "--force",
-            tmp.to_str().unwrap_or("/tmp/none"),
-        ],
-    );
-    if !ok_rm {
-        // The registration is still live (e.g. the worktree is locked), so
-        // deleting the directory underneath it would leave git's registration
-        // pointing at a path that no longer exists — a dangling worktree
-        // (AC-005d: no registration without its directory). Preserve the
-        // leftover and report it so the operator can unlock/remove it.
-        // Release the sibling lock so the suffix stays reusable.
-        let _ = std::fs::remove_file(tmp.with_extension("lock"));
-        return format!(
-            "git {kind} failed: {cause}; temp worktree removal failed and the \
-             worktree is left at \"{}\" ({err_rm}) — unlock and remove it manually",
-            tmp.display()
-        );
-    }
-    // `git worktree remove` already removed the directory; do NOT run a
-    // recursive delete here (each path is owned by whichever merge holds its
-    // sibling lock — deleting another process's worktree is never safe).
-    // AC-005h: verify the disposable directory is actually gone.
+    // Release the path lock (drop handle + remove file) so a concurrent
+    // same-repo merge can reuse the path. Idempotent: runs even at sites
+    // where the lock is already released.
+    *lock_handle = None;
     let _ = std::fs::remove_file(tmp.with_extension("lock"));
-    format!("git {kind} failed: {cause}; worktree cleaned up, no ref changes made")
+    let left = match store.delete_pending_result_ref(id, result_commit) {
+        Ok(true) | Ok(false) => false,
+        Err(_) => true,
+    };
+    if left {
+        format!("; pending result ref refs/forge/prs/{id}/result left in place")
+    } else {
+        String::new()
+    }
 }
 
 /// Test-only pending-window barrier (wire contract § Test-only pending-window
