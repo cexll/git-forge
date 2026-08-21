@@ -8,9 +8,13 @@
 #   * Source repo under test: $GDOGFOOD_SRC (default dsh-deepwork). The forge
 #     under test is NEVER the live worktree — everything runs against a
 #     disposable clone.
+#   * Preflight: GDOGFOOD_SRC must exist, be a git repository, and hold the
+#     working files the checks use (PLAN.md); a clear one-line error otherwise.
 #   * Binary: builds/refreshes the release binary from the git-forge checkout
-#     that contains this script (never a stale binary), then copies it plus
-#     the git-issue/git-pr dispatch wrappers into a private temp bin dir.
+#     that contains this script (never a stale binary) into a controlled temp
+#     --target-dir (immune to CARGO_TARGET_DIR / cargo target-dir config), then
+#     copies it plus the git-issue/git-pr dispatch wrappers into a private temp
+#     bin dir.
 #   * Temp dirs: mktemp -d, removed on EXIT via trap. Nothing escapes.
 set -eu
 
@@ -21,16 +25,33 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # Source repo this run dogfoods against (parameterizable).
 SRC="${GDOGFOOD_SRC:-/Users/chenwenjie/workspaces/dsh-deepwork}"
 
+# Preflight GDOGFOOD_SRC: an existing git-repo directory holding the working
+# files the checks exercise (PLAN.md). Fail loud with a one-line error naming
+# the path and the specific requirement.
+if [ ! -e "$SRC" ]; then
+  echo "gf-dogfood: GDOGFOOD_SRC '$SRC' does not exist" >&2; exit 1
+elif [ ! -d "$SRC" ]; then
+  echo "gf-dogfood: GDOGFOOD_SRC '$SRC' is not a directory" >&2; exit 1
+elif ! git -C "$SRC" rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  echo "gf-dogfood: GDOGFOOD_SRC '$SRC' is not a git repository" >&2; exit 1
+elif [ ! -f "$SRC/PLAN.md" ]; then
+  echo "gf-dogfood: GDOGFOOD_SRC '$SRC' is missing the expected working file PLAN.md" >&2; exit 1
+fi
+
 T="$(mktemp -d)"
 trap 'rm -rf "$T"' EXIT
 BIN="$T/bin"
+TGT="$T/target"
 mkdir -p "$BIN"
 
-# Build/refresh the release binary from THIS checkout; never test a stale one.
-( cd "$REPO_ROOT" && cargo build --release ) >/dev/null
-cp "$REPO_ROOT/target/release/git-forge" "$BIN/git-forge"
-cp "$REPO_ROOT/target/release/git-forge" "$BIN/git-issue"
-cp "$REPO_ROOT/target/release/git-forge" "$BIN/git-pr"
+# Build/refresh the release binary from THIS checkout into a controlled temp
+# target dir. --target-dir overrides CARGO_TARGET_DIR and cargo target-dir
+# config, so the checkout never gains a git-visible target/ and we never build
+# elsewhere / consume a stale or externally redirected binary.
+( cd "$REPO_ROOT" && cargo build --release --target-dir "$TGT" ) >/dev/null
+cp "$TGT/release/git-forge" "$BIN/git-forge"
+cp "$TGT/release/git-forge" "$BIN/git-issue"
+cp "$TGT/release/git-forge" "$BIN/git-pr"
 
 git clone -q "$SRC" "$T/dogfood"
 git clone -q "$SRC" "$T/dogfood2"

@@ -65,10 +65,13 @@ e2e:
     fi
 
 # Full 45-check dogfood e2e (scripts/gf-dogfood.sh). Self-contained:
-# builds/refreshes the release binary from THIS checkout (never a stale one),
-# clones GDOGFOOD_SRC (default dsh-deepwork) into a mktemp -d disposable area,
-# runs the 45 checks from a non-base checkout, and exits 0 iff the dogfood
-# summary reports pass=45 fail=0. Temp dirs are trap-cleaned on exit.
+# builds/refreshes the release binary from THIS checkout (never a stale one)
+# into a controlled temp --target-dir (immune to CARGO_TARGET_DIR / cargo
+# target-dir config; no git-visible target/ left in the checkout), preflights
+# GDOGFOOD_SRC (env, default dsh-deepwork: existing dir, git repo, PLAN.md
+# present), clones it into a mktemp -d disposable area, runs the 45 checks from
+# a non-base checkout, and exits 0 iff the dogfood summary reports pass=45
+# fail=0. Temp dirs are trap-cleaned on exit.
 dogfood:
     bash scripts/gf-dogfood.sh
 
