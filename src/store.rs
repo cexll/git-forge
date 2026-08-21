@@ -367,18 +367,26 @@ impl EventStore {
     /// so a repo with only user.email set would otherwise mis-fall back. The
     /// email is the wire contract; user.name is irrelevant to the actor.
     ///
-    /// Falls back to the store default `forge@localhost` only when the key is
-    /// not configured at all; malformed or unreadable config (not a missing
-    /// key) propagates as an error so an unusable identity surfaces.
+    /// Falls back to the store default `forge@localhost` when the key is not
+    /// configured at all OR is set to an empty/whitespace value (an empty
+    /// string counts as absent: libgit2 returns it as-is, not as NotFound);
+    /// malformed or unreadable config (an error other than a missing key)
+    /// propagates as `StoreError` so an unusable identity surfaces.
     pub fn actor(&self) -> Result<String, StoreError> {
-        self.repo
+        let email = self
+            .repo
             .config()
             .map_err(StoreError::Git)?
-            .get_string("user.email")
-            .or_else(|e| match e.code() {
-                git2::ErrorCode::NotFound => Ok("forge@localhost".to_string()),
-                _ => Err(StoreError::Git(e)),
-            })
+            .get_string("user.email");
+        match email {
+            // `git config user.email ""` leaves the key present-but-empty;
+            // get_string yields Ok("") (not NotFound). Semantically that is no
+            // usable identity, so it gets the same fallback as an absent key.
+            Ok(value) if value.trim().is_empty() => Ok("forge@localhost".to_string()),
+            Ok(value) => Ok(value),
+            Err(e) if e.code() == git2::ErrorCode::NotFound => Ok("forge@localhost".to_string()),
+            Err(e) => Err(StoreError::Git(e)),
+        }
     }
 
     fn counter_next_from_entry(&self, entry: &TreeEntry<'_>) -> Result<u64, StoreError> {

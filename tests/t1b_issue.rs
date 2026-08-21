@@ -388,6 +388,42 @@ fn cli_events_fallback_to_store_default_when_no_identity_configured() {
 }
 
 #[test]
+fn cli_events_fallback_to_store_default_when_user_email_is_empty() {
+    // F-027 regression: `git config user.email ""` leaves the key present-but-
+    // empty in .git/config, and libgit2's get_string returns that empty string
+    // as-is (NOT NotFound). The old actor() recorded an empty-string actor,
+    // violating the wire contract `"actor": "<user.email>"`. An empty/whitespace
+    // value is semantically "no email": every CLI-written event must carry the
+    // store default forge@localhost and commands must still succeed. The hermetic
+    // forge() env guarantees no machine/user-level identity leaks in to mask it.
+    let dir = tmpdir("actor-empty-email");
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&dir)
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.email", ""])
+        .current_dir(&dir)
+        .status()
+        .unwrap();
+    assert_eq!(
+        forge(&dir, &["forge", "issue", "new", "T", "desc"]).0,
+        0,
+        "empty user.email repo: issue new must still succeed"
+    );
+    assert_eq!(forge(&dir, &["forge", "issue", "comment", "1", "hi"]).0, 0);
+    assert_eq!(forge(&dir, &["forge", "issue", "close", "1"]).0, 0);
+    assert_eq!(forge(&dir, &["forge", "issue", "reopen", "1"]).0, 0);
+    let actors = event_chain_actors(&dir);
+    assert_eq!(actors.len(), 4);
+    assert!(
+        actors.iter().all(|a| a == "forge@localhost"),
+        "empty user.email: every event actor must fall back to the store default, got: {actors:?}"
+    );
+}
+
+#[test]
 fn concurrent_comments_both_succeed() {
     let dir = tmpdir("concurrent");
     init_repo(&dir);
