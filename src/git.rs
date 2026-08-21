@@ -134,11 +134,10 @@ pub(crate) fn worktree_list(repo_dir: &Path) -> Result<String, String> {
     let r = git_in_with_status(repo_dir, &["worktree", "list", "--porcelain"]);
     match r.status {
         Some(0) => Ok(r.stdout),
-        None => Err(format!(
-            "git worktree list failed: {}",
-            r.raw_spawn_error
-                .expect("spawn failure always carries the raw io error")
-        )),
+        None => match r.raw_spawn_error {
+            Some(e) => Err(format!("git worktree list failed: {e}")),
+            None => Err("git worktree list failed".to_string()),
+        },
         Some(_) => Err("git worktree list failed".to_string()),
     }
 }
@@ -322,11 +321,10 @@ pub(crate) fn require_single_merge_base(
     if r.status != Some(0) {
         match r.status {
             None => {
-                return Err(format!(
-                    "git merge-base failed: {}",
-                    r.raw_spawn_error
-                        .expect("spawn failure always carries the raw io error")
-                ));
+                return Err(match r.raw_spawn_error {
+                    Some(e) => format!("git merge-base failed: {e}"),
+                    None => "git merge-base failed".to_string(),
+                });
             }
             Some(1) if lines.is_empty() => return Err(zero_merge_base_error(repo)),
             Some(_) => return Err(format!("git merge-base failed: {}", r.stderr.trim())),
