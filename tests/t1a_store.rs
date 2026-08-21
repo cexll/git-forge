@@ -15,11 +15,59 @@ use git_forge::store::{
 // when both init the same temp dir in the same instant.
 static NEXT_TMPDIR: AtomicU64 = AtomicU64::new(0);
 
+fn candidate_name(tag: &str, pid: u32, seq: u64) -> PathBuf {
+    std::env::temp_dir().join(format!("gf-t1a-{tag}-{pid}-{seq}"))
+}
+
+/// Create a fresh isolated temp dir, starting the candidate scan at
+/// `start_seq`. Creation is exclusive (`create_dir`): a candidate that already
+/// exists — a stale dir left in /tmp by a prior run after PID reuse, or a
+/// parallel test's directory — is skipped, never reopened as the test repo.
+fn make_tmpdir(tag: &str, pid: u32, start_seq: u64) -> PathBuf {
+    let mut seq = start_seq;
+    loop {
+        let d = candidate_name(tag, pid, seq);
+        match std::fs::create_dir(&d) {
+            Ok(()) => return d,
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => seq += 1,
+            Err(e) => panic!("cannot create temp dir {d:?}: {e}"),
+        }
+    }
+}
+
 fn tmpdir(tag: &str) -> PathBuf {
-    let n = NEXT_TMPDIR.fetch_add(1, Ordering::Relaxed);
-    let d = std::env::temp_dir().join(format!("gf-t1a-{tag}-{}-{n}", std::process::id()));
-    std::fs::create_dir_all(&d).unwrap();
-    d
+    // fetch_add gives each test a distinct candidate range within this process;
+    // exclusivity across processes (and across runs) comes from create_dir.
+    let start_seq = NEXT_TMPDIR.fetch_add(1, Ordering::Relaxed);
+    make_tmpdir(tag, std::process::id(), start_seq)
+}
+
+#[test]
+fn tmpdir_skips_stale_directory_from_prior_run() {
+    // Cross-run PID-reuse regression: a prior run may leave
+    // gf-t1a-<tag>-<pid>-<seq> in /tmp (this suite never cleans up). Start the
+    // scan at seq 0 with candidate 0 pre-existing — make_tmpdir must skip it
+    // and exclusively create candidate 1, never reopen the stale repo.
+    struct TempDirGuard(PathBuf);
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    let pid = std::process::id();
+    let stale = candidate_name("stale", pid, 0);
+    std::fs::create_dir(&stale).unwrap();
+    let _stale_guard = TempDirGuard(stale.clone());
+    let d = make_tmpdir("stale", pid, 0);
+    let _d_guard = TempDirGuard(d.clone());
+    assert_ne!(d, stale, "tmpdir must not reuse an existing directory");
+    assert_eq!(
+        d,
+        candidate_name("stale", pid, 1),
+        "must take the first free candidate"
+    );
+    std::fs::remove_dir(&stale).unwrap();
 }
 
 fn event(kind: EventKind, entity: &str, id: u64, actor: &str, body: &[(&str, JsonValue)]) -> Event {
