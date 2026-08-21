@@ -767,22 +767,19 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
     };
 
     // Execute the strategy inside the worktree. result_commit = worktree HEAD.
-    // The squash path commits with the PR title (a state field, checked here);
-    // all git shell-outs run in the adapter.
-    let title = if strategy == "squash" {
-        state.title.as_deref().ok_or_else(|| {
-            crate::git::cleanup_failed_worktree(
-                &repo_dir,
-                &tmp,
-                "squash",
-                "PR has no title".to_string(),
-            )
-        })?
-    } else {
-        ""
-    };
+    // The squash path commits with the PR title, checked INSIDE the adapter
+    // AFTER `git merge --squash` staged the changes (pre-extraction ordering,
+    // VAL-101: a missing title produces the cleanup error after staging); the
+    // rebase/merge paths never use the title. All git shell-outs run in the
+    // adapter.
     let result_commit = crate::git::execute_strategy(
-        &repo_dir, &tmp, strategy, source_oid, base_oid, merge_base, title,
+        &repo_dir,
+        &tmp,
+        strategy,
+        source_oid,
+        base_oid,
+        merge_base,
+        state.title.as_deref().unwrap_or(""),
     )?;
     let result_commit = result_commit.parse::<git2::Oid>().map_err(|_| {
         crate::git::cleanup_failed_worktree(

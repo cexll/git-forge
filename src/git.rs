@@ -150,6 +150,11 @@ pub(crate) fn base_checked_out_elsewhere(repo_dir: &Path, base_ref: &str) -> Res
 /// the resulting HEAD oid (as a string). On any failure the in-flight
 /// merge/rebase state is cleaned up (abort/reset + `git clean -fd`) and the
 /// temp worktree is removed; the returned Err is the full user-facing error.
+///
+/// Squash ordering (VAL-101, pre-extraction behavior): `git merge --squash`
+/// runs first (staging), THEN the title is checked — a missing/empty title
+/// produces the "PR has no title" cleanup error AFTER staging. `title` is
+/// only used by the squash path; rebase/merge ignore it.
 pub(crate) fn execute_strategy(
     repo_dir: &Path,
     tmp: &Path,
@@ -175,9 +180,21 @@ pub(crate) fn execute_strategy(
             }
         }
         "squash" => {
+            // `git merge --squash` runs first (staging); only then is the
+            // title checked, so a missing/empty title hits the cleanup path
+            // AFTER staging (reset --hard HEAD + clean + worktree removal) —
+            // exactly the pre-extraction ordering (VAL-101).
             let (ok, _o, e) = git_in(tmp, &["merge", "--squash", &source_oid.to_string()]);
             if !ok {
                 return Err(cleanup_failed_worktree(repo_dir, tmp, "squash", e));
+            }
+            if title.is_empty() {
+                return Err(cleanup_failed_worktree(
+                    repo_dir,
+                    tmp,
+                    "squash",
+                    "PR has no title".to_string(),
+                ));
             }
             let (ok2, _o2, e2) = git_in(tmp, &["commit", "-m", title]);
             if !ok2 {
