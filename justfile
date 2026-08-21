@@ -37,12 +37,26 @@ lint:
 # tokei is a REQUIRED local prerequisite — `just setup` stays `cargo fetch` per
 # AGENTS.md and does NOT auto-install it; a missing tokei makes this gate fail
 # loudly with `tokei missing — run brew install tokei`.
+#
+# CONFIG ISOLATION (F-015): tokei loads a user config from $HOME/tokei.toml
+# (and $XDG_CONFIG_HOME/tokei/config.toml). A hostile config like
+# `types = ["Python"]` removes Rust from its language table and makes an
+# over-limit file invisible (tokei counts 0 files for src/), so the gate would
+# silently pass. The invocation therefore runs tokei with HOME and
+# XDG_CONFIG_HOME pointed at a fresh empty directory (mktemp -d) so no user
+# config can load, and --no-ignore disables .gitignore/.ignore/.tokeignore
+# suppression so a file cannot be hidden from the gate by ignore rules;
+# `--output json` keeps the count machine-readable.
 size-gate:
-    @if ! command -v tokei >/dev/null 2>&1; then \
+    @set -o pipefail; \
+    if ! command -v tokei >/dev/null 2>&1; then \
         echo "tokei missing — run brew install tokei" >&2; \
         exit 1; \
     fi; \
-    tokei --output json src/ | python3 -c 'import json,sys; data=json.load(sys.stdin); bad=[(r["name"],r["stats"]["code"]) for v in data.values() for r in v.get("reports",[]) if r["name"].startswith("src/") and r["stats"]["code"]>800]; [print("size-gate: %s exceeds 800 code lines (%d)"%(n,c), file=sys.stderr) for n,c in sorted(bad)]; sys.exit(1 if bad else 0)'
+    REPO=$(pwd); \
+    T=$(mktemp -d) || { echo "size-gate: mktemp failed" >&2; exit 1; }; \
+    trap 'rm -rf "$T"' EXIT; \
+    cd "$T" && HOME="$T" XDG_CONFIG_HOME="$T" tokei --no-ignore --output json "$REPO/src/" | python3 -c 'import json,sys; data=json.load(sys.stdin); prefix=sys.argv[1]; bad=[(r["name"],r["stats"]["code"]) for v in data.values() for r in v.get("reports",[]) if r["name"].startswith(prefix + "/") and r["stats"]["code"]>800]; [print("size-gate: %s exceeds 800 code lines (%d)"%(n,c), file=sys.stderr) for n,c in sorted(bad)]; sys.exit(1 if bad else 0)' "$REPO/src"
 
 # ── Tests ────────────────────────────────────────────────────────
 test:
