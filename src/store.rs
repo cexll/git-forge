@@ -348,6 +348,28 @@ impl EventStore {
         self.counter_next_from_entry(&entry)
     }
 
+    /// The single public counter-read entry: read `next` from the counter
+    /// commit chain tip. An absent counter (fresh repo) reads as 1, so callers
+    /// can bound entity scans without distinguishing "no counter" from an
+    /// empty one. The whole chain walk reuses the private read internals.
+    pub fn counter_next(&self) -> Result<u64, StoreError> {
+        match self.current_tip(COUNTER_REF)? {
+            Some(tip) => self.read_counter_next(tip),
+            None => Ok(1),
+        }
+    }
+
+    /// The event actor for the invoking repo: `user.email` from git config
+    /// (wire contract `"actor": "<user.email>"` — the email, never user.name).
+    /// When no identity is configured (`repo.signature()` errors), fall back
+    /// to the store default email `forge@localhost` so commands still succeed.
+    pub fn actor(&self) -> String {
+        self.signature()
+            .ok()
+            .and_then(|sig| sig.email().map(String::from))
+            .unwrap_or_else(|| "forge@localhost".to_string())
+    }
+
     fn counter_next_from_entry(&self, entry: &TreeEntry<'_>) -> Result<u64, StoreError> {
         let obj = entry.to_object(&self.repo)?;
         let blob = obj
@@ -435,15 +457,22 @@ impl EventStore {
     }
 
     /// Atomically create a PR. Parameter order is fixed and documented:
-    /// `(title, source_ref, base_ref, source_oid, base_oid, merge_base)` —
-    /// title first (primary user input), then the two branch names, then the
-    /// three OIDs (distinct `Oid` type; cannot swap with the `&str`s). The
-    /// `pr.created` event commit (parent = genesis) is written first, then ONE
-    /// `git update-ref --stdin` transaction CASes the counter and creates
-    /// `/head` → event commit, `/meta` → same event commit (convenience
-    /// pointer), `/source` → `source_oid`, `/base` → `base_oid`, all with
-    /// expected absence. Any failure leaves counter and all four PR refs
-    /// unchanged; a pre-existing PR ref for the target id is `RefExists`.
+    /// `(title, source_ref, base_ref, source_oid, base_oid, merge_base,
+    /// actor)` — title first (primary user input), then the two branch names,
+    /// then the three OIDs (distinct `Oid` type; cannot swap with the `&str`s),
+    /// then the event actor (`user.email`). The `pr.created` event commit
+    /// (parent = genesis) is written first, then ONE `git update-ref --stdin`
+    /// transaction CASes the counter and creates `/head` → event commit,
+    /// `/meta` → same event commit (convenience pointer), `/source` →
+    /// `source_oid`, `/base` → `base_oid`, all with expected absence. Any
+    /// failure leaves counter and all four PR refs unchanged; a pre-existing
+    /// PR ref for the target id is `RefExists`.
+    ///
+    /// Clippy `too-many-arguments` is suppressed: the positional order is a
+    /// documented, test-pinned wire contract, and bundling the snapshot OIDs
+    /// or the actor into a struct would churn the public store API for a lint
+    /// threshold.
+    #[allow(clippy::too_many_arguments)]
     pub fn create_pr(
         &self,
         title: &str,
@@ -452,6 +481,7 @@ impl EventStore {
         source_oid: Oid,
         base_oid: Oid,
         merge_base: Oid,
+        actor: &str,
     ) -> Result<u64, StoreError> {
         for _ in 0..MAX_ALLOC_RETRIES {
             let (counter_tip, counter_new, next, genesis) = match self.current_tip(COUNTER_REF)? {
@@ -487,7 +517,7 @@ impl EventStore {
                 "merge_base".into(),
                 JsonValue::String(merge_base.to_string()),
             );
-            let event = Event::new(EventKind::PrCreated, "pr", next, "git-forge", body);
+            let event = Event::new(EventKind::PrCreated, "pr", next, actor, body);
             let message = format!("forge:{}:{}", event.kind.as_str(), event.entity_id);
             let event_oid = self.write_event_commit(&event, &[genesis], &message)?;
             let plan = [
@@ -595,7 +625,8 @@ impl EventStore {
     /// `pr.merge` event commit parented to it, both inside the same function
     /// as the transaction — so head, base, and the pending-ref deletion move
     /// as one atomic unit. On failure nothing moved; the caller reports the
-    /// leftover pending ref.
+    /// leftover pending ref. `actor` is the invoking repo's `user.email`
+    /// (wire contract `"actor": "<user.email>"`).
     pub fn finalize_pr_merge(
         &self,
         pr_id: u64,

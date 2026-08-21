@@ -774,6 +774,69 @@ fn nonexistent_pr_merge_is_clean_error() {
     assert!(e.contains("#42"), "stderr: {e}");
 }
 
+/// Every CLI-written PR event (create/comment/review/merge) must carry the
+/// invoking repo's configured `user.email` as its actor (wire contract:
+/// `"actor": "<user.email>"`). The actor lives in the event JSON, so the
+/// assertion reads the raw chain JSON, not the folded state.
+fn pr_chain_actors(dir: &Path, ref_name: &str) -> Vec<String> {
+    let rev = git(dir, &["rev-list", ref_name]);
+    assert_eq!(rev.0, 0, "rev-list {ref_name} failed: {}", rev.2);
+    let mut actors = Vec::new();
+    for oid in rev.1.split_whitespace() {
+        let show = git(dir, &["show", &format!("{oid}:.forge/event.json")]);
+        if show.0 != 0 {
+            continue; // genesis root has no event.json
+        }
+        let json = show.1;
+        let key = "\"actor\":";
+        let idx = json.find(key).expect("event json must carry actor") + key.len();
+        let value: String = json[idx..]
+            .chars()
+            .skip_while(|c| *c == ' ' || *c == '"')
+            .take_while(|c| *c != '"')
+            .collect();
+        actors.push(value);
+    }
+    actors
+}
+
+#[test]
+fn pr_chain_events_carry_configured_user_email_as_actor() {
+    let dir = tmpdir("practor");
+    init_repo(&dir);
+    // Distinct from the fixture identity so the assertion proves the actor
+    // comes from the repo config, not from a hardcoded fallback.
+    let (c, _, e) = git(&dir, &["config", "user.email", "someone@example.com"]);
+    assert_eq!(c, 0, "config user.email failed: {e}");
+    make_feature(&dir, "feature", "feat\n");
+    let (c, o, e) = forge(
+        &dir,
+        &[
+            "forge", "pr", "create", "--source", "feature", "--base", "main", "PR",
+        ],
+    );
+    assert_eq!(c, 0, "pr create failed: {e} {o}");
+    assert_eq!(forge(&dir, &["forge", "pr", "comment", "1", "hello"]).0, 0);
+    assert_eq!(
+        forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
+        0
+    );
+    checkout(&dir, "feature");
+    let (cm, om, em) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_eq!(cm, 0, "pr merge failed: {em} {om}");
+
+    let actors = pr_chain_actors(&dir, "refs/forge/prs/1/head");
+    assert_eq!(
+        actors.len(),
+        4,
+        "four events: pr.created + pr.comment + pr.review + pr.merge"
+    );
+    assert!(
+        actors.iter().all(|a| a == "someone@example.com"),
+        "every PR event actor must equal configured user.email, got: {actors:?}"
+    );
+}
+
 #[test]
 fn barrier_holds_pending_ref_through_gc() {
     let dir = tmpdir("barrier");

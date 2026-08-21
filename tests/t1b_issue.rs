@@ -185,6 +185,73 @@ fn git_forge_discovery_on_path() {
     assert!(os.contains("discovered"), "git-forge-created issue: {os}");
 }
 
+/// Every CLI-written event (new/comment/close) must carry the invoking repo's
+/// configured `user.email` as its actor (wire contract: `"actor": "<user.email>"`).
+fn event_chain_actors(dir: &PathBuf) -> Vec<String> {
+    // Walk the issue #1 chain (oldest→tip) and collect each event's actor from
+    // the stored wire-format JSON — the actor field lives in the event JSON, not
+    // in the folded state.
+    let rev = Command::new("git")
+        .args(["rev-list", "refs/forge/issues/1"])
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert_eq!(rev.status.code(), Some(0), "rev-list failed");
+    let mut actors = Vec::new();
+    for oid in String::from_utf8_lossy(&rev.stdout).split_whitespace() {
+        let show = Command::new("git")
+            .args(["show", &format!("{oid}:.forge/event.json")])
+            .current_dir(dir)
+            .output()
+            .unwrap();
+        if show.status.code() != Some(0) {
+            continue; // genesis root has no event.json
+        }
+        let json = String::from_utf8_lossy(&show.stdout).to_string();
+        let key = "\"actor\":";
+        let idx = json.find(key).expect("event json must carry actor") + key.len();
+        let value: String = json[idx..]
+            .chars()
+            .skip_while(|c| *c == ' ' || *c == '"')
+            .take_while(|c| *c != '"')
+            .collect();
+        actors.push(value);
+    }
+    actors
+}
+
+#[test]
+fn cli_events_carry_configured_user_email_as_actor() {
+    let dir = tmpdir("actor");
+    init_repo(&dir);
+    // Distinct from the default fixture identity so the assertion proves the
+    // actor comes from the repo config, not from a hardcoded fallback.
+    let cfg = Command::new("git")
+        .args(["config", "user.email", "someone@example.com"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert_eq!(cfg.status.code(), Some(0), "config user.email failed");
+    assert_eq!(forge(&dir, &["forge", "issue", "new", "T"]).0, 0);
+    assert_eq!(
+        forge(&dir, &["forge", "issue", "comment", "1", "hello"]).0,
+        0
+    );
+    assert_eq!(forge(&dir, &["forge", "issue", "close", "1"]).0, 0);
+    assert_eq!(forge(&dir, &["forge", "issue", "reopen", "1"]).0, 0);
+
+    let actors = event_chain_actors(&dir);
+    assert_eq!(
+        actors.len(),
+        4,
+        "four events: created + comment + close + reopen"
+    );
+    assert!(
+        actors.iter().all(|a| a == "someone@example.com"),
+        "every event actor must equal configured user.email, got: {actors:?}"
+    );
+}
+
 #[test]
 fn concurrent_comments_both_succeed() {
     let dir = tmpdir("concurrent");

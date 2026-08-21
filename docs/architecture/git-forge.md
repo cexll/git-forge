@@ -126,6 +126,7 @@ Each event is a git commit with a one-file tree:
 - Non-event merge commits (L2 convergence only): empty tree, parent = local tip + remote tip, message `forge:merge:<id>`; the fold algorithm ignores commits whose tree has no `.forge/event.json`. L1 never creates them.
 - Message for normal events: `forge:<kind>:<id>` (stable subject for tooling).
 - Committer/author identity: the invoking `user.email` / `user.name` from git config.
+- Event `actor` (see below): the invoking repo's `user.email`. When no identity is configured — `user.email`/`user.name` absent from repo, global, and system config — commands still succeed and the actor falls back to `forge@localhost` (the same default the store commit signature uses); a repo without identity is never blocked from writing events.
 
 ### Event JSON Schema (v1)
 
@@ -177,6 +178,8 @@ Kinds and body fields:
 ### Event Identity
 
 - Every event carries an immutable UUID `id` (v4) generated at creation, independent of its commit OID. On CAS retry, the event UUID is retained even though the commit OID and parent change.
+- `actor` is the invoking repo's `user.email` from git config (the email, never `user.name`); the CLI resolves it once per command via the store entry.
+- **No-config fallback**: when no git identity is configured (`repo.signature()` errors — `user.name`/`user.email` absent from repo, global, and system config), the actor falls back to `forge@localhost` and commands still succeed; the store commit signature uses the same default (`git-forge` / `forge@localhost`).
 - State folding and refs identify events by UUID, not by commit hash; UUIDs never change.
 
 ### Deterministic Single-Chain CAS Append (L1)

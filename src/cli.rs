@@ -7,7 +7,7 @@
 use std::collections::HashMap;
 
 use crate::event::{Event, EventKind, JsonValue};
-use crate::store::{EventStore, StoreError};
+use crate::store::EventStore;
 
 /// Parse `"<n>"` into a positive u64, else a clean usage error (no panic).
 fn parse_entity_id(s: &str) -> Result<u64, String> {
@@ -35,16 +35,15 @@ fn body_obj(pairs: &[(&str, JsonValue)]) -> HashMap<String, JsonValue> {
 }
 
 /// Build an `issue.*` event for `store`.
-fn issue_event(kind: EventKind, id: u64, body: HashMap<String, JsonValue>) -> Event {
+fn issue_event(kind: EventKind, id: u64, actor: &str, body: HashMap<String, JsonValue>) -> Event {
     Event::new(
-        kind,
-        "issue",
-        id,
-        // Actor comes from the running user's git identity in production; for
-        // the store layer the actor is a caller-supplied string. The CLI uses
-        // the configured identity when available, else a default.
-        "git-forge",
-        body,
+        kind, "issue", id,
+        // Wire contract: `"actor": "<user.email>"`. Every CLI command resolves
+        // the invoking repo's identity ONCE via the store's `actor()` (git
+        // config `user.email`, falling back to `forge@localhost` when no
+        // identity is configured) and passes it through here — the actor is
+        // never hardcoded.
+        actor, body,
     )
 }
 
@@ -62,11 +61,12 @@ fn cmd_new(store: &EventStore, args: &[String]) -> Result<String, String> {
         .map(|d| d.trim().to_string())
         .filter(|d| !d.is_empty());
     let id = store.allocate_id().map_err(|e| e.to_string())?;
+    let actor = store.actor();
     let mut body = body_obj(&[("title", json_str(&title))]);
     if let Some(d) = description {
         body.insert("description".into(), json_str(&d));
     }
-    let ev = issue_event(EventKind::IssueCreated, id, body);
+    let ev = issue_event(EventKind::IssueCreated, id, &actor, body);
     store
         .append_event(&crate::store::issue_ref(id), &ev)
         .map_err(|e| e.to_string())?;
@@ -83,7 +83,7 @@ fn cmd_list(store: &EventStore) -> Result<String, String> {
     let mut out = String::new();
     let mut found = 0usize;
     // Bound the scan by the counter's next value (best-effort).
-    let next_opt = counter_next(store).ok();
+    let next_opt = store.counter_next().ok();
     let bound = next_opt.unwrap_or(0);
     for n in 1..bound {
         let r = crate::store::issue_ref(n);
@@ -157,6 +157,7 @@ fn cmd_comment(store: &EventStore, args: &[String]) -> Result<String, String> {
     let ev = issue_event(
         EventKind::IssueComment,
         id,
+        &store.actor(),
         body_obj(&[("body", json_str(&body))]),
     );
     store.append_event(&r, &ev).map_err(|e| e.to_string())?;
@@ -170,7 +171,7 @@ fn cmd_state(store: &EventStore, kind: EventKind, args: &[String]) -> Result<Str
     if !store_has_ref(store, &r) {
         return Err(format!("issue #{id} does not exist"));
     }
-    let ev = issue_event(kind, id, HashMap::new());
+    let ev = issue_event(kind, id, &store.actor(), HashMap::new());
     store.append_event(&r, &ev).map_err(|e| e.to_string())?;
     let verb = match kind {
         EventKind::IssueClose => "closed",
@@ -181,40 +182,6 @@ fn cmd_state(store: &EventStore, kind: EventKind, args: &[String]) -> Result<Str
 }
 
 /// Read the counter's next value (best-effort) to bound `list`.
-fn counter_next(store: &EventStore) -> Result<u64, StoreError> {
-    let repo = store.repo();
-    match repo.find_reference(crate::store::COUNTER_REF) {
-        Ok(r) => {
-            let tip = r.target().ok_or(StoreError::MissingRef)?;
-            let commit = repo.find_commit(tip)?;
-            let tree = repo.find_tree(commit.tree_id())?;
-            let entry = tree
-                .get_path(std::path::Path::new(".forge/counter.json"))
-                .map_err(|_| StoreError::InvalidState("counter json missing".into()))?;
-            let obj = entry.to_object(repo)?;
-            let blob = obj
-                .as_blob()
-                .ok_or_else(|| StoreError::InvalidState("counter not a blob".into()))?;
-            let content = std::str::from_utf8(blob.content())
-                .map_err(|_| StoreError::InvalidState("counter not utf8".into()))?;
-            let key = "\"next\":";
-            let idx = content
-                .find(key)
-                .ok_or_else(|| StoreError::InvalidState("next missing".into()))?
-                + key.len();
-            let digits: String = content[idx..]
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
-            digits
-                .parse::<u64>()
-                .map_err(|_| StoreError::InvalidState("next not u64".into()))
-        }
-        Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(1),
-        Err(e) => Err(StoreError::Git(e)),
-    }
-}
-
 fn store_has_ref(store: &EventStore, r: &str) -> bool {
     store.repo().find_reference(r).is_ok()
 }
@@ -350,6 +317,7 @@ fn cmd_pr_create(store: &EventStore, args: &[String]) -> Result<String, String> 
             source_oid,
             base_oid,
             merge_base,
+            &store.actor(),
         )
         .map_err(|e| e.to_string())?;
     Ok(format!("PR #{id} created: {title} ({source} -> {base})"))
@@ -397,7 +365,7 @@ fn cmd_pr_show(store: &EventStore, args: &[String]) -> Result<String, String> {
 
 /// `git forge pr list`
 fn cmd_pr_list(store: &EventStore) -> Result<String, String> {
-    let bound = counter_next(store).ok().unwrap_or(1);
+    let bound = store.counter_next().ok().unwrap_or(1);
     let mut out = String::new();
     let mut found = 0usize;
     for n in 1..bound {
@@ -442,7 +410,7 @@ fn cmd_pr_comment(store: &EventStore, args: &[String]) -> Result<String, String>
         EventKind::PrComment,
         "pr",
         id,
-        "git-forge",
+        &store.actor(),
         body_obj(&[("body", json_str(&body))]),
     );
     store.append_event(&r, &ev).map_err(|e| e.to_string())?;
@@ -537,7 +505,7 @@ fn cmd_pr_review(store: &EventStore, args: &[String]) -> Result<String, String> 
         // diff changes).
         body.insert("commit".into(), json_str(&c));
     }
-    let ev = Event::new(EventKind::PrReview, "pr", id, "git-forge", body);
+    let ev = Event::new(EventKind::PrReview, "pr", id, &store.actor(), body);
     store.append_event(&r, &ev).map_err(|e| e.to_string())?;
     Ok(format!("reviewed PR #{id} ({decision})"))
 }
@@ -875,7 +843,7 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
     // Single atomic completion transaction: delete pending ref + CAS base + CAS head.
     // finalize_pr_merge reads the head tip itself so all three move atomically.
     store
-        .finalize_pr_merge(id, &base_ref, base_oid, result_commit, "git-forge")
+        .finalize_pr_merge(id, &base_ref, base_oid, result_commit, &store.actor())
         .map_err(|e| {
             // Nothing moved; report the leftover pending ref.
             format!(

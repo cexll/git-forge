@@ -137,6 +137,22 @@ fn sequential_ids_advance_counter() {
 }
 
 #[test]
+fn counter_next_entry_reads_chain_tip() {
+    let dir = tmpdir("cntnext");
+    let store = EventStore::init(&dir).unwrap();
+    // Absent counter: best-effort bound, first id is 1 (no error).
+    assert_eq!(store.counter_next().unwrap(), 1);
+    // After each allocation the single public entry returns the chain-tip
+    // value, matching what the raw counter walk sees.
+    assert_eq!(store.allocate_id().unwrap(), 1);
+    assert_eq!(store.counter_next().unwrap(), 2);
+    assert_eq!(counter_next(&store), store.counter_next().unwrap());
+    assert_eq!(store.allocate_id().unwrap(), 2);
+    assert_eq!(store.counter_next().unwrap(), 3);
+    assert_eq!(counter_next(&store), store.counter_next().unwrap());
+}
+
+#[test]
 fn counter_is_a_versioned_chain() {
     let dir = tmpdir("chain");
     let store = EventStore::init(&dir).unwrap();
@@ -399,7 +415,7 @@ fn create_pr_creates_head_meta_source_base_atomically() {
     assert_eq!(merge_base, base, "head descends from base; one merge base");
 
     let id = store
-        .create_pr("PR title", "feature", "main", head, base, merge_base)
+        .create_pr("PR title", "feature", "main", head, base, merge_base, "a@x")
         .unwrap();
     assert_eq!(id, 1, "first PR gets id 1");
 
@@ -471,7 +487,7 @@ fn create_pr_creates_head_meta_source_base_atomically() {
 
     // Next allocation takes id 2; the counter advanced to {next:2}.
     let id2 = store
-        .create_pr("second", "feature", "main", head, base, merge_base)
+        .create_pr("second", "feature", "main", head, base, merge_base, "a@x")
         .unwrap();
     assert_eq!(id2, 2, "second PR gets id 2");
     assert!(repo.find_reference(&pr_head_ref(2)).is_ok());
@@ -499,7 +515,7 @@ fn create_pr_rejects_preexisting_ref_without_touching_counter() {
     let merge_base = repo.merge_base(base, head).unwrap();
     // Pre-create the ref the fresh counter would target (#1) → forced collision.
     repo.reference(&pr_head_ref(1), head, false, "pre").unwrap();
-    let res = store.create_pr("T", "feature", "main", head, base, merge_base);
+    let res = store.create_pr("T", "feature", "main", head, base, merge_base, "a@x");
     assert!(res.is_err());
     assert!(matches!(res, Err(StoreError::RefExists(_))));
     assert!(
