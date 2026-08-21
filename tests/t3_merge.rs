@@ -754,6 +754,110 @@ fn worktree_removal_failure_reports_and_cleans_pending_ref() {
 }
 
 #[test]
+fn seam_lock_failure_releases_lock_and_cleans_pending_ref() {
+    // F-019 regression: when the debug seam's own `git worktree lock` call
+    // fails (shim forces it), the merge must route through the shared cleanup
+    // — release the sibling path lock and best-effort delete the pending
+    // result ref — instead of returning with both leaked. This is the
+    // deterministic counterpart to the (harder-to-trigger) in-process seam
+    // path; the shim intercepts `git -C <repo> worktree lock <tmp>` and exits
+    // 128 with a distinctive stderr, forwarding every other git call.
+    let dir = tmpdir("seamlockfail");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "seam lock fail PR");
+    checkout(&dir, "feature");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+
+    let shim = tmpdir("seamlockfail-shim");
+    let which = Command::new("sh")
+        .arg("-c")
+        .arg("command -v git")
+        .output()
+        .unwrap();
+    let real_git = String::from_utf8_lossy(&which.stdout).trim().to_string();
+    assert!(!real_git.is_empty(), "could not resolve real git path");
+    let shim_script = format!(
+        "#!/bin/sh\n\
+         if [ \"$1\" = \"-C\" ] && [ \"$3\" = \"worktree\" ] && [ \"$4\" = \"lock\" ]; then\n\
+         \x20 echo \"fatal: worktree lock disabled by test shim\" >&2\n\
+         \x20 exit 128\n\
+         fi\n\
+         exec \"{real_git}\" \"$@\"\n"
+    );
+    std::fs::write(shim.join("git"), shim_script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(shim.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mut path = shim.display().to_string();
+    if let Ok(p) = std::env::var("PATH") {
+        path.push(':');
+        path.push_str(&p);
+    }
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let out = Command::new(bin)
+        .args(["forge", "pr", "merge", "1"])
+        .current_dir(&dir)
+        .env("PATH", &path)
+        .env("GIT_FORGE_TEST_FAIL_WORKTREE_REMOVE", "1")
+        .output()
+        .unwrap();
+    let code = out.status.code().unwrap_or(-1);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(code, 0, "merge must fail on seam lock failure");
+    assert!(
+        stderr.contains("worktree lock disabled by test shim"),
+        "stderr must surface the injected worktree lock failure: {stderr}"
+    );
+    // Base unchanged, PR chain untouched, no merge committed.
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged"
+    );
+    let (cs, os, _) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert!(cs == 0, "pr show must succeed after seam lock failure");
+    assert!(!os.contains("merged"), "no pr.merge: {os}");
+    // The shared cleanup ran: the pending result ref is gone (CAS expected
+    // oid, best-effort) and no sibling lock file survives for the path.
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_none(),
+        "pending result ref must be cleaned best-effort on seam lock failure"
+    );
+    let (wl, out2, _) = git(&dir, &["worktree", "list", "--porcelain"]);
+    assert_eq!(wl, 0);
+    let mut temp_path: Option<std::path::PathBuf> = None;
+    for line in out2.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            if p.contains("git-forge-pr1-merge") {
+                temp_path = Some(std::path::PathBuf::from(p));
+            }
+        }
+    }
+    // The leftover temp worktree MUST exist (the seam failed before removing
+    // it) and its sibling lock MUST already be released by the shared cleanup.
+    assert!(
+        temp_path.is_some(),
+        "expected a leftover temp worktree (git-forge-pr1-merge) after seam lock failure"
+    );
+    if let Some(tp) = temp_path {
+        let lock = std::path::PathBuf::from(format!("{}.lock", tp.display()));
+        assert!(
+            !lock.exists(),
+            "sibling lock file must be released on seam lock failure: {}",
+            lock.display()
+        );
+        // Hygiene: remove the leftover worktree so the repo is clean for any
+        // later assertion. It was never locked (the seam failed before
+        // locking), so only a plain remove is needed.
+        let (r, _, er) = git(
+            &dir,
+            &["worktree", "remove", "--force", tp.to_str().unwrap()],
+        );
+        assert!(r == 0, "remove failed: {er}");
+    }
+}
+
+#[test]
 fn worktree_verification_failure_surfaces_raw_git_stderr() {
     let dir = tmpdir("verifyfail");
     init_repo(&dir);

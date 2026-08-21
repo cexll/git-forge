@@ -784,8 +784,17 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
     #[cfg(debug_assertions)]
     if std::env::var("GIT_FORGE_TEST_FAIL_WORKTREE_REMOVE").as_deref() == Ok("1") {
         if let Err(lock_err) = crate::git::worktree_lock(&repo_dir, &tmp) {
+            // F-019: the seam failed before worktree removal. The pending
+            // result ref exists and the temp worktree is present, so route
+            // through the SAME cleanup as the removal-failure branch —
+            // release the sibling path lock and best-effort remove the
+            // pending ref — before returning, so no lock/ref leak survives
+            // even in this injected path.
+            let pending = cleanup_pending_result(store, id, result_commit, &mut lock_handle, &tmp);
             return Err(format!(
-                "test seam: failed to lock temp worktree for removal-failure injection: {lock_err}"
+                "test seam: failed to lock temp worktree for removal-failure injection: \
+                 {lock_err} (worktree left at {}{pending})",
+                tmp.display()
             ));
         }
     }
