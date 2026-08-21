@@ -131,17 +131,7 @@ pub(crate) fn worktree_lock(repo_dir: &Path, path: &Path) -> Result<(), String> 
 /// worktree list cannot be enumerated — a failed guard must not silently
 /// bypass the check.
 pub(crate) fn base_checked_out_elsewhere(repo_dir: &Path, base_ref: &str) -> Result<bool, String> {
-    use std::process::Command;
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo_dir)
-        .args(["worktree", "list", "--porcelain"])
-        .output()
-        .map_err(|e| format!("git worktree list failed: {e}"))?;
-    if !out.status.success() {
-        return Err("git worktree list failed".into());
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
+    let text = worktree_list(repo_dir)?;
     let want = format!("branch refs/heads/{base_ref}");
     Ok(text.lines().any(|l| l.trim() == want))
 }
@@ -284,28 +274,20 @@ pub(crate) fn require_single_merge_base(
     a: git2::Oid,
     b: git2::Oid,
 ) -> Result<git2::Oid, String> {
-    use std::process::Command;
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(repo.path())
-        .args(["merge-base", "--all", &a.to_string(), &b.to_string()])
-        .output()
-        .map_err(|e| format!("git merge-base failed: {e}"))?;
-    let stdout =
-        std::str::from_utf8(&out.stdout).map_err(|_| "merge-base output not utf8".to_string())?;
-    let lines: Vec<&str> = stdout.trim().lines().filter(|l| !l.is_empty()).collect();
+    let (ok, out, err) = git_in(
+        repo.path(),
+        &["merge-base", "--all", &a.to_string(), &b.to_string()],
+    );
+    let lines: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
     // `git merge-base --all` exits 1 with EMPTY stdout when the two commits
     // share no common ancestor (unrelated histories, or shallow/incomplete
     // history). Exit 128 (nonempty stderr) is a genuine git failure. Without
     // this classification the deepen/unshallow guidance below is dead code.
-    if !out.status.success() {
-        if out.status.code() == Some(1) && lines.is_empty() {
+    if !ok {
+        if err.is_empty() && lines.is_empty() {
             return Err(zero_merge_base_error(repo));
         }
-        return Err(format!(
-            "git merge-base failed: {}",
-            String::from_utf8_lossy(&out.stderr).trim()
-        ));
+        return Err(format!("git merge-base failed: {}", err.trim()));
     }
     if lines.len() != 1 {
         if lines.is_empty() {
