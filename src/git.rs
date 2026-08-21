@@ -26,8 +26,9 @@ struct GitResult {
 }
 
 /// Run `git` in the given working directory, returning the exit status,
-/// stdout, stderr and raw spawn error. The ONLY function that constructs a
-/// git Command (no other `Command` construction exists in this crate).
+/// stdout, stderr and raw spawn error. This is the primary `git` Command
+/// constructor; the exceptions are `store.rs`'s `run_update_ref_stdin` and
+/// `cli.rs`'s `cmd_pr_diff`.
 fn git_in_with_status(dir: &Path, args: &[&str]) -> GitResult {
     use std::process::Command;
     let out = Command::new("git").arg("-C").arg(dir).args(args).output();
