@@ -72,6 +72,17 @@ cp "$TGT/release/git-forge" "$BIN/git-pr"
 
 git clone -q "$SRC_CANON" "$T/dogfood"
 git clone -q "$SRC_CANON" "$T/dogfood2"
+
+# Resolve the clone's default branch. `git clone` checks out the source's
+# default branch whatever it is named; every checkout/tag/PR below uses
+# $BASE_BRANCH, never a hardcoded branch name (F-033). An empty resolution
+# (detached/unborn HEAD) fails loudly and names the source — never guess.
+BASE_BRANCH="$(git -C "$T/dogfood" branch --show-current)"
+if [ -z "$BASE_BRANCH" ]; then
+  echo "gf-dogfood: GDOGFOOD_SRC '$SRC' has no checked-out default branch (branch --show-current empty); refusing to guess" >&2
+  exit 1
+fi
+
 export PATH="$BIN:$PATH"
 PASS=0; FAIL=0
 ck() { # ck <name> <expected_exit 0|nonzero> <cmd...>
@@ -91,7 +102,7 @@ at() { # at <name> <expected 0|nonzero> <shell test cmd>
 }
 event_commit_is_oid() { # event stores OID, not ref name
   local expected actual
-  expected=$(git rev-parse master)
+  expected=$(git rev-parse "$BASE_BRANCH")
   actual=$(git show "$(git rev-parse refs/forge/prs/2/head):.forge/event.json")
   [[ "$actual" == *"\"commit\":\"$expected\""* ]]
 }
@@ -112,22 +123,22 @@ ck "issue empty title rejected" nonzero git forge issue new "   "
 ck "issue comment on missing" nonzero git forge issue comment 99 x
 
 # ── FR-002 / AC-002 / AC-002a..e / AC-002i / VAL-021/028: PR create guards ──
-git checkout -B feat/dogfood master
+git checkout -B feat/dogfood "$BASE_BRANCH"
 printf '\n# dogfood change\n' >> PLAN.md
 git add PLAN.md && git commit -qm "feat(dogfood): test change"
-git checkout -q master
-git tag v1.0 master   # deterministic local tag
-ck "pr create snapshot" 0 git forge pr create --source feat/dogfood --base master "dogfood PR"
+git checkout -q "$BASE_BRANCH"
+git tag v1.0 "$BASE_BRANCH"   # deterministic local tag
+ck "pr create snapshot" 0 git forge pr create --source feat/dogfood --base "$BASE_BRANCH" "dogfood PR"
 ck "pr show snapshot fields" 0 git forge pr show 2
 ck "pr diff three-dot" 0 git forge pr diff 2
-ck "pr create missing source" nonzero git forge pr create --base master T2
+ck "pr create missing source" nonzero git forge pr create --base "$BASE_BRANCH" T2
 ck "pr create missing base" nonzero git forge pr create --source feat/dogfood T2
-ck "pr create empty title" nonzero git forge pr create --source feat/dogfood --base master " "
-ck "pr create same ref" nonzero git forge pr create --source master --base master T2
-ck "pr create tag ref" nonzero git forge pr create --source v1.0 --base master T2
-ck "pr create remote-tracking ref" nonzero git forge pr create --source origin/master --base master T2
-ck "pr create oid/rev-expr ref" nonzero git forge pr create --source HEAD --base master T2
-ck "pr create same-commit distinct refs" nonzero git forge pr create --source master --base master~0 T2
+ck "pr create empty title" nonzero git forge pr create --source feat/dogfood --base "$BASE_BRANCH" " "
+ck "pr create same ref" nonzero git forge pr create --source "$BASE_BRANCH" --base "$BASE_BRANCH" T2
+ck "pr create tag ref" nonzero git forge pr create --source v1.0 --base "$BASE_BRANCH" T2
+ck "pr create remote-tracking ref" nonzero git forge pr create --source "origin/$BASE_BRANCH" --base "$BASE_BRANCH" T2
+ck "pr create oid/rev-expr ref" nonzero git forge pr create --source HEAD --base "$BASE_BRANCH" T2
+ck "pr create same-commit distinct refs" nonzero git forge pr create --source "$BASE_BRANCH" --base "$BASE_BRANCH~0" T2
 ck "pr ops nonexistent" nonzero git forge pr show 99
 
 # ── FR-005 (fixed): inline review anchor validation ──
@@ -135,38 +146,38 @@ FEAT_OID=$(git rev-parse feat/dogfood)
 ck "inline no anchor rejected" nonzero git forge pr review 2 --approve --file PLAN.md --line 1
 ck "inline bogus anchor rejected" nonzero git forge pr review 2 --approve --file PLAN.md --line 1 --commit deadbeef
 ck "inline anchored ok" 0 git forge pr review 2 --approve --file PLAN.md --line 1 --commit "$FEAT_OID"
-ck "inline ref-name anchor canonicalizes" 0 git forge pr review 2 --approve --file PLAN.md --line 1 --commit master
+ck "inline ref-name anchor canonicalizes" 0 git forge pr review 2 --approve --file PLAN.md --line 1 --commit "$BASE_BRANCH"
 at "event stores OID not ref name" 0 event_commit_is_oid
 ck "precedence nonexistent PR" nonzero git forge pr review 99 --approve --commit deadbeef
 
 # ── FR-003 / AC-003 / AC-004 / AC-004a/b: gate from NON-base checkout ──
 git checkout -q feat/dogfood
 ck "approve then reject blocks" 0 git forge pr review 2 --reject
-git checkout -q master && git checkout -q feat/dogfood   # ensure non-base
+git checkout -q "$BASE_BRANCH" && git checkout -q feat/dogfood   # ensure non-base
 ck "merge blocked after reject" nonzero git forge pr merge 2
 ck "reject then approve allows" 0 git forge pr review 2 --approve
 git checkout -q feat/dogfood
 ck "approved merge succeeds" 0 git forge pr merge 2
 ck "pr show merged" 0 git forge pr show 2
-at "base contains merged commit" 0 "git merge-base --is-ancestor \$(git rev-parse feat/dogfood) master"
+at "base contains merged commit" 0 "git merge-base --is-ancestor \$(git rev-parse feat/dogfood) \"$BASE_BRANCH\""
 ck "already merged blocked" nonzero git forge pr merge 2
 
 # ── AC-005e / VAL-022: base checked out → refuse (from base itself) ──
-git checkout -B feat2 master
+git checkout -B feat2 "$BASE_BRANCH"
 printf '\n# change 2\n' >> PLAN.md
 git add PLAN.md && git commit -qm "feat(dogfood): change 2"
-git checkout -q master
-git forge pr create --source feat2 --base master "PR base-checked-out" >/dev/null
+git checkout -q "$BASE_BRANCH"
+git forge pr create --source feat2 --base "$BASE_BRANCH" "PR base-checked-out" >/dev/null
 git forge pr review 3 --approve >/dev/null
 ck "merge refused with base checked out" nonzero git forge pr merge 3
 at "checked-out-base error names worktree" 0 "git forge pr merge 3 2>&1 | grep -q 'checked out'"
 
 # ── AC-005b / VAL-017: stale base rejected (from non-base checkout) ──
-git checkout -B feat3 master
+git checkout -B feat3 "$BASE_BRANCH"
 printf '\n# change 3\n' >> PLAN.md
 git add PLAN.md && git commit -qm "feat(dogfood): change 3"
-git checkout -q master
-git forge pr create --source feat3 --base master "PR stale" >/dev/null
+git checkout -q "$BASE_BRANCH"
+git forge pr create --source feat3 --base "$BASE_BRANCH" "PR stale" >/dev/null
 git forge pr review 4 --approve >/dev/null
 printf '\n# base advance\n' >> PLAN.md
 git add PLAN.md && git commit -qm "base advance after PR"
@@ -175,30 +186,30 @@ ck "stale base merge rejected" nonzero git forge pr merge 4
 at "stale error names base_head" 0 "git forge pr merge 4 2>&1 | grep -q 'has moved'"
 
 # ── FR-004 / AC-005 / VAL-005: strategies (fresh PRs, from non-base) ──
-git checkout -B feat4 master
+git checkout -B feat4 "$BASE_BRANCH"
 printf 'a\n' > f4.txt && git add f4.txt && git commit -qm "f4 c1"
 printf 'b\n' >> f4.txt && git add f4.txt && git commit -qm "f4 c2"
-git checkout -q master
-git forge pr create --source feat4 --base master "squash PR" >/dev/null
+git checkout -q "$BASE_BRANCH"
+git forge pr create --source feat4 --base "$BASE_BRANCH" "squash PR" >/dev/null
 git forge pr review 5 --approve >/dev/null
 git checkout -q feat4
 ck "squash merge ok" 0 git forge pr merge 5 --squash
-at "squash = single commit" 0 "[ \$(git rev-list --parents -n 1 master | awk '{print NF}') -eq 2 ] && ! git merge-base --is-ancestor \$(git rev-parse feat4) master"
-git checkout -B feat5 master
+at "squash = single commit" 0 "[ \$(git rev-list --parents -n 1 \"$BASE_BRANCH\" | awk '{print NF}') -eq 2 ] && ! git merge-base --is-ancestor \$(git rev-parse feat4) \"$BASE_BRANCH\""
+git checkout -B feat5 "$BASE_BRANCH"
 printf 'x\n' > f5.txt && git add f5.txt && git commit -qm "f5 c1"
 printf 'y\n' >> f5.txt && git add f5.txt && git commit -qm "f5 c2"
-git checkout -q master
-git forge pr create --source feat5 --base master "rebase PR" >/dev/null
+git checkout -q "$BASE_BRANCH"
+git forge pr create --source feat5 --base "$BASE_BRANCH" "rebase PR" >/dev/null
 git forge pr review 6 --approve >/dev/null
 git checkout -q feat5
 ck "rebase merge ok" 0 git forge pr merge 6 --rebase
-at "rebase = linear history" 0 "[ \$(git rev-list --count --merges master~1..master) -eq 0 ]"
+at "rebase = linear history" 0 "[ \$(git rev-list --count --merges \"$BASE_BRANCH~1..$BASE_BRANCH\") -eq 0 ]"
 
 # ── FR-003 / AC-003: truly unapproved PR blocked (fresh #7, from non-base) ──
-git checkout -B feat6 master
+git checkout -B feat6 "$BASE_BRANCH"
 printf 'z\n' > f6.txt && git add f6.txt && git commit -qm "f6 c1"
-git checkout -q master
-git forge pr create --source feat6 --base master "unapproved PR" >/dev/null
+git checkout -q "$BASE_BRANCH"
+git forge pr create --source feat6 --base "$BASE_BRANCH" "unapproved PR" >/dev/null
 git checkout -q feat6
 ck "unapproved merge blocked (gate)" nonzero git forge pr merge 7
 

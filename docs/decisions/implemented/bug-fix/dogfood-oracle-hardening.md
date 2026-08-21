@@ -53,3 +53,42 @@ gaps found by the milestone scrutiny validator:
   dependency cache can still dogfood (same cache the test suite uses).
 - `constraints.yaml` e2e surface is now `just e2e && just dogfood`; every row
   in the mirror resolves to a real justfile target.
+
+## Addendum: default-branch resolution instead of hardcoded master (F-033)
+
+### Problem
+
+`scripts/gf-dogfood.sh` hardcoded `master` at every checkout, tag, PR
+`--base`/`--source`, the `event_commit_is_oid` helper, and the squash/rebase
+assertions — roughly 20 command sites. A `GDOGFOOD_SRC` whose default branch is
+`main` passed preflight (PLAN.md is present, it is a git worktree root) and then
+aborted at the first checkout (`git checkout -B feat/dogfood master` → `master`
+is not a commit), even though every check is default-branch-agnostic.
+
+### Decision
+
+- Immediately after the disposable clones, resolve the clone's default branch:
+  `BASE_BRANCH="$(git -C "$T/dogfood" branch --show-current)"`. `git clone`
+  checks out the source's default branch whatever it is named, so this is the
+  one honest source of truth.
+- The resolution is rejected loudly when empty (detached/unborn HEAD): a
+  one-line error naming the source path and the missing default branch, exiting
+  before any check runs. No guess, no fallback to a hardcoded name.
+- Every `master` reference becomes `$BASE_BRANCH` (`origin/$BASE_BRANCH` for
+  the remote-tracking rejection check; `$BASE_BRANCH~0` and
+  `$BASE_BRANCH~1..$BASE_BRANCH` for the rev-expr checks).
+- An OWNED regression — `scripts/gf-dogfood-main-default.sh` + `just
+  dogfood-main-default` — builds a throwaway `git init -b main` source with a
+  base commit and PLAN.md, exports `GDOGFOOD_SRC` at it, and runs the FULL real
+  dogfood flow, asserting `pass=45 fail=0`. It is RED against the pre-fix
+  script (verified) and GREEN after (verified), so the fix can never silently
+  regress.
+
+### Consequences
+
+- A main-default source dogfoods 45/45, as does the master-default source
+  (`dsh-deepwork`).
+- An empty `branch --show-current` resolution fails with a one-line error
+  before any work (verified: detached, branchless source exits 1 naming the
+  path).
+- `grep` for `master` in `scripts/gf-dogfood.sh` returns zero hits.
