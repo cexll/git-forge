@@ -424,6 +424,83 @@ fn cli_events_fallback_to_store_default_when_user_email_is_empty() {
 }
 
 #[test]
+fn cli_events_fallback_to_store_default_when_user_email_value_is_unreadable() {
+    // F-028 STAGE B regression: a user.email VALUE that cannot be read as a
+    // string — here non-UTF-8 bytes, which libgit2 returns raw and git2's
+    // get_string rejects with "configuration value is not valid utf8" (a
+    // non-NotFound error) — is an unusable identity, not an environment
+    // fault. Policy: commit commands still succeed and every event carries
+    // the store default forge@localhost (the value-lookup failure falls back,
+    // unlike a config-open failure which propagates). The old actor()
+    // propagated this error, so `forge issue new` hard-failed. The hermetic
+    // forge() env keeps any machine/user-level identity from masking the
+    // fallback.
+    let dir = tmpdir("actor-unreadable-email");
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&dir)
+        .status()
+        .unwrap();
+    // A raw 0xFF byte in an unquoted value parses fine as git config (values
+    // are byte strings) but can never convert to a Rust String, so git2's
+    // get_string returns a non-NotFound error for the existing key.
+    std::fs::write(
+        dir.join(".git/config"),
+        b"[user]\n\temail = bad\xff@example.com\n",
+    )
+    .unwrap();
+    assert_eq!(
+        forge(&dir, &["forge", "issue", "new", "T", "desc"]).0,
+        0,
+        "unreadable user.email value: issue new must still succeed"
+    );
+    assert_eq!(forge(&dir, &["forge", "issue", "comment", "1", "hi"]).0, 0);
+    assert_eq!(forge(&dir, &["forge", "issue", "close", "1"]).0, 0);
+    assert_eq!(forge(&dir, &["forge", "issue", "reopen", "1"]).0, 0);
+    let actors = event_chain_actors(&dir);
+    assert_eq!(actors.len(), 4);
+    assert!(
+        actors.iter().all(|a| a == "forge@localhost"),
+        "unreadable user.email value: every event actor must fall back to the store default, got: {actors:?}"
+    );
+}
+
+#[test]
+fn cli_events_propagate_config_open_failure_as_clean_error() {
+    // F-028 STAGE A regression: when the repo's own .git/config cannot be
+    // opened at all (here: chmod 000), the event command must fail with a
+    // CLEAN error — no panic, no silent fallback to forge@localhost on an
+    // environment fault, and no forge ref written. This pins the current
+    // correct two-stage policy: a config-open failure (STAGE A) propagates
+    // while a value-lookup failure (STAGE B) falls back. The hermetic forge()
+    // env keeps any machine/user-level identity out of the picture.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmpdir("actor-config-unreadable");
+    init_repo(&dir);
+    let config = dir.join(".git/config");
+    let original = std::fs::metadata(&config).unwrap().permissions();
+    let mut blocked = original.clone();
+    blocked.set_mode(0o000);
+    std::fs::set_permissions(&config, blocked).unwrap();
+    let (c, _o, es) = forge(&dir, &["forge", "issue", "new", "T"]);
+    // Restore so the temp dir is never left with a permission-blocked config.
+    std::fs::set_permissions(&config, original).unwrap();
+    assert_eq!(
+        c, 1,
+        "config-open failure must surface as a clean command error (1), not a panic; exit was {c}, stderr: {es}"
+    );
+    assert!(
+        es.contains("config"),
+        "the clean error should point at the config problem, stderr: {es}"
+    );
+    // The environment fault must not mutate forge state: no refs may be written.
+    assert!(
+        !dir.join(".git/refs/forge").exists(),
+        "no refs/forge may be written when the config cannot open"
+    );
+}
+
+#[test]
 fn concurrent_comments_both_succeed() {
     let dir = tmpdir("concurrent");
     init_repo(&dir);

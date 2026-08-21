@@ -367,25 +367,36 @@ impl EventStore {
     /// so a repo with only user.email set would otherwise mis-fall back. The
     /// email is the wire contract; user.name is irrelevant to the actor.
     ///
-    /// Falls back to the store default `forge@localhost` when the key is not
-    /// configured at all OR is set to an empty/whitespace value (an empty
-    /// string counts as absent: libgit2 returns it as-is, not as NotFound);
-    /// malformed or unreadable config (an error other than a missing key)
-    /// propagates as `StoreError` so an unusable identity surfaces.
+    /// State-dependent config-failure policy (F-028):
+    ///
+    /// STAGE A — opening the repo's own config (`repo.config()`): propagates
+    /// deliberately. If the config cannot be opened at all the repo itself is
+    /// in a broken environment state; actor resolution is impossible and a
+    /// silent fallback (or an empty actor) would mask the fault. The `?`
+    /// below is intentional, not an oversight.
+    ///
+    /// STAGE B — looking up `user.email` (`get_string`): falls back to the
+    /// store default `forge@localhost`. Any value-level failure — the key is
+    /// absent (NotFound), it is empty/whitespace (an empty string counts as
+    /// absent: libgit2 returns it as-is, not as NotFound), or the stored value
+    /// cannot be read as a usable string (a malformed/unreadable value, e.g.
+    /// non-UTF-8 bytes) — means no usable identity, so commands still succeed
+    /// with the default, matching the wire contract.
     pub fn actor(&self) -> Result<String, StoreError> {
+        // STAGE A: config-open failure is an environment fault and propagates
+        // (deliberately — no silent fallback, no empty actor).
         let email = self
             .repo
             .config()
             .map_err(StoreError::Git)?
             .get_string("user.email");
         match email {
-            // `git config user.email ""` leaves the key present-but-empty;
-            // get_string yields Ok("") (not NotFound). Semantically that is no
-            // usable identity, so it gets the same fallback as an absent key.
+            // STAGE B: any value-lookup failure means no usable identity —
+            // absent key, an empty/whitespace value, or an unreadable value
+            // all fall back to the store default.
             Ok(value) if value.trim().is_empty() => Ok("forge@localhost".to_string()),
             Ok(value) => Ok(value),
-            Err(e) if e.code() == git2::ErrorCode::NotFound => Ok("forge@localhost".to_string()),
-            Err(e) => Err(StoreError::Git(e)),
+            Err(_) => Ok("forge@localhost".to_string()),
         }
     }
 

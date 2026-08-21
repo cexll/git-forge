@@ -17,9 +17,13 @@ Existing tests covered this up by always configuring `user.name` first.
 `EventStore::actor()` now reads `user.email` directly from the repo config via
 `repo.config().get_string("user.email")`, not via `Repository::signature()`.
 Fallback to `forge@localhost` happens when the `user.email` key is absent
-from repo, global, and system config — or is present but empty/whitespace
-(F-027, see below); a malformed or unreadable config (any error other than a
-missing key) propagates as `StoreError` instead of being swallowed. Because
+from repo, global, and system config, is present but empty/whitespace
+(F-027, see below), or cannot be read as a usable string (F-028, see below).
+Failure handling is stage-specific (F-028): a failure to OPEN the repo's own
+config (the early `repo.config()` `?`) PROPAGATES as `StoreError` — a
+repo-access environment fault that an identity fallback must never mask; a
+failure to LOOK UP the value (`get_string` with a non-`NotFound` error) FALLS
+BACK to `forge@localhost`. Because
 the read is now fallible, every event-creation command
 resolves the actor before any allocation or mutation: `cmd_new` resolves
 before `allocate_id()`, and `cmd_pr_merge` resolves after the read-only guards
@@ -35,8 +39,32 @@ event `actor`, violating the wire contract `"actor": "<user.email>"` (an
 empty string is not an email). `actor()` now treats a non-`NotFound`
 `Ok(value)` whose `value` is empty or all-whitespace exactly like an absent
 key and falls back to `forge@localhost`. Nothing else changed: a non-empty
-configured email is still used verbatim, and non-`NotFound` config errors
-still propagate.
+configured email is still used verbatim, and value errors are governed by the
+F-028 stage policy below.
+
+### Extension (F-028): stage-specific config-failure policy
+
+Scrutiny finding F-028: `actor()` hard-failed on any config problem, so every
+event command errored on a repo whose identity config was not cleanly
+parseable. The policy is now stage-specific inside `actor()`:
+
+- **STAGE A — opening the repo's own config (`repo.config()`)** is a
+  repo-access environment fault: the error PROPAGATES via `StoreError`
+  (deliberately — a doc comment on `actor()` states this). If the config
+  cannot be opened at all, actor resolution is impossible and a silent
+  fallback (or an empty actor) would mask a broken repo; the store writes no
+  event and mutates no ref.
+- **STAGE B — looking up `user.email` (`get_string`)** FALLS BACK to
+  `forge@localhost` on any value-level failure. `NotFound` (absent key) already
+  fell back; the change extends the same rule to other `get_string` errors: a
+  value that cannot be read as a usable string (e.g. non-UTF-8 bytes, which
+  libgit2 returns raw and git2's `get_string` rejects) is semantically "no
+  usable identity", so commands still succeed with the documented default,
+  honoring the contract sentence that "commands still succeed".
+
+`git2::ErrorCode::NotFound` and all other value-lookup errors now share one
+fallback arm — the two stages differ on where the error originates (open vs
+lookup), not on the key's absence.
 
 ## Alternatives considered
 
@@ -67,13 +95,26 @@ still propagate.
 - `docs/architecture/git-forge.md` updated in the same change (fallback
   condition is now "user.email absent or empty", not "user.email absent";
   both the Event Commit Layout bullet and the Event Identity "No-email
-  fallback" bullet state the same condition).
+  fallback" bullet state the same condition). F-028 added the two-stage
+  failure policy to both: lookup failures fall back, config-open failures
+  propagate.
 - F-027 extension: a `user.email` configured to an empty/whitespace value now
   yields the same fallback as an absent key — every event carries
   `forge@localhost` and commands succeed. Regression coverage: a hermetic
   issue-chain test (empty-email repo) proves the event-JSON actor field equals
   `forge@localhost` across new/comment/close/reopen; it failed against the
   pre-extension implementation (empty-string actors).
+- F-028 extension: STAGE B regression via a hermetic issue-chain test on a
+  repo whose `user.email` VALUE is non-UTF-8 (non-`NotFound` `get_string`
+  error) — every event carries `forge@localhost` and commands succeed; it
+  failed against the pre-fix implementation ("configuration value is not
+  valid utf8"). STAGE A is pinned by a hermetic CLI regression: with
+  `.git/config` unreadable (chmod 000) the event command exits cleanly (1)
+  with a config-mentioning error and writes no forge ref. (Note: libgit2
+  skips an unreadable on-disk config rather than failing `repo.config()`, so
+  the STAGE A `?` propagates its error only if libgit2 itself fails the open;
+  the CLI regression asserts the observable contract — unreadable config
+  ⇒ clean error, no silent fallback, no mutation.)
 - Regression coverage: hermetic email-only tests for both issue and PR chains
   prove the name-less path. The hermetic forge child sets HOME/XDG dirs to a
   fresh exclusively-created directory and disables system/global config
