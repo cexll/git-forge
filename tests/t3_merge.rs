@@ -67,6 +67,79 @@ fn forge(dir: &Path, args: &[&str]) -> (i32, String, String) {
     )
 }
 
+/// Repo for the email-only PR actor regression: setup (git commits) runs with
+/// user.name present, then user.name is UNSET for the forge phase so only
+/// user.email remains locally configured. Asserts the post-unset state so a
+/// name that silently survives can never mask the regression.
+fn init_email_only_test_repo(dir: &Path) {
+    init_repo(dir);
+    make_feature(dir, "feature", "feat\n");
+    let (c, _, e) = git(dir, &["config", "--unset", "user.name"]);
+    assert_eq!(c, 0, "unset user.name failed: {e}");
+    let (c, _, e) = git(dir, &["config", "user.email", "practor@example.com"]);
+    assert_eq!(c, 0, "set user.email failed: {e}");
+    let (c, o, _) = git(dir, &["config", "--get", "--local", "user.name"]);
+    assert_ne!(
+        c, 0,
+        "local user.name must be absent after unset (got {o:?})"
+    );
+    let (c, o, _) = git(dir, &["config", "--get", "--local", "user.email"]);
+    assert_eq!(c, 0, "local user.email must remain: {o}");
+    assert_eq!(o.trim(), "practor@example.com");
+}
+
+/// Run the git-forge binary in `dir` under a HERMETIC config env: HOME and
+/// the XDG dirs point at a freshly-and-exclusively-created empty directory and
+/// system config is disabled. Only the repo's own local config can supply git
+/// identity, so no machine/user-level user.name can leak in and mask a
+/// missing-name repo. Used only by the email-only PR actor regression: the
+/// directory is created with `create_dir` (exclusive, unique per call) so
+/// parallel tests never share or remove each other's enclave.
+fn forge_hermetic(dir: &Path, args: &[&str]) -> (i32, String, String) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let mut clean = std::env::temp_dir().join(format!(
+        "gf-t3-herm-{}-{}",
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let mut created = false;
+    for _ in 0..16 {
+        match std::fs::create_dir(&clean) {
+            Ok(()) => {
+                created = true;
+                break;
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                clean = clean.with_extension(format!("r{}", NEXT.fetch_add(1, Ordering::Relaxed)));
+            }
+            Err(e) => panic!("cannot create hermetic dir {clean:?}: {e}"),
+        }
+    }
+    assert!(
+        created,
+        "could not reserve a unique hermetic config dir after 16 attempts"
+    );
+    let out = Command::new(bin)
+        .args(args)
+        .current_dir(dir)
+        .env("HOME", &clean)
+        .env("XDG_CONFIG_HOME", &clean)
+        .env("XDG_GLOBAL_CONFIG", &clean)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_CONFIG_GLOBAL")
+        .env_remove("GIT_CONFIG_SYSTEM")
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&clean);
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    )
+}
+
 /// Make a feature branch off main with one commit, then return to main.
 fn make_feature(dir: &Path, branch: &str, content: &str) {
     let (c, _, e) = git(dir, &["checkout", "-q", "-b", branch]);
@@ -834,6 +907,45 @@ fn pr_chain_events_carry_configured_user_email_as_actor() {
     assert!(
         actors.iter().all(|a| a == "someone@example.com"),
         "every PR event actor must equal configured user.email, got: {actors:?}"
+    );
+}
+
+#[test]
+fn pr_events_carry_user_email_when_only_email_is_configured() {
+    // F-014 regression on the PR side: with ONLY user.email configured (no
+    // user.name), PR create/comment/review events must still carry that email
+    // as actor. Setup (branch + commits) runs while user.name is set (git
+    // commits need an identity); immediately before the forge phase we unset
+    // user.name so the store's actor path — which is required to read the
+    // email via repo.config(), never via git2 Repository::signature() — is
+    // actually exercised in the name-less state. forge_hermetic keeps any
+    // machine/user-level identity from leaking back in.
+    let dir = tmpdir("practor-email-only");
+    init_email_only_test_repo(&dir);
+    // PR merge is intentionally NOT part of this test: the git-level merge
+    // itself needs a committer identity (user.name), which is out of scope for
+    // the store's event-actor contract and covered by the name-present suite.
+    let (c, o, e) = forge_hermetic(
+        &dir,
+        &[
+            "forge", "pr", "create", "--source", "feature", "--base", "main", "PR",
+        ],
+    );
+    assert_eq!(c, 0, "email-only pr create failed: {e} {o}");
+    assert_eq!(
+        forge_hermetic(&dir, &["forge", "pr", "comment", "1", "hello"]).0,
+        0
+    );
+    assert_eq!(
+        forge_hermetic(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
+        0
+    );
+
+    let actors = pr_chain_actors(&dir, "refs/forge/prs/1/head");
+    assert_eq!(actors.len(), 3, "pr.created + pr.comment + pr.review");
+    assert!(
+        actors.iter().all(|a| a == "practor@example.com"),
+        "email-only PR events must carry the configured email, got: {actors:?}"
     );
 }
 

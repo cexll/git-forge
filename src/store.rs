@@ -361,13 +361,24 @@ impl EventStore {
 
     /// The event actor for the invoking repo: `user.email` from git config
     /// (wire contract `"actor": "<user.email>"` — the email, never user.name).
-    /// When no identity is configured (`repo.signature()` errors), fall back
-    /// to the store default email `forge@localhost` so commands still succeed.
-    pub fn actor(&self) -> String {
-        self.signature()
-            .ok()
-            .and_then(|sig| sig.email().map(String::from))
-            .unwrap_or_else(|| "forge@localhost".to_string())
+    ///
+    /// Read via `repo.config()` directly rather than `repo.signature()`: git2's
+    /// `signature()` requires BOTH user.name and user.email to be configured,
+    /// so a repo with only user.email set would otherwise mis-fall back. The
+    /// email is the wire contract; user.name is irrelevant to the actor.
+    ///
+    /// Falls back to the store default `forge@localhost` only when the key is
+    /// not configured at all; malformed or unreadable config (not a missing
+    /// key) propagates as an error so an unusable identity surfaces.
+    pub fn actor(&self) -> Result<String, StoreError> {
+        self.repo
+            .config()
+            .map_err(StoreError::Git)?
+            .get_string("user.email")
+            .or_else(|e| match e.code() {
+                git2::ErrorCode::NotFound => Ok("forge@localhost".to_string()),
+                _ => Err(StoreError::Git(e)),
+            })
     }
 
     fn counter_next_from_entry(&self, entry: &TreeEntry<'_>) -> Result<u64, StoreError> {

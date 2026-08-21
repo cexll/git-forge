@@ -60,8 +60,8 @@ fn cmd_new(store: &EventStore, args: &[String]) -> Result<String, String> {
         .get(1)
         .map(|d| d.trim().to_string())
         .filter(|d| !d.is_empty());
+    let actor = store.actor().map_err(|e| e.to_string())?;
     let id = store.allocate_id().map_err(|e| e.to_string())?;
-    let actor = store.actor();
     let mut body = body_obj(&[("title", json_str(&title))]);
     if let Some(d) = description {
         body.insert("description".into(), json_str(&d));
@@ -151,10 +151,11 @@ fn cmd_comment(store: &EventStore, args: &[String]) -> Result<String, String> {
     if !store_has_ref(store, &r) {
         return Err(format!("issue #{id} does not exist"));
     }
+    let actor = store.actor().map_err(|e| e.to_string())?;
     let ev = issue_event(
         EventKind::IssueComment,
         id,
-        &store.actor(),
+        &actor,
         body_obj(&[("body", json_str(&body))]),
     );
     store.append_event(&r, &ev).map_err(|e| e.to_string())?;
@@ -168,7 +169,8 @@ fn cmd_state(store: &EventStore, kind: EventKind, args: &[String]) -> Result<Str
     if !store_has_ref(store, &r) {
         return Err(format!("issue #{id} does not exist"));
     }
-    let ev = issue_event(kind, id, &store.actor(), HashMap::new());
+    let actor = store.actor().map_err(|e| e.to_string())?;
+    let ev = issue_event(kind, id, &actor, HashMap::new());
     store.append_event(&r, &ev).map_err(|e| e.to_string())?;
     let verb = match kind {
         EventKind::IssueClose => "closed",
@@ -306,6 +308,7 @@ fn cmd_pr_create(store: &EventStore, args: &[String]) -> Result<String, String> 
     }
     let merge_base = crate::git::require_single_merge_base(store.repo(), base_oid, source_oid)?;
 
+    let actor = store.actor().map_err(|e| e.to_string())?;
     let id = store
         .create_pr(
             title.trim(),
@@ -314,7 +317,7 @@ fn cmd_pr_create(store: &EventStore, args: &[String]) -> Result<String, String> 
             source_oid,
             base_oid,
             merge_base,
-            &store.actor(),
+            &actor,
         )
         .map_err(|e| e.to_string())?;
     Ok(format!("PR #{id} created: {title} ({source} -> {base})"))
@@ -403,11 +406,12 @@ fn cmd_pr_comment(store: &EventStore, args: &[String]) -> Result<String, String>
     if !store_has_ref(store, &r) {
         return Err(format!("PR #{id} does not exist"));
     }
+    let actor = store.actor().map_err(|e| e.to_string())?;
     let ev = Event::new(
         EventKind::PrComment,
         "pr",
         id,
-        &store.actor(),
+        &actor,
         body_obj(&[("body", json_str(&body))]),
     );
     store.append_event(&r, &ev).map_err(|e| e.to_string())?;
@@ -502,7 +506,8 @@ fn cmd_pr_review(store: &EventStore, args: &[String]) -> Result<String, String> 
         // diff changes).
         body.insert("commit".into(), json_str(&c));
     }
-    let ev = Event::new(EventKind::PrReview, "pr", id, &store.actor(), body);
+    let actor = store.actor().map_err(|e| e.to_string())?;
+    let ev = Event::new(EventKind::PrReview, "pr", id, &actor, body);
     store.append_event(&r, &ev).map_err(|e| e.to_string())?;
     Ok(format!("reviewed PR #{id} ({decision})"))
 }
@@ -657,6 +662,13 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
              run the merge from/against an un-checked-out base"
         ));
     }
+
+    // Resolve the event actor NOW, before any merge side effects (worktree
+    // reservation, pending-result ref, execution). actor() is fallible
+    // (config read); resolving it any later — after the pending-result ref
+    // exists — could leak that ref on a config error.
+    let actor = store.actor().map_err(|e| e.to_string())?;
+
     // Repo-specific temp worktree path: hash the canonical workdir so parallel
     // test repos (same pid) never collide on the global temp dir.
     use std::hash::{Hash, Hasher};
@@ -840,7 +852,7 @@ fn cmd_pr_merge(store: &EventStore, args: &[String]) -> Result<String, String> {
     // Single atomic completion transaction: delete pending ref + CAS base + CAS head.
     // finalize_pr_merge reads the head tip itself so all three move atomically.
     store
-        .finalize_pr_merge(id, &base_ref, base_oid, result_commit, &store.actor())
+        .finalize_pr_merge(id, &base_ref, base_oid, result_commit, &actor)
         .map_err(|e| {
             // Nothing moved; report the leftover pending ref.
             format!(

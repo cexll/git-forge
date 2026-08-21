@@ -85,14 +85,49 @@ fn init_repo(dir: &PathBuf) {
         .unwrap();
 }
 
+/// Initialize a temp repo with ONLY user.email configured (no user.name).
+/// Used to prove the actor comes from user.email alone — git2's
+/// `Repository::signature()` (which the store must NOT rely on for the actor)
+/// errors when user.name is absent, and the old implementation fell back to
+/// forge@localhost, silently violating the wire contract.
+fn init_email_only(dir: &PathBuf) {
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(dir)
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.email", "email-only@example.com"])
+        .current_dir(dir)
+        .status()
+        .unwrap();
+}
+
 /// Run the git-forge binary in `dir`. `args` are the full args after the binary.
+///
+/// The child runs under a HERMETIC config env: HOME/XDG dirs point at a fresh
+/// empty directory and system config is disabled, so the only git identity the
+/// process can see is the repo's own local config (this is what makes the
+/// email-only and no-identity actor tests meaningful — a machine-level
+/// user.name/user.email can never mask them). libgit2 may still consult the
+/// account home, so HOME is SET to the clean dir, not removed.
 fn forge(dir: &PathBuf, args: &[&str]) -> (i32, String, String) {
     let bin = env!("CARGO_BIN_EXE_git-forge");
+    // Exclusive, owned hermetic config dir (tmpdir create_dir never reopens a
+    // stale dir; each call returns its actually-created path).
+    let clean = tmpdir("hermetic");
     let out = Command::new(bin)
         .args(args)
         .current_dir(dir)
+        .env("HOME", &clean)
+        .env("XDG_CONFIG_HOME", &clean)
+        .env("XDG_GLOBAL_CONFIG", &clean)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_CONFIG_GLOBAL")
+        .env_remove("GIT_CONFIG_SYSTEM")
         .output()
         .unwrap();
+    let _ = std::fs::remove_dir_all(&clean);
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).trim().to_string(),
@@ -298,6 +333,57 @@ fn cli_events_carry_configured_user_email_as_actor() {
     assert!(
         actors.iter().all(|a| a == "someone@example.com"),
         "every event actor must equal configured user.email, got: {actors:?}"
+    );
+}
+
+#[test]
+fn cli_events_carry_user_email_when_only_email_is_configured() {
+    // F-014 regression: with ONLY user.email configured (no user.name), the
+    // actor must still be that email. The old event-store actor() routed
+    // through git2 Repository::signature(), which requires user.name AND
+    // user.email; a name-less repo silently fell back to forge@localhost.
+    // The hermetic forge() env plus init_email_only make this meaningful: no
+    // machine/user-level user.name can leak in to mask the regression.
+    let dir = tmpdir("actor-email-only");
+    init_email_only(&dir);
+    assert_eq!(
+        forge(&dir, &["forge", "issue", "new", "T", "desc"]).0,
+        0,
+        "email-only repo: issue new must succeed"
+    );
+    assert_eq!(forge(&dir, &["forge", "issue", "comment", "1", "hi"]).0, 0);
+    assert_eq!(forge(&dir, &["forge", "issue", "close", "1"]).0, 0);
+    assert_eq!(forge(&dir, &["forge", "issue", "reopen", "1"]).0, 0);
+    let actors = event_chain_actors(&dir);
+    assert_eq!(actors.len(), 4);
+    assert!(
+        actors.iter().all(|a| a == "email-only@example.com"),
+        "email-only repo: every actor must equal the config email, got: {actors:?}"
+    );
+}
+
+#[test]
+fn cli_events_fallback_to_store_default_when_no_identity_configured() {
+    // A repo with NO user.email (and no user.name, and no leaked machine
+    // identity because forge() is hermetic) must still succeed, recording the
+    // documented store fallback actor. The fallback fires only when the
+    // user.email key is ABSENT — the actor is the email, never user.name.
+    let dir = tmpdir("actor-none");
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&dir)
+        .status()
+        .unwrap();
+    assert_eq!(
+        forge(&dir, &["forge", "issue", "new", "T"]).0,
+        0,
+        "no-identity repo: issue new must still succeed"
+    );
+    let actors = event_chain_actors(&dir);
+    assert_eq!(actors.len(), 1);
+    assert_eq!(
+        actors[0], "forge@localhost",
+        "no identity: fallback actor must be the store default"
     );
 }
 
