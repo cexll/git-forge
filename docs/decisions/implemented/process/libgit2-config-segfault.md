@@ -68,7 +68,11 @@ libgit2** — it is a defect in the pinned dependency, not in git-forge code:
 
 - Reproducer and analysis are on record for an upstream libgit2 report.
 - git-forge behavior on malformed-config-after-open remains "undefined
-  behavior inside libgit2" (crash); commands do not corrupt refs, but the
-  process dies. Documented, not mitigated, until upstream responds.
+  behavior inside libgit2" (crash). The probe exercised only `repo.config()`
+  in an isolated Rust process — no CLI command/ref-transaction path was run
+  under the crash condition, so this record makes NO claim about ref
+  integrity or partial-write behavior on that path; that remains untested and
+  out of scope for this finding. Documented, not mitigated, until upstream
+  responds.
 - Future dependency bumps should re-test fixtures 3 and 4 as a regression
   gate before adopting a new libgit2.
