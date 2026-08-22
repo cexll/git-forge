@@ -117,8 +117,26 @@ dogfood-eval-regression:
 dogfood-all: dogfood-main-default dogfood-eval-regression dogfood
 
 # ── Coverage (L3: 80% lines, block; standalone until qualified) ──
+# cargo-llvm-cov needs llvm-profdata, which Homebrew's rust install does not
+# ship in its sysroot (`lib/rustlib/*/bin/` has only rust-objcopy). rustup's
+# matching-version toolchain does carry llvm-tools, so when the active rustc's
+# sysroot lacks llvm-profdata we run cargo-llvm-cov under the rustup toolchain
+# that ships it. Detect via the sysroot directly (command substitution), not a
+# shell variable, so `just` hands `$(...)` to the shell unmangled.
 coverage:
-    @if [ -f Cargo.toml ]; then cargo llvm-cov --all-targets --fail-under-lines 80; else echo "coverage: no Cargo.toml yet — lands with devflow t0"; fi
+    @if [ -f Cargo.toml ]; then \
+        if find "$(rustc --print sysroot)/lib/rustlib" -name llvm-profdata 2>/dev/null | grep -q .; then \
+            cargo llvm-cov --all-targets --fail-under-lines 80; \
+        elif rustup run 1.93.0-aarch64-apple-darwin true 2>/dev/null; then \
+            echo "coverage: Homebrew rust lacks llvm-profdata; using rustup toolchain 1.93.0-aarch64-apple-darwin"; \
+            rustup run 1.93.0-aarch64-apple-darwin cargo llvm-cov --all-targets --fail-under-lines 80; \
+        else \
+            echo "coverage: no llvm-profdata in this rustc sysroot and no rustup 1.93.0 toolchain; install one (rustup toolchain install 1.93.0-aarch64-apple-darwin && rustup component add llvm-tools-aarch64-apple-darwin)"; \
+            exit 1; \
+        fi; \
+    else \
+        echo "coverage: no Cargo.toml yet — lands with devflow t0"; \
+    fi
 
 # ── Build ────────────────────────────────────────────────────────
 build:
