@@ -17,19 +17,19 @@ silently return as a bypass.
 via `test-guardrails`): run the repo's own `size-gate` recipe
 (`just --justfile <repo>/justfile --working-directory <temp>`) against an
 OWNED temp project holding a synthetic 801-line Rust file plus hostile config
-on every relevant tokei channel: the project's own `tokei.toml` (current
-directory); `$XDG_CONFIG_HOME/tokei.toml` (default
-`$HOME/.config/tokei.toml`) and `$HOME/tokei.toml` (user configuration); and
-a project `.tokeignore` excluding the probe (ignore-rule channel; a gate that
-lost `--no-ignore` would silently skip it). The fixture writes the project
-`tokei.toml`, then sets `HOME` and `XDG_CONFIG_HOME` to the same temporary
-bracket, so its one `$HOME/tokei.toml` fixture exercises both user-config
-locations. The gate must exit non-zero WITH the exact diagnostic
-`exceeds 800 code lines (801)`; after removing the probe and `.tokeignore`,
-the gate must exit zero on the same clean project. tokei and
-just are required prereqs — their absence is a FAIL, not a false pass. Fixtures
-live in `mktemp -d` dirs created and removed by the script — the real repo tree
-is never touched.
+at every relevant tokei configuration base: the config directory
+`$XDG_CONFIG_HOME` (default `$HOME/.config` when XDG is unset), `$HOME`, and
+the project's current directory. At each base tokei reads `tokei.toml` or
+falls back to `.tokeirc`. A project `.tokeignore` separately excludes the
+probe through the ignore-rule channel; a gate that lost `--no-ignore` would
+silently skip it. The fixture writes the project `tokei.toml`, then sets
+`HOME` and `XDG_CONFIG_HOME` to the same temporary bracket, so its one
+`$HOME/tokei.toml` fixture exercises both user-config locations. The gate
+must exit non-zero WITH the exact diagnostic `exceeds 800 code lines (801)`;
+after removing the probe and `.tokeignore`, the gate must exit zero on the
+same clean project. tokei and just are required prereqs — their absence is a
+FAIL, not a false pass. Fixtures live in `mktemp -d` dirs created and removed
+by the script — the real repo tree is never touched.
 
 ## Alternatives considered
 

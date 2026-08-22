@@ -38,8 +38,9 @@ fi
 
 # 4. F-015 regression: size-gate must stay immune to a hostile user/root tokei
 # config. Run from an OWNED temp project (never the real repo): a synthetic
-# over-800-line src file plus hostile tokei.toml (cwd, $HOME, XDG) and a
-# .tokeignore must make `just size-gate` exit non-zero with the exact
+# over-800-line src file plus hostile tokei config (`tokei.toml` or fallback
+# `.tokeirc` at the cwd, $HOME, or config-dir base) and a `.tokeignore`
+# ignore rule must make `just size-gate` exit non-zero with the exact
 # 'exceeds 800 code lines (801)' diagnostic, and a clean project must exit
 # zero. tokei/just are required prereqs (AGENTS) — their absence is a FAIL,
 # not a fail-closed pass.
@@ -58,10 +59,11 @@ else
   printf 'types = ["Python"]\n' > "$guard_tmp/tokei.toml"
   hostile_home="$guard_tmp/home"
   mkdir -p "$hostile_home"
-  # Hostile config channels: tokei reads $XDG_CONFIG_HOME/tokei.toml (default
-  # $HOME/.config/tokei.toml), $HOME/tokei.toml, and the current directory.
-  # HOME and XDG_CONFIG_HOME share this bracket, so the real tokei.toml fixture
-  # must not hide the over-limit file or let F-015 isolation regress.
+  # Hostile config channels: at each config base — $XDG_CONFIG_HOME (default
+  # $HOME/.config when XDG is unset), $HOME, and the current directory — tokei
+  # reads tokei.toml or falls back to .tokeirc. HOME and XDG_CONFIG_HOME share
+  # this bracket, so the real tokei.toml fixture must not hide the over-limit
+  # file or let F-015 isolation regress.
   printf 'types = ["Python"]\n' > "$hostile_home/tokei.toml"
   # Hostile IGNORE channel: a project .tokeignore excluding the probe lets a
   # gate that lost --no-ignore silently skip it; the guardrail catches that.

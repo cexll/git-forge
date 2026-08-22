@@ -5,15 +5,16 @@ Status: active
 ## Problem
 
 `just size-gate` (L3 block gate, wired into `just check`) counted source lines
-via `tokei --output json src/`. Tokei loads user configuration from
-`$XDG_CONFIG_HOME/tokei.toml` (default `$HOME/.config/tokei.toml`) and
-`$HOME/tokei.toml`. A hostile or merely unusual config such as
-`types = ["Python"]` replaces the built-in
-language table, which removes Rust entirely from the report — an over-800-line
-`src/*.rs` file then reports `code = 0` and the gate passes. Ignore rules
-(`.gitignore`, `.ignore`, `.tokeignore`) can likewise suppress a file from the
-walk. The gate could be bypassed by the very environment it runs in, so the
-L3 size guarantee was advisory rather than enforced.
+via `tokei --output json src/`. Tokei loads `tokei.toml` or falls back to
+`.tokeirc` at each configuration base: the config directory
+`$XDG_CONFIG_HOME` (default `$HOME/.config` when XDG is unset), `$HOME`, and
+the current directory. A hostile or merely unusual config such as
+`types = ["Python"]` replaces the built-in language table, which removes Rust
+entirely from the report — an over-800-line `src/*.rs` file then reports
+`code = 0` and the gate passes. Ignore rules (`.gitignore`, `.ignore`, and
+`.tokeignore`) are a distinct channel and can likewise suppress a file from
+the walk. The gate could be bypassed by the very environment it runs in, so
+the L3 size guarantee was advisory rather than enforced.
 
 ## Decision
 
@@ -21,13 +22,15 @@ L3 size guarantee was advisory rather than enforced.
 
 - the gate first captures the repo root (`$REPO`), creates a fresh empty
   directory (`mktemp -d`), and **changes into it** before invoking tokei with
-  the absolute source path `$REPO/src/` — this neutralizes the current
-  directory's `tokei.toml` lookup, which tokei also consults (verified: a
-  repo-root `types = ["Python"]` `tokei.toml` hid every Rust file until the
-  gate ran from the empty dir);
+  the absolute source path `$REPO/src/` — this neutralizes config files at the
+  current-directory base: `tokei.toml` or fallback `.tokeirc` (a repo-root
+  `types = ["Python"]` `tokei.toml` hid every Rust file until the gate ran from
+  the empty dir);
 - `HOME` and `XDG_CONFIG_HOME` are pointed at that same empty directory, so
-  tokei cannot load either user configuration channel;
-- `--no-ignore` disables `.gitignore`/`.ignore`/`.tokeignore` suppression;
+  tokei cannot load `tokei.toml` or fallback `.tokeirc` from either the `$HOME`
+  or config-directory base;
+- `--no-ignore` disables the separate `.gitignore`/`.ignore`/`.tokeignore`
+  ignore-rule channel;
 - the temp dir is removed via a `trap ... EXIT` so an interrupted or failing
   run never leaks it;
 - `set -o pipefail` makes the gate's exit code reflect tokei's own failure
