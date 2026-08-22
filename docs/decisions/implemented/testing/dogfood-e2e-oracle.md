@@ -30,8 +30,17 @@ repo's state is never the test surface).
 summary reports `pass=45 fail=0`. The AGENTS.md Verification Matrix now names
 the real e2e surfaces — the t2_pr/t3_merge integration tests (`just test`) plus
 `scripts/gf-dogfood.sh` (`just dogfood`) — and no longer claims the nonexistent
-files. `just e2e` remains a placeholder for future dedicated e2e test files: it
-exits 0 with an honest note naming the real surfaces.
+files.
+
+`just e2e` is now the real enforced e2e gate (F-008): it runs `dogfood-all` —
+both 45/45 dogfood oracles on disposable clones, the master-default oracle
+(`scripts/gf-dogfood.sh`) and the owned main-default regression
+(`scripts/gf-dogfood-main-default.sh`) — and exits non-zero on any oracle
+failure (constraints.yaml e2e surface: command `just e2e`, L3, evidence both
+45/45 oracle summaries). This supersedes the historical placeholder era, when
+`just e2e` was a compatibility stub that only echoed an honest note about the
+never-created dedicated e2e test files; that era is preserved as superseded
+history (see Problem).
 
 ## Alternatives considered
 
@@ -41,7 +50,8 @@ exits 0 with an honest note naming the real surfaces.
 - **Add `tests/e2e_workflow.rs` now**: rejected — standing up a dedicated
   integration harness (test fixtures, repo orchestration, isolation) is a real
   project; the executable oracle already covers the merge-lifecycle 45 checks,
-  and the placeholder stays honest until that harness lands.
+  and the placeholder's honest note was kept until the real `just e2e` gate
+  superseded it.
 - **Gate `tests/` files with the 800-line size gate**: rejected — tests/t3_merge.rs
   exceeds 800 code lines and is tracked as an open concern pending a separate
   split; that split is recorded in its own decision
@@ -61,5 +71,10 @@ exits 0 with an honest note naming the real surfaces.
 - The self-build writes only under the run's temp dir (`--target-dir`), so the
   checkout stays free of build artifacts and the tested binary always comes
   fresh from this checkout.
-- `tests/` line-size remains ungated pending the separate t3_merge split;
-  `just e2e` stays a placeholder until dedicated e2e test files land.
+- `tests/` line-size remains ungated pending the separate t3_merge split.
+- `just e2e` is the enforced e2e gate: it runs `dogfood-all` (both 45/45
+  oracles, master-default + main-default) and fails loudly on any oracle
+  failure, replacing the placeholder stub that only echoed a compatibility
+  note. The dedicated `tests/e2e_workflow.rs`/`tests/e2e_counter.rs` harness
+  was never created and is no longer a planned surface — the end-to-end merge
+  lifecycle is exercised through both default-branch dogfood oracles instead.
