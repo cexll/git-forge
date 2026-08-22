@@ -97,10 +97,13 @@ dogfood:
 dogfood-main-default:
     bash scripts/gf-dogfood-main-default.sh
 
-# Enforced e2e dogfood surface: both default-branch variants (master-default via
-# scripts/gf-dogfood.sh + main-default via scripts/gf-dogfood-main-default.sh),
-# ~3min, intentionally NOT in just check.
-dogfood-all: dogfood dogfood-main-default
+# Enforced e2e dogfood surface: both default-branch variants (main-default via
+# scripts/gf-dogfood-main-default.sh + master-default via scripts/gf-dogfood.sh),
+# ~3min, intentionally NOT in just check. Self-contained main-default runs
+# first: it has no external prereqs, so the owned regression still executes
+# when GDOGFOOD_SRC (master-default's prerequisite) is absent — a missing
+# source fails only the master-default leg, never masks the main-default one.
+dogfood-all: dogfood-main-default dogfood
 
 # ── Coverage (L3: 80% lines, block; standalone until qualified) ──
 coverage:

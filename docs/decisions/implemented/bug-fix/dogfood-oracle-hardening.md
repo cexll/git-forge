@@ -33,8 +33,9 @@ gaps found by the milestone scrutiny validator:
   or drift with the index, and `--target-dir` keeps the temp build out of the
   checkout (unchanged from f4).
 - `constraints.yaml` `verification.surfaces.e2e` now reads
-  `just test && just dogfood` with evidence spanning both surfaces, matching
-  AGENTS.md's Verification Matrix.
+  `just e2e` (both 45/45 dogfood oracles, master-default + main-default),
+  with `test: just test` kept as a separate L3 surface for the t2_pr/t3_merge
+  integration tests; this matches AGENTS.md's Verification Matrix.
 
 ## Alternatives considered
 
@@ -51,8 +52,9 @@ gaps found by the milestone scrutiny validator:
   subdirectory-of-worktree (all verified: each exits 1 with a one-line error).
 - The oracle builds offline and locked; a no-network machine with a warm
   dependency cache can still dogfood (same cache the test suite uses).
-- `constraints.yaml` e2e surface is now `just test && just dogfood`; every row
-  in the mirror resolves to a real justfile target.
+- `constraints.yaml` e2e surface is now `just e2e` (both 45/45 dogfood oracles)
+  with `test: just test` separate; every row in the mirror resolves to a real
+  justfile target.
 
 ## Addendum: default-branch resolution instead of hardcoded master (F-033)
 

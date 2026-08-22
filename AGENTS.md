@@ -153,8 +153,7 @@ All commands route through `justfile`. Do not invent ad-hoc commands; add missin
 | Lint | clippy `-D warnings` | `just lint` | exit 0 |
 | Unit tests | cargo test --lib | `just unit` | exit 0 + test names |
 | All tests | cargo test --all-targets | `just test` | exit 0 |
-| E2E (real surfaces) | tests/t2_pr.rs + tests/t3_merge.rs integration + scripts/gf-dogfood.sh | `just test` + `just dogfood` | exit 0; dogfood prints `DOGFOOD SUMMARY pass=45 fail=0` (master-default oracle); main-default variant covered by `just e2e` |
-| E2E (both default branches) | scripts/gf-dogfood.sh + scripts/gf-dogfood-main-default.sh | `just e2e` (= `just dogfood-all`) | exit 0; two `DOGFOOD SUMMARY pass=45 fail=0` lines |
+| E2E (real surfaces, both default branches) | tests/t2_pr.rs + tests/t3_merge.rs integration (via `just test`, independent surface) + scripts/gf-dogfood.sh + scripts/gf-dogfood-main-default.sh | `just e2e` (= `just dogfood-all`) | exit 0; two `DOGFOOD SUMMARY pass=45 fail=0` lines |
 | Coverage | llvm-cov ≥80% lines | `just coverage` | report ≥ threshold |
 | Guardrails | scripts/test-guardrails.sh | `just test-guardrails` | 5/5 pass (accept clean, reject violation, size-gate hostile-config regression) |
 | Size gate | tokei per-file code lines over src/ | `just size-gate` | exit 0; non-zero if any src/ file exceeds 800 code lines (wired into `just check`) |
