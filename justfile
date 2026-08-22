@@ -97,13 +97,24 @@ dogfood:
 dogfood-main-default:
     bash scripts/gf-dogfood-main-default.sh
 
+# SEC-01 regression: a source repo whose default branch is `x$(>$MARKER)`
+# (git update-ref accepts no-space payloads) must be used as data by
+# gf-dogfood.sh — the eval re-parse must never execute the embedded `$()`.
+# Asserts the vulnerable at() assertion was reached AND no marker file was
+# created. ~30s, part of the enforced e2e gate.
+dogfood-eval-regression:
+    bash tests/dogfood-eval-injection-regression.sh
+
 # Enforced e2e dogfood surface: both default-branch variants (main-default via
 # scripts/gf-dogfood-main-default.sh + master-default via scripts/gf-dogfood.sh),
-# ~3min, intentionally NOT in just check. Self-contained main-default runs
-# first: it has no external prereqs, so the owned regression still executes
-# when GDOGFOOD_SRC (master-default's prerequisite) is absent — a missing
-# source fails only the master-default leg, never masks the main-default one.
-dogfood-all: dogfood-main-default dogfood
+# plus the SEC-01 eval-injection regression (tests/dogfood-eval-injection-regression.sh)
+# — a source repo whose default branch is `x$(>$MARKER)` must be used as data,
+# never eval'd. ~3.5min, intentionally NOT in just check. Both self-contained
+# targets (main-default + eval-regression, no external prereqs) run BEFORE the
+# GDOGFOOD_SRC-dependent master-default dogfood, so the owned regressions still
+# execute when the source is absent — a missing source fails only its own leg
+# and never masks the self-contained ones.
+dogfood-all: dogfood-main-default dogfood-eval-regression dogfood
 
 # ── Coverage (L3: 80% lines, block; standalone until qualified) ──
 coverage:
