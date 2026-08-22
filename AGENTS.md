@@ -113,7 +113,7 @@ git config core.hooksPath .git-hooks   # one-time hook install
 > tokei makes `size-gate` exit 1 with `tokei missing — run brew install tokei` so a fresh clone
 > fails loudly instead of silently passing the size gate.
 
-> **Prerequisite — GDOGFOOD_SRC for `just dogfood`:** scripts/gf-dogfood.sh dogfoods a
+> **Prerequisite — GDOGFOOD_SRC for `just e2e` / `just dogfood-all` / `just dogfood`:** scripts/gf-dogfood.sh dogfoods a
 > disposable clone of `$GDOGFOOD_SRC` (default /Users/chenwenjie/workspaces/dsh-deepwork).
 > The path must exist, be a git repository, and hold the checks' working files (PLAN.md);
 > the script preflights this and exits 1 with a clear one-line error when any requirement
