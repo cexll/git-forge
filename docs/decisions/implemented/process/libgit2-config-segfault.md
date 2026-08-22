@@ -99,3 +99,61 @@ and a dependency bump must still re-test fixtures 3/4), but the git-forge
 forge-write paths are no longer exposed to it. An isolated child-process
 regression (`tests/t1a_store.rs` `val115_postopen_corrupt_write_does_not_segv`)
 proves the write-after-post-open-corruption path completes without SIGSEGV.
+
+## Upstream issue draft (ready to file against libgit2 / libgit2-rs)
+
+The following is the issue text prepared for an upstream report. It has NOT
+been filed yet — filing is an external action gated on a maintainer decision.
+Copy it to the upstream issue tracker when the escalation is approved.
+
+---
+
+**Title**: SIGSEGV (not a clean error) when `.git/config` is replaced with
+malformed content after `Repository::open` and before the first `repo.config()`
+
+**Environment**: libgit2 1.9.6 (libgit2-sys 0.18.7+1.9.6), git2 0.20, Rust,
+macOS arm64. Reproduces on any platform where the lazy-load config re-parse
+path is reachable.
+
+**Summary**: `git2::Repository::open` on a repository with a valid
+`.git/config` succeeds. Replacing that file with malformed content (e.g. the
+byte sequence `[user\nemail = broken`, i.e. a section header missing its `]`)
+and then calling `repository.config()` crashes the process with **SIGSEGV
+(exit 139)** instead of returning a config-parse error. The crash is in
+libgit2's config lazy-load path (`git_repository_config__weakptr`,
+`repository.c` ~lines 1403-1471): the config file is re-parsed after the
+open-time snapshot, so its authoritative state is no longer the state observed
+at open and the replacement is parsed without a corresponding snapshot
+validation.
+
+**Reproducer** (minimal, two independent triggers):
+
+```rust
+// trigger 1: valid config at open, malformed after open, then config()
+let repo = git2::Repository::open("/tmp/r")?;   // .git/config valid here
+// externally: replace /tmp/r/.git/config with "[user\nemail = broken"
+let cfg = repo.config()?;                        // SIGSEGV on deferred re-parse
+
+// trigger 2: config absent at open (open tolerates it), malformed after
+let repo = git2::Repository::open("/tmp/r2")?;   // .git/config absent
+// externally: create a malformed .git/config
+let cfg = repo.config()?;                        // same crash
+```
+
+**Expected**: a clean config-parse failure, identical to the malformed-before-open
+case, which fails loudly at `open()` with libgit2's own parse error ("failed to
+parse config file: missing ']' in section header").
+
+**Observed**: the process terminates with SIGSEGV (exit 139); no error is
+returned to the caller and no cleanup path runs.
+
+**Notes for maintainers**: the crash trigger is a race between open-time
+snapshot state and a later filesystem mutation, on the deferred (lazy) config
+load. A caller-side "preflight parse" does not prevent it — preflight parses
+before open (where malformed content already fails cleanly) and cannot cover
+the mutation-after-open window that actually crashes. This is a defect in
+libgit2's config lifecycle; the caller cannot defensibly avoid it short of not
+using `repo.config()` at all. A fix might snapshot the config file identity at
+open and re-validate the parsed object against it, or surface a clean error
+instead of a page fault when the re-parse encounters a structurally invalid
+config.
