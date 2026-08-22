@@ -424,6 +424,43 @@ fn cli_events_fallback_to_store_default_when_user_email_is_empty() {
 }
 
 #[test]
+fn cli_events_fallback_to_store_default_when_user_email_is_whitespace() {
+    // F-005 regression: `git config user.email "   "` (whitespace-only) leaves
+    // the key present-but-whitespace in .git/config, and libgit2's get_string
+    // returns that whitespace string as-is (NOT NotFound). An all-whitespace
+    // value is semantically "no email" exactly like an empty one: actor()
+    // trims before the emptiness check, so every CLI-written event must carry
+    // the store default forge@localhost and commands must still succeed. The
+    // hermetic forge() env guarantees no machine/user-level identity leaks in
+    // to mask it.
+    let dir = tmpdir("actor-whitespace-email");
+    Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(&dir)
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.email", "   "])
+        .current_dir(&dir)
+        .status()
+        .unwrap();
+    assert_eq!(
+        forge(&dir, &["forge", "issue", "new", "T", "desc"]).0,
+        0,
+        "whitespace user.email repo: issue new must still succeed"
+    );
+    assert_eq!(forge(&dir, &["forge", "issue", "comment", "1", "hi"]).0, 0);
+    assert_eq!(forge(&dir, &["forge", "issue", "close", "1"]).0, 0);
+    assert_eq!(forge(&dir, &["forge", "issue", "reopen", "1"]).0, 0);
+    let actors = event_chain_actors(&dir);
+    assert_eq!(actors.len(), 4);
+    assert!(
+        actors.iter().all(|a| a == "forge@localhost"),
+        "whitespace user.email: every event actor must fall back to the store default, got: {actors:?}"
+    );
+}
+
+#[test]
 fn cli_events_fallback_to_store_default_when_user_email_value_is_unreadable() {
     // F-028 STAGE B regression: a user.email VALUE that cannot be read as a
     // string — here non-UTF-8 bytes, which libgit2 returns raw and git2's
@@ -462,41 +499,6 @@ fn cli_events_fallback_to_store_default_when_user_email_value_is_unreadable() {
     assert!(
         actors.iter().all(|a| a == "forge@localhost"),
         "unreadable user.email value: every event actor must fall back to the store default, got: {actors:?}"
-    );
-}
-
-#[test]
-fn cli_events_propagate_config_open_failure_as_clean_error() {
-    // F-028 STAGE A regression: when the repo's own .git/config cannot be
-    // opened at all (here: chmod 000), the event command must fail with a
-    // CLEAN error — no panic, no silent fallback to forge@localhost on an
-    // environment fault, and no forge ref written. This pins the current
-    // correct two-stage policy: a config-open failure (STAGE A) propagates
-    // while a value-lookup failure (STAGE B) falls back. The hermetic forge()
-    // env keeps any machine/user-level identity out of the picture.
-    use std::os::unix::fs::PermissionsExt;
-    let dir = tmpdir("actor-config-unreadable");
-    init_repo(&dir);
-    let config = dir.join(".git/config");
-    let original = std::fs::metadata(&config).unwrap().permissions();
-    let mut blocked = original.clone();
-    blocked.set_mode(0o000);
-    std::fs::set_permissions(&config, blocked).unwrap();
-    let (c, _o, es) = forge(&dir, &["forge", "issue", "new", "T"]);
-    // Restore so the temp dir is never left with a permission-blocked config.
-    std::fs::set_permissions(&config, original).unwrap();
-    assert_eq!(
-        c, 1,
-        "config-open failure must surface as a clean command error (1), not a panic; exit was {c}, stderr: {es}"
-    );
-    assert!(
-        es.contains("config"),
-        "the clean error should point at the config problem, stderr: {es}"
-    );
-    // The environment fault must not mutate forge state: no refs may be written.
-    assert!(
-        !dir.join(".git/refs/forge").exists(),
-        "no refs/forge may be written when the config cannot open"
     );
 }
 

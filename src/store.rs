@@ -375,6 +375,18 @@ impl EventStore {
     /// silent fallback (or an empty actor) would mask the fault. The `?`
     /// below is intentional, not an oversight.
     ///
+    /// Probe observation (VAL-117 replan, pinned libgit2 1.9.6): six attempted
+    /// fixtures produced no clean `repo.config()` error on an already-open
+    /// repository — see the probe record in
+    /// `.specs/git-forge-contract-fix/evidence/assertions-contract-fix/VAL-117-STAGE-A-probe.txt`.
+    /// A config replaced by a directory at lazy-load resolves to `NotFound`
+    /// (STAGE B fallback), and a malformed config at parse crashes libgit2
+    /// (SIGSEGV, exit 139) — an undefined-behavior state recorded as a LOCAL
+    /// SAFETY FINDING requiring escalation, NOT acceptable evidence for this
+    /// branch. This branch is therefore an unexercised defensive error path
+    /// under the pinned libgit2; no snapshot-loading invariant or absolute
+    /// unreachability is claimed.
+    ///
     /// STAGE B — looking up `user.email` (`get_string`): falls back to the
     /// store default `forge@localhost`. Any value-level failure — the key is
     /// absent (NotFound), it is empty/whitespace (an empty string counts as

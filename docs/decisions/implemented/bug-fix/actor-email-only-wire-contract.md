@@ -108,13 +108,26 @@ lookup), not on the key's absence.
   repo whose `user.email` VALUE is non-UTF-8 (non-`NotFound` `get_string`
   error) — every event carries `forge@localhost` and commands succeed; it
   failed against the pre-fix implementation ("configuration value is not
-  valid utf8"). STAGE A is pinned by a hermetic CLI regression: with
-  `.git/config` unreadable (chmod 000) the event command exits cleanly (1)
-  with a config-mentioning error and writes no forge ref. (Note: libgit2
-  skips an unreadable on-disk config rather than failing `repo.config()`, so
-  the STAGE A `?` propagates its error only if libgit2 itself fails the open;
-  the CLI regression asserts the observable contract — unreadable config
-  ⇒ clean error, no silent fallback, no mutation.)
+  valid utf8").
+- VAL-115 replan → VAL-117 (F-002): STAGE A is documented, not regressed.
+  The earlier CLI regression `cli_events_propagate_config_open_failure_as_clean_error`
+  (chmod 000 on `.git/config`) was DELETED: it observed the git-update-ref
+  subprocess seam, not the actor STAGE A branch, and implied config causality
+  without proving it. STAGE A evidence is now source inspection + a probe
+  record: six attempted fixtures on the pinned libgit2 1.9.6 produced no clean
+  `repo.config()` error on an already-open repository (probe record at
+  `.specs/git-forge-contract-fix/evidence/assertions-contract-fix/VAL-117-STAGE-A-probe.txt`).
+  A directory config at lazy-load resolves to `NotFound` (STAGE B fallback);
+  malformed config at parse crashes libgit2 (SIGSEGV, exit 139) — a LOCAL
+  SAFETY FINDING requiring escalation (reproducer in the probe record), not
+  acceptable evidence for this branch. No snapshot-loading invariant or
+  absolute unreachability is claimed; the deliberate propagation semantics
+  are unchanged (config-open failures still propagate via `StoreError`).
+- F-005 extension: a whitespace-only `user.email` value (`"   "`) gets the
+  same fallback as an empty one and now has its own hermetic issue-chain
+  regression (whitespace-email repo) proving the event-JSON actor equals
+  `forge@localhost` across new/comment/close/reopen, alongside the F-027
+  empty-string case.
 - Regression coverage: hermetic email-only tests for both issue and PR chains
   prove the name-less path. The hermetic forge child sets HOME/XDG dirs to a
   fresh exclusively-created directory and disables system/global config
