@@ -9,8 +9,7 @@ hook="$repo_root/.git-hooks/check-naming.sh"
 pass=0; fail=0
 
 # 1. Clean tree must pass (no staged added files).
-"$hook" >/dev/null 2>&1
-if [ $? -eq 0 ]; then
+if "$hook" >/dev/null 2>&1; then
   echo "PASS  guard: clean tree accepted"; pass=$((pass+1))
 else
   echo "FAIL  guard: clean tree rejected"; fail=$((fail+1))
@@ -29,8 +28,7 @@ else
 fi
 
 # 3. Clean filename must pass the write-time check.
-"$hook" src/event.rs >/dev/null 2>&1
-if [ $? -eq 0 ]; then
+if "$hook" src/event.rs >/dev/null 2>&1; then
   echo "PASS  guard: clean path accepted"; pass=$((pass+1))
 else
   echo "FAIL  guard: clean path rejected"; fail=$((fail+1))
@@ -68,6 +66,11 @@ else
   # Hostile IGNORE channel: a project .tokeignore excluding the probe lets a
   # gate that lost --no-ignore silently skip it; the guardrail catches that.
   printf 'src/_size_probe.rs\n' > "$guard_tmp/.tokeignore"
+  # Hostile .tokeirc channel: tokei 14 reads $HOME/.tokeirc as an independent
+  # config fallback (three config bases: XDG config dir, $HOME, cwd). A gate
+  # that stopped isolating $HOME from .tokeirc would pick up these types and
+  # miscount the 801-line Rust probe as Python — the guardrail must catch it.
+  printf 'types = ["Python"]\n' > "$hostile_home/.tokeirc"
   # Run the repo's OWN size-gate recipe against the temp project's cwd (so a
   # repo-root tokei.toml there is the gate's current-directory config channel)
   # with a hostile HOME/XDG bracket: the gate must still count the 801-line src

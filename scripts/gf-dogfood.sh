@@ -159,7 +159,7 @@ ck "reject then approve allows" 0 git forge pr review 2 --approve
 git checkout -q feat/dogfood
 ck "approved merge succeeds" 0 git forge pr merge 2
 ck "pr show merged" 0 git forge pr show 2
-at "base contains merged commit" 0 "git merge-base --is-ancestor \$(git rev-parse feat/dogfood) \"$BASE_BRANCH\""
+at "base contains merged commit" 0 "git merge-base --is-ancestor \$(git rev-parse feat/dogfood) \"\$BASE_BRANCH\""
 ck "already merged blocked" nonzero git forge pr merge 2
 
 # ── AC-005e / VAL-022: base checked out → refuse (from base itself) ──
@@ -194,7 +194,7 @@ git forge pr create --source feat4 --base "$BASE_BRANCH" "squash PR" >/dev/null
 git forge pr review 5 --approve >/dev/null
 git checkout -q feat4
 ck "squash merge ok" 0 git forge pr merge 5 --squash
-at "squash = single commit" 0 "[ \$(git rev-list --parents -n 1 \"$BASE_BRANCH\" | awk '{print NF}') -eq 2 ] && ! git merge-base --is-ancestor \$(git rev-parse feat4) \"$BASE_BRANCH\""
+at "squash = single commit" 0 "[ \$(git rev-list --parents -n 1 \"\$BASE_BRANCH\" | awk '{print NF}') -eq 2 ] && ! git merge-base --is-ancestor \$(git rev-parse feat4) \"\$BASE_BRANCH\""
 git checkout -B feat5 "$BASE_BRANCH"
 printf 'x\n' > f5.txt && git add f5.txt && git commit -qm "f5 c1"
 printf 'y\n' >> f5.txt && git add f5.txt && git commit -qm "f5 c2"
@@ -203,7 +203,7 @@ git forge pr create --source feat5 --base "$BASE_BRANCH" "rebase PR" >/dev/null
 git forge pr review 6 --approve >/dev/null
 git checkout -q feat5
 ck "rebase merge ok" 0 git forge pr merge 6 --rebase
-at "rebase = linear history" 0 "[ \$(git rev-list --count --merges \"$BASE_BRANCH~1..$BASE_BRANCH\") -eq 0 ]"
+at "rebase = linear history" 0 "[ \$(git rev-list --count --merges \"\$BASE_BRANCH~1..\$BASE_BRANCH\") -eq 0 ]"
 
 # ── FR-003 / AC-003: truly unapproved PR blocked (fresh #7, from non-base) ──
 git checkout -B feat6 "$BASE_BRANCH"
