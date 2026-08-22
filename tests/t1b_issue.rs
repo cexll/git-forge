@@ -503,6 +503,45 @@ fn cli_events_fallback_to_store_default_when_user_email_value_is_unreadable() {
 }
 
 #[test]
+fn cli_unreadable_config_fails_cleanly_without_mutation() {
+    // Observable CLI guarantee: when the repo's own .git/config is unreadable
+    // (here: chmod 000), a forge command must fail with a CLEAN error — a
+    // non-zero exit, not a panic — and must not mutate forge state: no
+    // refs/forge may be written. This test pins ONLY that subprocess-level
+    // contract; it does NOT exercise actor()'s STAGE A branch (the
+    // repo.config() open-failure path), which is an unexercised defensive
+    // error path under pinned libgit2 1.9.6 (see the VAL-117 probe record:
+    // `.specs/git-forge-contract-fix/evidence/assertions-contract-fix/
+    // VAL-117-STAGE-A-probe.txt`). No claim is made that this fixture reaches
+    // that branch. The hermetic forge() env keeps any machine/user-level
+    // identity out of the picture.
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tmpdir("cli-config-unreadable");
+    init_repo(&dir);
+    let config = dir.join(".git/config");
+    let original = std::fs::metadata(&config).unwrap().permissions();
+    let mut blocked = original.clone();
+    blocked.set_mode(0o000);
+    std::fs::set_permissions(&config, blocked).unwrap();
+    let (c, _o, es) = forge(&dir, &["forge", "issue", "new", "T"]);
+    // Restore so the temp dir is never left with a permission-blocked config.
+    std::fs::set_permissions(&config, original).unwrap();
+    assert_eq!(
+        c, 1,
+        "unreadable config must surface as a clean command error (1), not a panic; exit was {c}, stderr: {es}"
+    );
+    assert!(
+        es.contains("config"),
+        "the clean error should point at the config problem, stderr: {es}"
+    );
+    // The environment fault must not mutate forge state: no refs may be written.
+    assert!(
+        !dir.join(".git/refs/forge").exists(),
+        "no refs/forge may be written when the config is unreadable"
+    );
+}
+
+#[test]
 fn concurrent_comments_both_succeed() {
     let dir = tmpdir("concurrent");
     init_repo(&dir);
