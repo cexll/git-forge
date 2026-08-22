@@ -126,10 +126,10 @@ dogfood-all: dogfood-main-default dogfood-eval-regression dogfood
 coverage:
     @if [ -f Cargo.toml ]; then \
         if find "$(rustc --print sysroot)/lib/rustlib" -name llvm-profdata 2>/dev/null | grep -q .; then \
-            cargo llvm-cov --all-targets --fail-under-lines 80; \
+            cargo llvm-cov --all-targets --fail-under-lines 95; \
         elif rustup run 1.93.0-aarch64-apple-darwin true 2>/dev/null; then \
             echo "coverage: Homebrew rust lacks llvm-profdata; using rustup toolchain 1.93.0-aarch64-apple-darwin"; \
-            rustup run 1.93.0-aarch64-apple-darwin cargo llvm-cov --all-targets --fail-under-lines 80; \
+            rustup run 1.93.0-aarch64-apple-darwin cargo llvm-cov --all-targets --fail-under-lines 95; \
         else \
             echo "coverage: no llvm-profdata in this rustc sysroot and no rustup 1.93.0 toolchain; install one (rustup toolchain install 1.93.0-aarch64-apple-darwin && rustup component add llvm-tools-aarch64-apple-darwin)"; \
             exit 1; \
