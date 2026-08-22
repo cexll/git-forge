@@ -5,9 +5,10 @@ Status: active
 ## Problem
 
 `just size-gate` (L3 block gate, wired into `just check`) counted source lines
-via `tokei --output json src/`. Tokei loads a user configuration from
-`$HOME/tokei.toml` (and `$XDG_CONFIG_HOME/tokei/config.toml`). A hostile or
-merely unusual config such as `types = ["Python"]` replaces the built-in
+via `tokei --output json src/`. Tokei loads user configuration from
+`$XDG_CONFIG_HOME/tokei.toml` (default `$HOME/.config/tokei.toml`) and
+`$HOME/tokei.toml`. A hostile or merely unusual config such as
+`types = ["Python"]` replaces the built-in
 language table, which removes Rust entirely from the report — an over-800-line
 `src/*.rs` file then reports `code = 0` and the gate passes. Ignore rules
 (`.gitignore`, `.ignore`, `.tokeignore`) can likewise suppress a file from the
@@ -24,8 +25,8 @@ L3 size guarantee was advisory rather than enforced.
   directory's `tokei.toml` lookup, which tokei also consults (verified: a
   repo-root `types = ["Python"]` `tokei.toml` hid every Rust file until the
   gate ran from the empty dir);
-- `HOME` and `XDG_CONFIG_HOME` are pointed at that same empty directory, so no
-  user `tokei.toml`/`config.toml` can load;
+- `HOME` and `XDG_CONFIG_HOME` are pointed at that same empty directory, so
+  tokei cannot load either user configuration channel;
 - `--no-ignore` disables `.gitignore`/`.ignore`/`.tokeignore` suppression;
 - the temp dir is removed via a `trap ... EXIT` so an interrupted or failing
   run never leaks it;

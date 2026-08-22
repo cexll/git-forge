@@ -58,12 +58,11 @@ else
   printf 'types = ["Python"]\n' > "$guard_tmp/tokei.toml"
   hostile_home="$guard_tmp/home"
   mkdir -p "$hostile_home"
-  # Hostile HOME/XDG channels too: configs in $HOME/tokei.toml and
-  # $HOME/tokei/config.toml (both tokei lookup locations) must not hide the
-  # over-limit file, so the F-015 isolation cannot regress on that axis.
-  mkdir -p "$hostile_home/tokei"
+  # Hostile config channels: tokei reads $XDG_CONFIG_HOME/tokei.toml (default
+  # $HOME/.config/tokei.toml), $HOME/tokei.toml, and the current directory.
+  # HOME and XDG_CONFIG_HOME share this bracket, so the real tokei.toml fixture
+  # must not hide the over-limit file or let F-015 isolation regress.
   printf 'types = ["Python"]\n' > "$hostile_home/tokei.toml"
-  printf 'types = ["Python"]\n' > "$hostile_home/tokei/config.toml"
   # Hostile IGNORE channel: a project .tokeignore excluding the probe lets a
   # gate that lost --no-ignore silently skip it; the guardrail catches that.
   printf 'src/_size_probe.rs\n' > "$guard_tmp/.tokeignore"
