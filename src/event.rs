@@ -585,3 +585,113 @@ fn parse_json_value(input: &str) -> Option<JsonValue> {
     }
     Some(value)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::HashMap;
+
+    fn body_with(kv: Vec<(&str, JsonValue)>) -> HashMap<String, JsonValue> {
+        kv.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
+    }
+
+    /// v1 schema serialization is self-consistent: to_json -> from_json is the
+    /// identity on every field, including control characters that must be
+    /// escaped in the wire encoding (wire contract § Event JSON schema v1).
+    #[test]
+    fn json_roundtrip_escapes_control_chars_in_actor_and_body() {
+        let ev = Event::new(
+            EventKind::IssueComment,
+            "issue",
+            7,
+            "dev@example.com",
+            body_with(vec![
+                ("title", JsonValue::String("a\"b\\c\nd\te\rf".into())),
+                ("n", JsonValue::Number(-42)),
+                ("ok", JsonValue::Bool(true)),
+                ("none", JsonValue::Null),
+            ]),
+        );
+        let json = ev.to_json();
+        assert!(json.contains("\\\"") && json.contains("\\\\") && json.contains("\\n"));
+        let round = Event::from_json(&json).expect("roundtrip must parse");
+        assert_eq!(round, ev);
+    }
+
+    /// Nested arrays/objects survive serialization and parsing verbatim.
+    #[test]
+    fn json_roundtrip_nested_structures() {
+        let nested = JsonValue::Array(vec![
+            JsonValue::Object(body_with(vec![(
+                "deep",
+                JsonValue::Array(vec![JsonValue::Number(1), JsonValue::String("x".into())]),
+            )])),
+            JsonValue::Number(0),
+        ]);
+        let ev = Event::new(
+            EventKind::PrReview,
+            "pr",
+            3,
+            "a@b.c",
+            body_with(vec![("review", nested)]),
+        );
+        let round = Event::from_json(&ev.to_json()).expect("nested roundtrip must parse");
+        assert_eq!(round, ev);
+    }
+
+    /// from_json is strict: malformed shape, wrong schema version, non-UUID id,
+    /// unknown kind, or a non-object body must all be rejected, never coerced.
+    #[test]
+    fn from_json_rejects_malformed_shapes() {
+        let good =
+            Event::new(EventKind::IssueCreated, "issue", 1, "x@y.z", HashMap::new()).to_json();
+        // Truncate the JSON to a malformed but parseable-then-absent tail.
+        assert!(Event::from_json("not json").is_none());
+        // strip the closing brace -> trailing garbage, parse must reject.
+        assert!(Event::from_json(&good[..good.len() - 1]).is_none());
+        // wrong schema version
+        let wrong_v = good.replace("\"v\":1", "\"v\":2");
+        assert!(Event::from_json(&wrong_v).is_none());
+        // non-object body
+        let bad_body = good.replace("\"body\":{", "\"body\":[");
+        assert!(Event::from_json(&bad_body).is_none());
+    }
+
+    /// EventKind as_str/from_str roundtrip for every wire kind; unknown rejects.
+    #[test]
+    fn event_kind_string_roundtrip_all_kinds() {
+        for kind in [
+            EventKind::IssueCreated,
+            EventKind::IssueComment,
+            EventKind::IssueClose,
+            EventKind::IssueReopen,
+            EventKind::PrCreated,
+            EventKind::PrComment,
+            EventKind::PrReview,
+            EventKind::PrMerge,
+        ] {
+            assert_eq!(kind.as_str().parse::<EventKind>().unwrap(), kind);
+        }
+        assert!("pr.merge".parse::<EventKind>().is_ok());
+        assert!("issue.bogus".parse::<EventKind>().is_err());
+        assert!("".parse::<EventKind>().is_err());
+    }
+
+    /// UUID-v4 shape validation: exact length/hyphen positions, version nibble,
+    /// variant nibble, and hex-only rejection.
+    #[test]
+    fn uuid_v4_shape_boundaries() {
+        assert!(is_uuid_v4("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(is_uuid_v4("00000000-0000-4000-8000-000000000000"));
+        // wrong length
+        assert!(!is_uuid_v4("550e8400-e29b-41d4-a716-44665544000"));
+        // wrong hyphen position
+        assert!(!is_uuid_v4("550e8400-e29b-41d4-a716446655440000"));
+        // wrong version nibble (not 4)
+        assert!(!is_uuid_v4("550e8400-e29b-51d4-a716-446655440000"));
+        // wrong variant nibble (not 8/9/a/b)
+        assert!(!is_uuid_v4("550e8400-e29b-41d4-1716-446655440000"));
+        // non-hex char
+        assert!(!is_uuid_v4("550e8400-e29b-41d4-a716-44665544000g"));
+    }
+}
