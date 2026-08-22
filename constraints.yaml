@@ -195,8 +195,8 @@ verification:
       evidence: "exit-code + test names (all targets)"
       required_at: "L3"
     e2e:
-      command: "just test && just dogfood"
-      evidence: "exit-code (fails loudly when test files exist but fail); dogfood 45/45 on a disposable clone oracle"
+      command: "just e2e"
+      evidence: "exit-code; runs both 45/45 dogfood oracles (master-default + main-default) on disposable clones; fails loudly on any oracle failure"
       required_at: "L3"
     cli:
       command: "just verify-cli"

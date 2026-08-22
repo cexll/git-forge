@@ -70,17 +70,13 @@ test:
 unit:
     @if [ -f Cargo.toml ]; then cargo test --lib; else echo "unit: no Cargo.toml yet — lands with devflow t0"; fi
 
-# Integration / CLI e2e. Placeholder ONLY: tests/e2e_workflow.rs and
-# tests/e2e_counter.rs do NOT exist (the real e2e surfaces are the t2_pr/t3_merge
-# integration tests wired into `just test` and the 45-check dogfood via
-# `just dogfood`, scripts/gf-dogfood.sh). Kept for compatibility: fails loudly
-# if the old files ever exist but fail; otherwise exits 0 with this honest note.
-e2e:
-    @if [ -f tests/e2e_workflow.rs ] || [ -f tests/e2e_counter.rs ]; then \
-        cargo test --test e2e_workflow --test e2e_counter; \
-    else \
-        echo "e2e: placeholder only — tests/e2e_workflow.rs / e2e_counter.rs do not exist; real e2e surfaces are tests/t2_pr.rs + tests/t3_merge.rs (just test) and scripts/gf-dogfood.sh (just dogfood)"; \
-    fi
+# Real enforced e2e gate (F-008): `just e2e` runs `dogfood-all` — BOTH 45/45
+# dogfood oracles on disposable clones: the master-default oracle
+# (scripts/gf-dogfood.sh) and the owned main-default regression
+# (scripts/gf-dogfood-main-default.sh). Supersedes the previous stub target
+# that only echoed a compatibility note. ~3min; intentionally NOT part of
+# `just check` (fast path).
+e2e: dogfood-all
 
 # Full 45-check dogfood e2e (scripts/gf-dogfood.sh). Self-contained:
 # builds/refreshes the release binary from THIS checkout (never a stale one)
@@ -100,6 +96,11 @@ dogfood:
 # against a gf-dogfood.sh that hardcodes master; GREEN after the fix.
 dogfood-main-default:
     bash scripts/gf-dogfood-main-default.sh
+
+# Enforced e2e dogfood surface: both default-branch variants (master-default via
+# scripts/gf-dogfood.sh + main-default via scripts/gf-dogfood-main-default.sh),
+# ~3min, intentionally NOT in just check.
+dogfood-all: dogfood dogfood-main-default
 
 # ── Coverage (L3: 80% lines, block; standalone until qualified) ──
 coverage:
