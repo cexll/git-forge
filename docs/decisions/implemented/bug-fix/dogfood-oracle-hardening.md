@@ -94,3 +94,47 @@ is not a commit), even though every check is default-branch-agnostic.
   before any work (verified: detached, branchless source exits 1 naming the
   path).
 - `grep` for `master` in `scripts/gf-dogfood.sh` returns zero hits.
+
+## Addendum: BASE_BRANCH must stay data, never eval input (SEC-01)
+
+### Problem
+
+F-033's `$BASE_BRANCH` flows into the `at()` assertion helper, which runs its
+test command via `eval "$*"`. The three at() calls taking the branch
+interpolated it into the eval string (`"$BASE_BRANCH"` inline). Git ref
+syntax forbids spaces, control characters, and patterns such as `..`, `@{`,
+`~`, `^`, `:`, `?`, `*`, `[`, and backslash — but it permits `$()`,
+backticks, `;`, `&`, `|`, `>`, and quotes in no-space combinations: verified
+`git update-ref refs/heads/x$(id)` (no-space payload) succeeds. A
+`GDOGFOOD_SRC` whose default branch is e.g. `x$(>$MARKER)` therefore made
+eval re-parse the embedded `$()` and execute the redirection — command
+injection at L3-gate runtime.
+
+### Decision
+
+- The three at() calls escape the interpolation (`\"\$BASE_BRANCH\"`): the
+  branch name is expanded at eval time as a shell variable VALUE, which POSIX
+  shells do not re-parse. The branch remains data inside the evaluated
+  string; nothing in the payload is spliced into the string before parsing.
+- Direct argv call sites (`git checkout -B feat "$BASE_BRANCH"`, ck(), the
+  `event_commit_is_oid` helper) were already safe — `"$BASE_BRANCH"` expands
+  to a single argv element, never parsed as syntax.
+- No branch-name whitelist: Git-valid names including `$()`/backticks are a
+  supported source contract; rejecting them would change dogfood behavior.
+  The invariant is that the value never reaches a parser, not that the value
+  is benign.
+- An OWNED regression — `tests/dogfood-eval-injection-regression.sh` + `just
+  dogfood-eval-regression` — creates a source repo whose default branch is
+  `x$(>$MARKER)` via `git update-ref`, points HEAD at it, runs the FULL real
+  dogfood flow, requires the vulnerable at() assertion AND the `DOGFOOD
+  SUMMARY` to be reached (no preflight-crash false positive), and asserts the
+  marker file was never created. RED against the inline-interpolated form
+  (verified: `FAIL: injected $(>$MARKER) executed`) and GREEN after (verified).
+
+### Consequences
+
+- A maliciously-named default branch (`x$(>$MARKER)`) runs the full 45-check
+  flow with the branch as data; the injected redirection never executes.
+- `just e2e` (the enforced L3 e2e gate) now runs the SEC-01 regression as a
+  self-contained target ordered BEFORE the GDOGFOOD_SRC-dependent dogfood, so
+  a missing source fails only its own leg and never masks the regression.
