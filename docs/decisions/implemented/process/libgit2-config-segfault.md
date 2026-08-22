@@ -76,3 +76,26 @@ libgit2** — it is a defect in the pinned dependency, not in git-forge code:
   responds.
 - Future dependency bumps should re-test fixtures 3 and 4 as a regression
   gate before adopting a new libgit2.
+
+## Addendum: write-path mitigation (VAL-115 resolution)
+
+The write path no longer calls `repo.config()` at all. Identity is resolved
+via the safe git binary (`crate::git::config_get_identity`, a
+`git config --null --get` child) and bound as an explicit signature through
+`EventStore::bind_signature`, which yields a write-capable `BoundEventStore`.
+The libgit2 lazy-load crash therefore cannot be reached by any forge command:
+- Resolve-identity commutes the open: the CLI resolves identity BEFORE the
+  libgit2 `Repository::open`, so a malformed `.git/config` surfaces as a clean
+  CLI error (`git config --get` exits 128), never as a libgit2 open failure
+  or the post-open lazy-load SIGSEGV.
+- Bound-write commutes the config read: `BoundEventStore` write methods use
+  the pre-bound signature; they never read libgit2 config, so a config
+  corrupted after `Repository::open` cannot page-fault the write. The ref
+  transaction shells out to `git update-ref`, which itself parses the corrupt
+  config and may fail with git's clean error — process never SIGSEGVs.
+
+The pinned libgit2 defect remains (an upstream escalation is still warranted,
+and a dependency bump must still re-test fixtures 3/4), but the git-forge
+forge-write paths are no longer exposed to it. An isolated child-process
+regression (`tests/t1a_store.rs` `val115_postopen_corrupt_write_does_not_segv`)
+proves the write-after-post-open-corruption path completes without SIGSEGV.

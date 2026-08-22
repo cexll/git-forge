@@ -2,12 +2,15 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
+
+use git2::Signature;
 
 use git_forge::event::{Event, EventKind, JsonValue};
 use git_forge::store::{
-    issue_ref, pr_base_ref, pr_head_ref, pr_meta_ref, pr_source_ref, EventStore, StoreError,
-    COUNTER_REF,
+    issue_ref, pr_base_ref, pr_head_ref, pr_meta_ref, pr_source_ref, BoundEventStore, EventStore,
+    StoreError, COUNTER_REF,
 };
 
 // Process-local monotonic suffix: two tests in this binary may share a `tag`
@@ -112,25 +115,43 @@ fn counter_next(store: &EventStore) -> u64 {
     digits.parse().unwrap()
 }
 
+/// A deterministic test committer identity for bound stores. Binding is the
+/// ONLY route to forge writes; the store never reads libgit2 config for
+/// commits, so the test supplies the signature explicitly.
+fn test_signature() -> Signature<'static> {
+    git2::Signature::now("test", "test@example.com").expect("test signature")
+}
+
+/// Open (or init, for a fresh dir) the repo at `dir` and bind a committer
+/// identity, yielding a write-capable [`BoundEventStore`]. The open-first
+/// fallback lets one helper serve both the primary store (fresh dir → init)
+/// and concurrently-opened secondary stores (existing repo → open).
+fn bound(dir: &Path) -> BoundEventStore {
+    let store = EventStore::open(dir)
+        .or_else(|_| EventStore::init(dir))
+        .expect("bound store on fresh or existing repo");
+    store.bind_signature(test_signature())
+}
+
 #[test]
 fn lazy_first_allocation_is_atomic() {
     let dir = tmpdir("lazy");
-    let store = EventStore::init(&dir).unwrap();
+    let store = bound(&dir);
     let id = store.allocate_id().unwrap();
     assert_eq!(id, 1, "first allocation must be id 1");
     assert!(store.repo().find_reference(COUNTER_REF).is_ok());
-    assert_eq!(counter_next(&store), 2);
+    assert_eq!(counter_next(store.store()), 2);
     assert!(store.repo().find_reference(&issue_ref(1)).is_ok());
 }
 
 #[test]
 fn sequential_ids_advance_counter() {
     let dir = tmpdir("seq");
-    let store = EventStore::init(&dir).unwrap();
+    let store = bound(&dir);
     assert_eq!(store.allocate_id().unwrap(), 1);
     assert_eq!(store.allocate_id().unwrap(), 2);
     assert_eq!(store.allocate_id().unwrap(), 3);
-    assert_eq!(counter_next(&store), 4);
+    assert_eq!(counter_next(store.store()), 4);
     for n in 1..=3 {
         assert!(store.repo().find_reference(&issue_ref(n)).is_ok());
     }
@@ -139,23 +160,23 @@ fn sequential_ids_advance_counter() {
 #[test]
 fn counter_next_entry_reads_chain_tip() {
     let dir = tmpdir("cntnext");
-    let store = EventStore::init(&dir).unwrap();
+    let store = bound(&dir);
     // Absent counter: best-effort bound, first id is 1 (no error).
     assert_eq!(store.counter_next().unwrap(), 1);
     // After each allocation the single public entry returns the chain-tip
     // value, matching what the raw counter walk sees.
     assert_eq!(store.allocate_id().unwrap(), 1);
     assert_eq!(store.counter_next().unwrap(), 2);
-    assert_eq!(counter_next(&store), store.counter_next().unwrap());
+    assert_eq!(counter_next(store.store()), store.counter_next().unwrap());
     assert_eq!(store.allocate_id().unwrap(), 2);
     assert_eq!(store.counter_next().unwrap(), 3);
-    assert_eq!(counter_next(&store), store.counter_next().unwrap());
+    assert_eq!(counter_next(store.store()), store.counter_next().unwrap());
 }
 
 #[test]
 fn counter_is_a_versioned_chain() {
     let dir = tmpdir("chain");
-    let store = EventStore::init(&dir).unwrap();
+    let store = bound(&dir);
     assert_eq!(store.allocate_id().unwrap(), 1); // counter commit {v1,next:2} (root)
     assert_eq!(store.allocate_id().unwrap(), 2); // counter commit {v1,next:3}
     assert_eq!(store.allocate_id().unwrap(), 3); // counter commit {v1,next:4}
@@ -212,7 +233,7 @@ fn counter_is_a_versioned_chain() {
 #[test]
 fn append_and_read_chain_roundtrip() {
     let dir = tmpdir("chain");
-    let store = EventStore::init(&dir).unwrap();
+    let store = bound(&dir);
     let id = store.allocate_id().unwrap();
     let r = issue_ref(id);
     let created = event(
@@ -246,7 +267,7 @@ fn append_and_read_chain_roundtrip() {
 #[test]
 fn append_cas_retry_retains_uuid() {
     let dir = tmpdir("cas");
-    let store = EventStore::init(&dir).unwrap();
+    let store = bound(&dir);
     let id = store.allocate_id().unwrap();
     let r = issue_ref(id);
 
@@ -272,11 +293,15 @@ fn append_cas_retry_retains_uuid() {
     let r_a = r.clone();
     let r_b = r.clone();
     let h1 = std::thread::spawn(move || {
-        let s = EventStore::open(&dir_a).unwrap();
+        let s = EventStore::open(&dir_a)
+            .unwrap()
+            .bind_signature(test_signature());
         s.append_event(&r_a, &a_clone).unwrap()
     });
     let h2 = std::thread::spawn(move || {
-        let s = EventStore::open(&dir_b).unwrap();
+        let s = EventStore::open(&dir_b)
+            .unwrap()
+            .bind_signature(test_signature());
         s.append_event(&r_b, &b_clone).unwrap()
     });
     let _ = h1.join().unwrap();
@@ -296,7 +321,7 @@ fn append_cas_retry_retains_uuid() {
 #[test]
 fn stale_tip_rejected_without_corruption() {
     let dir = tmpdir("stale");
-    let store = EventStore::init(&dir).unwrap();
+    let store = bound(&dir);
     let id = store.allocate_id().unwrap();
     let r = issue_ref(id);
     let first = event(
@@ -315,7 +340,9 @@ fn stale_tip_rejected_without_corruption() {
         "b@x",
         &[("body", JsonValue::String("two".into()))],
     );
-    let s2 = EventStore::open(&dir).unwrap();
+    let s2 = EventStore::open(&dir)
+        .unwrap()
+        .bind_signature(test_signature());
     let comp = event(
         EventKind::IssueComment,
         "issue",
@@ -345,8 +372,20 @@ fn concurrent_allocation_returns_distinct_ids() {
     EventStore::init(&dir).unwrap();
     let dir_a = dir.clone();
     let dir_b = dir.clone();
-    let h1 = std::thread::spawn(move || EventStore::open(&dir_a).unwrap().allocate_id().unwrap());
-    let h2 = std::thread::spawn(move || EventStore::open(&dir_b).unwrap().allocate_id().unwrap());
+    let h1 = std::thread::spawn(move || {
+        EventStore::open(&dir_a)
+            .unwrap()
+            .bind_signature(test_signature())
+            .allocate_id()
+            .unwrap()
+    });
+    let h2 = std::thread::spawn(move || {
+        EventStore::open(&dir_b)
+            .unwrap()
+            .bind_signature(test_signature())
+            .allocate_id()
+            .unwrap()
+    });
     let a = h1.join().unwrap();
     let b = h2.join().unwrap();
     assert_ne!(a, b, "concurrent allocations must be distinct");
@@ -363,7 +402,7 @@ fn concurrent_allocation_returns_distinct_ids() {
 #[test]
 fn counter_collision_aborts_without_partial_state() {
     let dir = tmpdir("collide");
-    let store = EventStore::init(&dir).unwrap();
+    let store = bound(&dir);
     let genesis = {
         let repo = store.repo();
         let empty = repo.treebuilder(None).unwrap().write().unwrap();
@@ -391,7 +430,7 @@ fn counter_collision_aborts_without_partial_state() {
 #[test]
 fn create_pr_creates_head_meta_source_base_atomically() {
     let dir = tmpdir("pralloc");
-    let store = EventStore::init(&dir).unwrap();
+    let store = bound(&dir);
     let repo = store.repo();
     let sig = repo.signature().unwrap();
     let tree_oid = repo.treebuilder(None).unwrap().write().unwrap();
@@ -496,7 +535,7 @@ fn create_pr_creates_head_meta_source_base_atomically() {
 #[test]
 fn create_pr_rejects_preexisting_ref_without_touching_counter() {
     let dir = tmpdir("prreject");
-    let store = EventStore::init(&dir).unwrap();
+    let store = bound(&dir);
     let repo = store.repo();
     let sig = repo.signature().unwrap();
     let tree_oid = repo.treebuilder(None).unwrap().write().unwrap();
@@ -538,5 +577,91 @@ fn create_pr_rejects_preexisting_ref_without_touching_counter() {
     assert_eq!(
         repo.find_reference(&pr_head_ref(1)).unwrap().target(),
         Some(head)
+    );
+}
+
+// ── VAL-115 regression: config corrupted AFTER open (isolated child tests) ──
+//
+// libgit2 1.9.6 SIGSEGVs (exit 139) when `.git/config` is replaced with
+// malformed content after `Repository::open` and before a lazy `repo.config()`
+// read. The fix removes every libgit2 config read from write paths: identity
+// is resolved via the git binary and bound as an explicit signature BEFORE
+// writes, so a post-open corruption cannot page-fault the write.
+//
+// These tests run in ISOLATED child processes (parent spawns
+// `current_exe --ignored --exact <name>`): a pre-fix child SIGSEGVs the child
+// only, never the suite. The parent asserts the child completed (exit 0) —
+// exit 139 would fail the parent.
+
+/// Child: open valid store, bind identity, CORRUPT .git/config, then write —
+/// must not SIGSEGV (pre-bound signature means the FORGE commit path never
+/// re-reads libgit2 config). The write may fail with a CLEAN git error (the
+/// `git update-ref` subprocess itself parses the corrupt config and rejects
+/// it — that is git's clean error, not a libgit2 crash), but the process must
+/// never exit 139.
+#[test]
+#[ignore]
+fn val115_child_postopen_corrupt_write_completes() {
+    let dir = std::env::var("VAL115_REPO").expect("VAL115_REPO");
+    let store = EventStore::open(&dir).unwrap();
+    // Bind identity (the fix): explicit signature, no libgit2 config read.
+    let store = store.bind_signature(test_signature());
+    // Corrupt the config now — after open, before any forge write.
+    std::fs::write(store.repo().path().join("config"), "[user\nemail = broken").unwrap();
+    // The forge commit path (tree/blob building + commit with the pre-bound
+    // signature) must not crash. The ref transaction shells out to git
+    // update-ref, which itself reads config and may fail cleanly — that is
+    // acceptable (clean error, no SIGSEGV). Both outcomes are fine; reaching
+    // the end of this function (or returning an Err) proves no crash.
+    match store.allocate_id() {
+        Ok(id) => {
+            assert_eq!(id, 1);
+            let r = issue_ref(id);
+            let ev = Event::new(EventKind::IssueCreated, "issue", 1, "a@x", HashMap::new());
+            let _ = store.append_event(&r, &ev);
+        }
+        Err(_) => {
+            // git update-ref rejected the corrupt config — a clean CLI error,
+            // exactly the non-SIGSEGV outcome the regression requires.
+        }
+    }
+}
+
+/// Parent: run the child in its own process and require it to EXIT (not
+/// SIGSEGV — exit 139). Pre-fix this failed with status 139 (signal 11).
+#[test]
+fn val115_postopen_corrupt_write_does_not_segv() {
+    let dir = tmpdir("val115");
+    let clean = tmpdir("val115-herm");
+    Command::new("git")
+        .args(["init", "-q", "-b", "master"])
+        .current_dir(&dir)
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.email", "test@example.com"])
+        .current_dir(&dir)
+        .status()
+        .unwrap();
+    Command::new("git")
+        .args(["config", "user.name", "Test"])
+        .current_dir(&dir)
+        .status()
+        .unwrap();
+    let exe = std::env::current_exe().unwrap();
+    let out = Command::new(&exe)
+        .arg("--ignored")
+        .arg("--exact")
+        .arg("val115_child_postopen_corrupt_write_completes")
+        .env("VAL115_REPO", &dir)
+        .env("HOME", &clean)
+        .output()
+        .unwrap();
+    // Child must have COMPLETED. Exit 139 (SIGSEGV) fails this assertion.
+    assert!(
+        out.status.success(),
+        "child must complete without SIGSEGV; status={:?} stderr={}",
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr)
     );
 }
