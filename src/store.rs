@@ -98,10 +98,27 @@ impl From<GitError> for StoreError {
     }
 }
 
-/// Git-ref event store.
+/// Git-ref event store — read-only surface. All forge writes require binding
+/// an explicit committer identity via [`EventStore::bind_signature`], which
+/// yields a [`BoundEventStore`]; unbound stores have no signature, so a
+/// direct caller cannot accidentally write forge commits with a fallback
+/// identity (VAL-115 STAGE A: libgit2 config reads after open can SIGSEGV).
 pub struct EventStore {
     repo: Repository,
     git_dir: std::path::PathBuf,
+}
+
+/// A store with an explicitly bound committer identity — the ONLY route to
+/// forge write methods. Created from [`EventStore::bind_signature`]; reads
+/// nothing from libgit2 config at write time (the caller resolves identity
+/// via the git binary), so a config corrupted after `Repository::open` cannot
+/// page-fault this path.
+pub struct BoundEventStore {
+    /// The underlying read-capable store.
+    inner: EventStore,
+    /// Explicit committer identity for every forge commit written through this
+    /// bound store. Never read via `repo.signature()`.
+    signature: Signature<'static>,
 }
 
 impl EventStore {
@@ -127,6 +144,17 @@ impl EventStore {
             repo,
             git_dir: std::path::PathBuf::from(path_str),
         })
+    }
+
+    /// Bind an explicitly resolved committer identity to this store, yielding
+    /// a write-capable [`BoundEventStore`]. The ONLY route to forge writes —
+    /// `open`/`init` are read-only-capable and carry no signature, so a
+    /// mutating call must choose an identity deliberately.
+    pub fn bind_signature(self, sig: Signature<'static>) -> BoundEventStore {
+        BoundEventStore {
+            inner: self,
+            signature: sig,
+        }
     }
 
     /// Run `git update-ref --stdin` with the given transaction lines.
@@ -195,102 +223,12 @@ impl EventStore {
         }
     }
 
-    fn signature(&self) -> Result<Signature<'static>, StoreError> {
-        match self.repo.signature() {
-            Ok(sig) => Ok(sig),
-            Err(_) => Signature::now("git-forge", "forge@localhost").map_err(StoreError::Git),
-        }
-    }
-
-    /// Write a commit whose tree holds one blob at `.forge/<leaf>`; returns its
-    /// OID without touching any ref (CAS is done by the caller).
-    ///
-    /// git2 `TreeBuilder::insert` takes a single path component, so the `.forge`
-    /// subtree is built first and inserted into the root tree as
-    /// `FileMode::Tree` (wire contract § Event Commit Layout).
-    fn write_forge_commit(
-        &self,
-        leaf: &str,
-        content: &[u8],
-        parents: &[Oid],
-        message: &str,
-    ) -> Result<Oid, StoreError> {
-        let blob = self.repo.blob(content)?;
-        let mut forge_tb: TreeBuilder = self.repo.treebuilder(None)?;
-        // git2 0.20 TreeBuilder::insert takes i32; 0o100644 = regular blob.
-        forge_tb.insert(leaf, blob, 0o100644)?;
-        let forge_tree = self.repo.find_tree(forge_tb.write()?)?;
-        let mut root_tb: TreeBuilder = self.repo.treebuilder(None)?;
-        // 0o040000 = git tree entry.
-        root_tb.insert(".forge", forge_tree.id(), 0o040000)?;
-        let tree = self.repo.find_tree(root_tb.write()?)?;
-        let sig = self.signature()?;
-        let parent_commits: Vec<Commit> = parents
-            .iter()
-            .map(|oid| self.repo.find_commit(*oid))
-            .collect::<Result<_, _>>()?;
-        let parent_refs: Vec<&Commit> = parent_commits.iter().collect();
-        let oid = self
-            .repo
-            .commit(None, &sig, &sig, message, &tree, &parent_refs)?;
-        Ok(oid)
-    }
-
-    fn write_event_commit(
-        &self,
-        event: &Event,
-        parents: &[Oid],
-        message: &str,
-    ) -> Result<Oid, StoreError> {
-        self.write_forge_commit("event.json", event.to_json().as_bytes(), parents, message)
-    }
-
-    fn write_counter_commit(&self, next: u64, parent: Option<Oid>) -> Result<Oid, StoreError> {
-        let value = format!("{{\"v\":1,\"next\":{next}}}");
-        let parents: Vec<Oid> = parent.into_iter().collect();
-        self.write_forge_commit("counter.json", value.as_bytes(), &parents, "forge:counter")
-    }
-
-    /// Genesis root for a fresh entity chain (empty tree).
-    fn genesis_oid(&self) -> Result<Oid, StoreError> {
-        let tree_oid = self.repo.treebuilder(None)?.write()?;
-        let tree = self.repo.find_tree(tree_oid)?;
-        let sig = self.signature()?;
-        let oid = self
-            .repo
-            .commit(None, &sig, &sig, GENESIS_MSG, &tree, &[])?;
-        Ok(oid)
-    }
-
     fn current_tip(&self, entity_ref: &str) -> Result<Option<Oid>, StoreError> {
         match self.repo.find_reference(entity_ref) {
             Ok(r) => Ok(r.target()),
             Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
             Err(e) => Err(StoreError::Git(e)),
         }
-    }
-
-    /// Append an event to `entity_ref` with a true CAS. The event commit's sole
-    /// parent is the observed tip; the ref moves only if it still points at
-    /// that tip (`git update-ref <ref> <new> <old>`). On CAS conflict, retry
-    /// with the NEW tip as sole parent while retaining the same UUID, bounded
-    /// by `MAX_APPEND_RETRIES`. Returns the new tip OID.
-    pub fn append_event(&self, entity_ref: &str, event: &Event) -> Result<Oid, StoreError> {
-        let mut tip = self.current_tip(entity_ref)?;
-        for _ in 0..MAX_APPEND_RETRIES {
-            let message = format!("forge:{}:{}", event.kind.as_str(), event.entity_id);
-            let parents: Vec<Oid> = tip.into_iter().collect();
-            let new_oid = self.write_event_commit(event, &parents, &message)?;
-            match self.cas_update_ref(entity_ref, tip, new_oid)? {
-                true => return Ok(new_oid),
-                false => {
-                    // CAS conflict: another writer won. Re-read the new tip and
-                    // retry with the SAME event (retained UUID), re-parenting.
-                    tip = self.current_tip(entity_ref)?;
-                }
-            }
-        }
-        Err(StoreError::Exhausted)
     }
 
     /// Read a single entity event chain oldest→tip. Skips commits whose tree
@@ -359,59 +297,6 @@ impl EventStore {
         }
     }
 
-    /// The event actor for the invoking repo: `user.email` from git config
-    /// (wire contract `"actor": "<user.email>"` — the email, never user.name).
-    ///
-    /// Read via `repo.config()` directly rather than `repo.signature()`: git2's
-    /// `signature()` requires BOTH user.name and user.email to be configured,
-    /// so a repo with only user.email set would otherwise mis-fall back. The
-    /// email is the wire contract; user.name is irrelevant to the actor.
-    ///
-    /// State-dependent config-failure policy (F-028):
-    ///
-    /// STAGE A — opening the repo's own config (`repo.config()`): propagates
-    /// deliberately. If the config cannot be opened at all the repo itself is
-    /// in a broken environment state; actor resolution is impossible and a
-    /// silent fallback (or an empty actor) would mask the fault. The `?`
-    /// below is intentional, not an oversight.
-    ///
-    /// Probe observation (VAL-117 replan, pinned libgit2 1.9.6): six attempted
-    /// fixtures produced no clean `repo.config()` error on an already-open
-    /// repository — see the probe record in
-    /// `.specs/git-forge-contract-fix/evidence/assertions-contract-fix/VAL-117-STAGE-A-probe.txt`.
-    /// A config replaced by a directory at lazy-load resolves to `NotFound`
-    /// (STAGE B fallback), and a malformed config at parse crashes libgit2
-    /// (SIGSEGV, exit 139) — an undefined-behavior state recorded as a LOCAL
-    /// SAFETY FINDING requiring escalation, NOT acceptable evidence for this
-    /// branch. This branch is therefore an unexercised defensive error path
-    /// under the pinned libgit2; no snapshot-loading invariant or absolute
-    /// unreachability is claimed.
-    ///
-    /// STAGE B — looking up `user.email` (`get_string`): falls back to the
-    /// store default `forge@localhost`. Any value-level failure — the key is
-    /// absent (NotFound), it is empty/whitespace (an empty string counts as
-    /// absent: libgit2 returns it as-is, not as NotFound), or the stored value
-    /// cannot be read as a usable string (a malformed/unreadable value, e.g.
-    /// non-UTF-8 bytes) — means no usable identity, so commands still succeed
-    /// with the default, matching the wire contract.
-    pub fn actor(&self) -> Result<String, StoreError> {
-        // STAGE A: config-open failure is an environment fault and propagates
-        // (deliberately — no silent fallback, no empty actor).
-        let email = self
-            .repo
-            .config()
-            .map_err(StoreError::Git)?
-            .get_string("user.email");
-        match email {
-            // STAGE B: any value-lookup failure means no usable identity —
-            // absent key, an empty/whitespace value, or an unreadable value
-            // all fall back to the store default.
-            Ok(value) if value.trim().is_empty() => Ok("forge@localhost".to_string()),
-            Ok(value) => Ok(value),
-            Err(_) => Ok("forge@localhost".to_string()),
-        }
-    }
-
     fn counter_next_from_entry(&self, entry: &TreeEntry<'_>) -> Result<u64, StoreError> {
         let obj = entry.to_object(&self.repo)?;
         let blob = obj
@@ -420,6 +305,120 @@ impl EventStore {
         let content = std::str::from_utf8(blob.content())
             .map_err(|_| StoreError::InvalidState("counter.json not valid UTF-8".into()))?;
         parse_counter_next(content)
+    }
+
+    /// Low-level accessor for tests and the CLI layer.
+    pub fn repo(&self) -> &Repository {
+        &self.repo
+    }
+}
+
+impl BoundEventStore {
+    /// The underlying read-capable store — for ref/existence/read validation
+    /// during a mutation (merge gates, existence checks). Write methods stay
+    /// on `BoundEventStore`; this is delegation, not a second write surface.
+    pub fn store(&self) -> &EventStore {
+        &self.inner
+    }
+
+    /// The underlying repository (delegation for CLI ref/gate validation).
+    pub fn repo(&self) -> &Repository {
+        &self.inner.repo
+    }
+
+    /// Read a single entity event chain (delegation to the read surface).
+    pub fn read_chain(&self, entity_ref: &str) -> Result<Vec<Event>, StoreError> {
+        self.inner.read_chain(entity_ref)
+    }
+
+    /// Read the counter next value (delegation to the read surface).
+    pub fn counter_next(&self) -> Result<u64, StoreError> {
+        self.inner.counter_next()
+    }
+
+    /// Write a commit whose tree holds one blob at `.forge/<leaf>`; returns its
+    /// OID without touching any ref (CAS is done by the caller).
+    ///
+    /// git2 `TreeBuilder::insert` takes a single path component, so the `.forge`
+    /// subtree is built first and inserted into the root tree as
+    /// `FileMode::Tree` (wire contract § Event Commit Layout).
+    fn write_forge_commit(
+        &self,
+        leaf: &str,
+        content: &[u8],
+        parents: &[Oid],
+        message: &str,
+    ) -> Result<Oid, StoreError> {
+        let blob = self.inner.repo.blob(content)?;
+        let mut forge_tb: TreeBuilder = self.inner.repo.treebuilder(None)?;
+        // git2 0.20 TreeBuilder::insert takes i32; 0o100644 = regular blob.
+        forge_tb.insert(leaf, blob, 0o100644)?;
+        let forge_tree = self.inner.repo.find_tree(forge_tb.write()?)?;
+        let mut root_tb: TreeBuilder = self.inner.repo.treebuilder(None)?;
+        // 0o040000 = git tree entry.
+        root_tb.insert(".forge", forge_tree.id(), 0o040000)?;
+        let tree = self.inner.repo.find_tree(root_tb.write()?)?;
+        let sig = &self.signature;
+        let parent_commits: Vec<Commit> = parents
+            .iter()
+            .map(|oid| self.inner.repo.find_commit(*oid))
+            .collect::<Result<_, _>>()?;
+        let parent_refs: Vec<&Commit> = parent_commits.iter().collect();
+        let oid = self
+            .inner
+            .repo
+            .commit(None, sig, sig, message, &tree, &parent_refs)?;
+        Ok(oid)
+    }
+
+    fn write_event_commit(
+        &self,
+        event: &Event,
+        parents: &[Oid],
+        message: &str,
+    ) -> Result<Oid, StoreError> {
+        self.write_forge_commit("event.json", event.to_json().as_bytes(), parents, message)
+    }
+
+    fn write_counter_commit(&self, next: u64, parent: Option<Oid>) -> Result<Oid, StoreError> {
+        let value = format!("{{\"v\":1,\"next\":{next}}}");
+        let parents: Vec<Oid> = parent.into_iter().collect();
+        self.write_forge_commit("counter.json", value.as_bytes(), &parents, "forge:counter")
+    }
+
+    /// Genesis root for a fresh entity chain (empty tree).
+    fn genesis_oid(&self) -> Result<Oid, StoreError> {
+        let tree_oid = self.inner.repo.treebuilder(None)?.write()?;
+        let tree = self.inner.repo.find_tree(tree_oid)?;
+        let sig = &self.signature;
+        let oid = self
+            .inner
+            .repo
+            .commit(None, sig, sig, GENESIS_MSG, &tree, &[])?;
+        Ok(oid)
+    }
+
+    /// Append an event to `entity_ref` with a true CAS. The event commit's sole
+    /// parent is the observed tip; the ref moves only if it still points at
+    /// that tip (`git update-ref <ref> <new> <old>`). On CAS conflict, retry
+    /// with the NEW tip as sole parent while retaining the same UUID, bounded
+    /// by `MAX_APPEND_RETRIES`. Returns the new tip OID.
+    pub fn append_event(&self, entity_ref: &str, event: &Event) -> Result<Oid, StoreError> {
+        let mut tip = self.inner.current_tip(entity_ref)?;
+        for _ in 0..MAX_APPEND_RETRIES {
+            let message = format!("forge:{}:{}", event.kind.as_str(), event.entity_id);
+            let parents: Vec<Oid> = tip.into_iter().collect();
+            let new_oid = self.write_event_commit(event, &parents, &message)?;
+            match self.inner.cas_update_ref(entity_ref, tip, new_oid)? {
+                true => return Ok(new_oid),
+                false => {
+                    // CAS conflict: another writer won. Re-read the new tip and
+                    // retry with the SAME event (retained UUID), re-parenting.
+                    tip = self.inner.current_tip(entity_ref)?;
+                }
+            }
+        }
+        Err(StoreError::Exhausted)
     }
 
     /// Allocate the next sequential id via a single atomic ref transaction,
@@ -438,7 +437,7 @@ impl EventStore {
     ///   - otherwise → a real git failure.
     pub fn allocate_id(&self) -> Result<u64, StoreError> {
         for _ in 0..MAX_ALLOC_RETRIES {
-            match self.current_tip(COUNTER_REF)? {
+            match self.inner.current_tip(COUNTER_REF)? {
                 None => {
                     let counter_oid = self.write_counter_commit(2, None)?;
                     let genesis = self.genesis_oid()?;
@@ -446,19 +445,19 @@ impl EventStore {
                         format!("update {COUNTER_REF} {counter_oid} {ZERO_OID}"),
                         format!("update {} {genesis} {ZERO_OID}", issue_ref(1)),
                     ];
-                    match self.run_update_ref_stdin(&lines) {
+                    match self.inner.run_update_ref_stdin(&lines) {
                         Ok(()) => return Ok(1),
                         Err(e) => {
                             // Counter first: if it appeared, a concurrent first
                             // allocator won → retry (fresh read gives id via the
                             // existing-counter path).
-                            if self.current_tip(COUNTER_REF)?.is_some() {
+                            if self.inner.current_tip(COUNTER_REF)?.is_some() {
                                 continue;
                             }
                             // Counter still absent: the batch failed for another
                             // reason — a pre-existing issue #1 is the stale
                             // collision case; otherwise a real git error.
-                            if self.current_tip(&issue_ref(1))?.is_some() {
+                            if self.inner.current_tip(&issue_ref(1))?.is_some() {
                                 return Err(StoreError::RefExists(issue_ref(1)));
                             }
                             return Err(e);
@@ -466,7 +465,7 @@ impl EventStore {
                     }
                 }
                 Some(counter_tip) => {
-                    let next = self.read_counter_next(counter_tip)?;
+                    let next = self.inner.read_counter_next(counter_tip)?;
                     // Versioned chain: the new counter commit's sole parent is
                     // the observed counter tip (wire contract).
                     let counter_new = self.write_counter_commit(next + 1, Some(counter_tip))?;
@@ -475,18 +474,18 @@ impl EventStore {
                         format!("update {COUNTER_REF} {counter_new} {counter_tip}"),
                         format!("update {} {genesis} {ZERO_OID}", issue_ref(next)),
                     ];
-                    match self.run_update_ref_stdin(&lines) {
+                    match self.inner.run_update_ref_stdin(&lines) {
                         Ok(()) => return Ok(next),
                         Err(e) => {
                             // Counter first: if it moved from counter_tip, a
                             // concurrent allocator won → retry with a fresh id.
-                            if self.current_tip(COUNTER_REF)? != Some(counter_tip) {
+                            if self.inner.current_tip(COUNTER_REF)? != Some(counter_tip) {
                                 continue;
                             }
                             // Counter unchanged (whole batch rolled back): a
                             // pre-existing entity ref is the stale-collision
                             // case; otherwise a real git error.
-                            if self.current_tip(&issue_ref(next))?.is_some() {
+                            if self.inner.current_tip(&issue_ref(next))?.is_some() {
                                 return Err(StoreError::RefExists(issue_ref(next)));
                             }
                             return Err(e);
@@ -526,23 +525,24 @@ impl EventStore {
         actor: &str,
     ) -> Result<u64, StoreError> {
         for _ in 0..MAX_ALLOC_RETRIES {
-            let (counter_tip, counter_new, next, genesis) = match self.current_tip(COUNTER_REF)? {
-                None => (
-                    None,
-                    self.write_counter_commit(2, None)?,
-                    1,
-                    self.genesis_oid()?,
-                ),
-                Some(ct) => {
-                    let next = self.read_counter_next(ct)?;
-                    (
-                        Some(ct),
-                        self.write_counter_commit(next + 1, Some(ct))?,
-                        next,
+            let (counter_tip, counter_new, next, genesis) =
+                match self.inner.current_tip(COUNTER_REF)? {
+                    None => (
+                        None,
+                        self.write_counter_commit(2, None)?,
+                        1,
                         self.genesis_oid()?,
-                    )
-                }
-            };
+                    ),
+                    Some(ct) => {
+                        let next = self.inner.read_counter_next(ct)?;
+                        (
+                            Some(ct),
+                            self.write_counter_commit(next + 1, Some(ct))?,
+                            next,
+                            self.genesis_oid()?,
+                        )
+                    }
+                };
             let mut body = HashMap::new();
             body.insert("title".into(), JsonValue::String(title.to_string()));
             body.insert(
@@ -576,19 +576,19 @@ impl EventStore {
             for (r, oid) in &plan {
                 lines.push(format!("update {r} {oid} {ZERO_OID}"));
             }
-            match self.run_update_ref_stdin(&lines) {
+            match self.inner.run_update_ref_stdin(&lines) {
                 Ok(()) => return Ok(next),
                 Err(e) => {
                     // Counter first: if it moved, a concurrent allocator won →
                     // retry with a fresh id.
-                    if self.current_tip(COUNTER_REF)? != counter_tip {
+                    if self.inner.current_tip(COUNTER_REF)? != counter_tip {
                         continue;
                     }
                     // Counter unchanged (batch rolled back): a pre-existing PR
                     // ref is the stale-collision case.
                     let mut any_preexisting = false;
                     for (r, _) in &plan {
-                        if self.current_tip(r)?.is_some() {
+                        if self.inner.current_tip(r)?.is_some() {
                             any_preexisting = true;
                             break;
                         }
@@ -613,7 +613,8 @@ impl EventStore {
         result_commit: Oid,
     ) -> Result<(), StoreError> {
         let r = pr_result_ref(pr_id);
-        self.run_update_ref_stdin(&[format!("update {r} {result_commit} {ZERO_OID}")])
+        self.inner
+            .run_update_ref_stdin(&[format!("update {r} {result_commit} {ZERO_OID}")])
     }
 
     /// Best-effort deletion of the pending result ref (CAS: it must hold
@@ -626,10 +627,10 @@ impl EventStore {
     ) -> Result<bool, StoreError> {
         let r = pr_result_ref(pr_id);
         let line = format!("update {r} {ZERO_OID} {result_commit}");
-        match self.run_update_ref_stdin(&[line]) {
+        match self.inner.run_update_ref_stdin(&[line]) {
             Ok(()) => Ok(true),
             Err(_) => {
-                if self.current_tip(&r)?.is_none() {
+                if self.inner.current_tip(&r)?.is_none() {
                     Ok(false) // already gone
                 } else {
                     Err(StoreError::RefExists(r))
@@ -678,7 +679,10 @@ impl EventStore {
         actor: &str,
     ) -> Result<(), StoreError> {
         let head_ref = pr_head_ref(pr_id);
-        let head_tip = self.current_tip(&head_ref)?.ok_or(StoreError::MissingRef)?;
+        let head_tip = self
+            .inner
+            .current_tip(&head_ref)?
+            .ok_or(StoreError::MissingRef)?;
         let head_new =
             self.write_unappended_pr_merge_commit(pr_id, head_tip, result_commit, actor)?;
         let result = pr_result_ref(pr_id);
@@ -691,12 +695,7 @@ impl EventStore {
             // CAS PR head chain from old tip to pr.merge commit.
             format!("update {head_ref} {head_new} {head_tip}"),
         ];
-        self.run_update_ref_stdin(&lines)
-    }
-
-    /// Low-level accessor for tests and the CLI layer.
-    pub fn repo(&self) -> &Repository {
-        &self.repo
+        self.inner.run_update_ref_stdin(&lines)
     }
 }
 

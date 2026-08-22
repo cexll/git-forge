@@ -368,3 +368,81 @@ fn zero_merge_base_error(repo: &git2::Repository) -> String {
         "no merge base — the source/base histories are unrelated, or history is shallow; deepen/unshallow before creating a PR".to_string()
     }
 }
+
+/// A single config value read from the git binary (byte-exact). `Some` means
+/// a value was present and decodes as UTF-8 (empty/whitespace values are
+/// Some("") / Some("   ") — the caller applies the trim/fallback policy);
+/// `None` means the key is absent, the value is empty/whitespace, or the
+/// value is non-UTF-8 (all current fallback cases, F-028). An `Err` is a real
+/// config-open parse failure / spawn failure — STAGE A, propagates.
+///
+/// Command: `git -C <worktree> config --null --get user.email`.
+/// Contract (verified bytes, git 2.x): present -> exit 0 + `value\0`;
+/// missing -> exit 1 + empty stdout; empty value -> exit 0 + `\0`;
+/// whitespace -> exit 0 + `   \0`; raw non-UTF-8 bytes -> exit 0 + raw bytes
+/// (passed through verbatim, so UTF-8-decode failure below = fallback case);
+/// malformed .git/config -> exit 128. Because absence is exit 1 and an empty
+/// value is exit 0 + `\0`, the classification uses status AND stdout shape.
+fn config_get_string(worktree: &Path, key: &str) -> Result<Option<String>, String> {
+    use std::process::Command;
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(worktree)
+        .args(["config", "--null", "--get", key])
+        .output()
+        .map_err(|e| format!("failed to spawn git config: {e}"))?;
+    match out.status.code() {
+        Some(128) | None => Err(format!(
+            "repo config is unreadable (git config --get {key} failed): {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+        Some(0) => {
+            // stdout must be exactly `value\0`: one trailing NUL, no interior
+            // NUL, no trailing garbage. Anything else is untrustworthy output
+            // from the subprocess — Stage-A error, never a silent fallback.
+            let raw = match out.stdout.strip_suffix(b"\0") {
+                Some(body) if !body.contains(&0) => body,
+                _ => {
+                    return Err(format!(
+                        "git config --get {key} returned malformed output on exit 0"
+                    ))
+                }
+            };
+            // Non-UTF-8 raw bytes (F-028) decode-fail -> None (fallback).
+            match std::str::from_utf8(raw) {
+                Ok(s) => Ok(Some(s.to_string())),
+                Err(_) => Ok(None),
+            }
+        }
+        Some(other) => {
+            // Absent key is exit 1 with BOTH empty stdout and empty stderr.
+            // Any diagnostic output on exit 1 is a real config error and must
+            // not be silently downgraded to the absent-value fallback.
+            if other == 1 && out.stdout.is_empty() && out.stderr.is_empty() {
+                return Ok(None);
+            }
+            Err(format!(
+                "git config --get {key} exited {other}: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            ))
+        }
+    }
+}
+
+/// Resolve the repo's configured identity from the git binary, byte-exact.
+/// `name`/`email` are `Some` only when present AND UTF-8; empty/whitespace/
+/// absent/non-UTF-8 values come back as `None` (caller applies the email-only
+/// vs signature-default precedence, matching `repo.signature()` semantics —
+/// git-forge only uses a configured committer identity when BOTH name and
+/// email are usable). `Err` is a config-open failure (STAGE A): malformed
+/// `.git/config`, spawn failure.
+pub(crate) fn config_get_identity(
+    worktree: &Path,
+) -> Result<(Option<String>, Option<String>), String> {
+    let email = config_get_string(worktree, "user.email")?;
+    let name = config_get_string(worktree, "user.name")?;
+    // Trim: empty/whitespace values are not usable identities.
+    let email = email.filter(|v| !v.trim().is_empty());
+    let name = name.filter(|v| !v.trim().is_empty());
+    Ok((name, email))
+}
