@@ -391,16 +391,39 @@ fn config_get_string(worktree: &Path, key: &str) -> Result<Option<String>, Strin
         .args(["config", "--null", "--get", key])
         .output()
         .map_err(|e| format!("failed to spawn git config: {e}"))?;
-    match out.status.code() {
+    classify_config_get(out.status.code(), &out.stdout, &out.stderr, key)
+}
+
+/// Classify the raw `git config --null --get <key>` subprocess outcome into
+/// the identity value. Pure: takes the exit status, raw stdout/stderr bytes
+/// and key, and returns the parsed value or a Stage-A error. Split out of
+/// `config_get_string` so every branch is unit-testable without spawning git.
+///
+/// Branch contract:
+/// - `Some(128)` / `None` (spawn failure surfaces as no status) -> Err
+///   (unreadable config). Never silently downgraded to a fallback.
+/// - `Some(0)` -> stdout must be exactly `value\0` (one trailing NUL, no
+///   interior NUL); anything else -> Err (malformed output). `value` that is
+///   not UTF-8 -> `Ok(None)` (F-028 non-UTF-8 fallback).
+/// - `Some(1)` with EMPTY stdout AND stderr -> `Ok(None)` (absent key). Any
+///   diagnostic on exit 1 is a real config error -> Err.
+/// - any other status -> Err with the diagnostic.
+fn classify_config_get(
+    status: Option<i32>,
+    stdout: &[u8],
+    stderr: &[u8],
+    key: &str,
+) -> Result<Option<String>, String> {
+    match status {
         Some(128) | None => Err(format!(
             "repo config is unreadable (git config --get {key} failed): {}",
-            String::from_utf8_lossy(&out.stderr).trim()
+            String::from_utf8_lossy(stderr).trim()
         )),
         Some(0) => {
             // stdout must be exactly `value\0`: one trailing NUL, no interior
             // NUL, no trailing garbage. Anything else is untrustworthy output
             // from the subprocess — Stage-A error, never a silent fallback.
-            let raw = match out.stdout.strip_suffix(b"\0") {
+            let raw = match stdout.strip_suffix(b"\0") {
                 Some(body) if !body.contains(&0) => body,
                 _ => {
                     return Err(format!(
@@ -418,12 +441,12 @@ fn config_get_string(worktree: &Path, key: &str) -> Result<Option<String>, Strin
             // Absent key is exit 1 with BOTH empty stdout and empty stderr.
             // Any diagnostic output on exit 1 is a real config error and must
             // not be silently downgraded to the absent-value fallback.
-            if other == 1 && out.stdout.is_empty() && out.stderr.is_empty() {
+            if other == 1 && stdout.is_empty() && stderr.is_empty() {
                 return Ok(None);
             }
             Err(format!(
                 "git config --get {key} exited {other}: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
+                String::from_utf8_lossy(stderr).trim()
             ))
         }
     }
@@ -445,4 +468,156 @@ pub(crate) fn config_get_identity(
     let email = email.filter(|v| !v.trim().is_empty());
     let name = name.filter(|v| !v.trim().is_empty());
     Ok((name, email))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+    use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+
+    /// Fresh exclusive temp dir (never reused). create_dir_all on a unique
+    /// per-process-per-test path; parent /tmp is not a git repo so the
+    /// "not a git repository" branches below are stable.
+    fn temp_dir() -> PathBuf {
+        let seq = NEXT.fetch_add(1, Ordering::Relaxed);
+        let d = std::env::temp_dir().join(format!("gf-gitcfg-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// A git repo with a valid empty-ish identity, ready for local config edits.
+    fn init_repo() -> PathBuf {
+        let d = temp_dir();
+        let st = Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&d)
+            .status()
+            .unwrap();
+        assert!(st.success(), "git init failed");
+        d
+    }
+
+    /// Overwrite `.git/config` with raw bytes (supports non-UTF-8 / malformed
+    /// content that `git config` itself could not write).
+    fn write_config(d: &Path, bytes: &[u8]) {
+        std::fs::create_dir_all(d.join(".git")).unwrap();
+        std::fs::write(d.join(".git").join("config"), bytes).unwrap();
+    }
+
+    // ── classify_config_get: every branch, pure (no git spawn) ──
+
+    #[test]
+    fn classify_128_and_spawn_failure_are_unreadable() {
+        let err = classify_config_get(Some(128), &[], b"fatal: bad config line 1", "user.email")
+            .unwrap_err();
+        assert!(err.contains("repo config is unreadable"), "{err}");
+        // status None models a spawn failure (no status observed).
+        let err2 = classify_config_get(None, &[], b"", "user.email").unwrap_err();
+        assert!(err2.contains("repo config is unreadable"), "{err2}");
+    }
+
+    #[test]
+    fn classify_exit0_shape_variants() {
+        // present value
+        assert_eq!(
+            classify_config_get(Some(0), b"dev@example.com\0", b"", "user.email").unwrap(),
+            Some("dev@example.com".to_string())
+        );
+        // empty value -> exit 0 + bare NUL
+        assert_eq!(
+            classify_config_get(Some(0), b"\0", b"", "user.email").unwrap(),
+            Some(String::new())
+        );
+        // whitespace value
+        assert_eq!(
+            classify_config_get(Some(0), b"   \0", b"", "user.email").unwrap(),
+            Some("   ".to_string())
+        );
+        // non-UTF-8 raw bytes -> None (F-028 fallback), never an error
+        assert_eq!(
+            classify_config_get(Some(0), b"\xff\xfe\0", b"", "user.email").unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn classify_exit0_malformed_output_is_error() {
+        // interior NUL -> untrustworthy -> Err, never a fallback
+        let e = classify_config_get(Some(0), b"a\0b\0", b"", "user.email").unwrap_err();
+        assert!(e.contains("malformed output"), "{e}");
+        // missing trailing NUL -> Err
+        let e2 = classify_config_get(Some(0), b"no-trailing-nul", b"", "user.email").unwrap_err();
+        assert!(e2.contains("malformed output"), "{e2}");
+    }
+
+    #[test]
+    fn classify_absent_is_exit1_empty_both() {
+        // absent key: exit 1, both streams empty -> Ok(None)
+        assert_eq!(
+            classify_config_get(Some(1), &[], &[], "user.email").unwrap(),
+            None
+        );
+        // exit 1 WITH a diagnostic is a real config error, not absence
+        let e = classify_config_get(Some(1), &[], b"fatal: not a git repository", "user.email")
+            .unwrap_err();
+        assert!(e.contains("exited 1"), "{e}");
+        // other nonzero status
+        let e2 = classify_config_get(Some(5), &[], b"boom", "user.email").unwrap_err();
+        assert!(e2.contains("exited 5"), "{e2}");
+    }
+
+    // ── config_get_identity: real-git smoke, local-config-authored (stable) ──
+
+    #[test]
+    fn identity_uses_both_when_present() {
+        let d = init_repo();
+        let st = Command::new("git")
+            .args(["config", "user.email", "dev@example.com"])
+            .current_dir(&d)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let st = Command::new("git")
+            .args(["config", "user.name", "Dev"])
+            .current_dir(&d)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let (name, email) = config_get_identity(&d).unwrap();
+        assert_eq!(name.as_deref(), Some("Dev"));
+        assert_eq!(email.as_deref(), Some("dev@example.com"));
+    }
+
+    #[test]
+    fn identity_filters_empty_email_but_keeps_name() {
+        let d = init_repo();
+        let st = Command::new("git")
+            .args(["config", "--local", "user.email", ""])
+            .current_dir(&d)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let st = Command::new("git")
+            .args(["config", "--local", "user.name", "Dev"])
+            .current_dir(&d)
+            .status()
+            .unwrap();
+        assert!(st.success());
+        let (name, email) = config_get_identity(&d).unwrap();
+        assert_eq!(name.as_deref(), Some("Dev"));
+        assert_eq!(email, None, "empty email must be filtered to None");
+    }
+
+    #[test]
+    fn identity_surfaces_malformed_config_as_err() {
+        let d = init_repo();
+        write_config(&d, b"[user\nemail = broken");
+        let e = config_get_identity(&d).unwrap_err();
+        assert!(e.contains("repo config is unreadable"), "{e}");
+    }
 }

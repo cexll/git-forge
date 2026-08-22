@@ -596,3 +596,89 @@ fn bare_invocation_and_help_share_usage() {
     assert_eq!(c1, 0, "--help failed: {e1}");
     assert_eq!(o0, o1, "bare invocation usage must equal --help usage");
 }
+
+#[test]
+fn non_git_dir_reports_friendly_error_not_libgit2_internals() {
+    // A bare temp dir (never `git init`) is not inside any repository. Every
+    // forge command must surface a user-facing "not a git repository" error
+    // (exit 1) instead of leaking libgit2's internal error string
+    // ("could not find repository at '.'", "class=Repository (6)"). This is
+    // the store-NotFound -> StoreError::NotAGitRepository mapping.
+    let dir = tmpdir("nongit");
+    for args in [
+        &["forge", "issue", "list"][..],
+        &["forge", "issue", "new", "T"][..],
+        &["forge", "pr", "list"][..],
+        &["forge", "pr", "merge", "1"][..],
+    ] {
+        let (c, _o, e) = forge(&dir, args);
+        assert_eq!(c, 1, "{args:?} must fail with exit 1, got stderr: {e}");
+        assert!(
+            e.contains("not a git repository"),
+            "{args:?} should report 'not a git repository', got: {e}"
+        );
+        assert!(
+            !e.contains("class=Repository") && !e.contains("could not find repository"),
+            "{args:?} must not leak libgit2 internals, got: {e}"
+        );
+    }
+}
+
+#[test]
+fn issue_help_lists_every_subcommand() {
+    // `git forge issue --help` (and a bare `issue`) must print usage naming all
+    // subcommands. Covers the issue_help() block; a single call covers many lines.
+    let dir = tmpdir("ihelp");
+    let (c, o, e) = forge(&dir, &["forge", "issue", "--help"]);
+    assert_eq!(c, 0, "issue --help failed: {e}");
+    for sub in ["new", "list", "show", "comment", "close", "reopen"] {
+        assert!(o.contains(sub), "issue help missing '{sub}': {o}");
+    }
+    assert!(o.contains("usage: git forge issue"), "help head: {o}");
+    // bare `issue` (no subcommand) also prints the help, same as --help
+    let (c2, o2, e2) = forge(&dir, &["forge", "issue"]);
+    assert_eq!(c2, 0, "bare issue failed: {e2}");
+    assert!(
+        o2.contains("usage: git forge issue"),
+        "bare issue help: {o2}"
+    );
+}
+
+#[test]
+fn top_level_dispatch_unknown_and_forge_direct() {
+    // main.rs dispatch: unknown top-level command errors; the direct
+    // `forge forge` form dispatches help and rejects unknown forge subcommands.
+    let dir = tmpdir("dispatch");
+    let (c, _o, e) = forge(&dir, &["bogus"]);
+    assert_eq!(c, 1, "unknown top-level must fail");
+    assert!(e.contains("unknown command 'bogus'"), "{e}");
+
+    let (c2, o2, e2) = forge(&dir, &["forge", "--help"]);
+    assert_eq!(c2, 0, "forge --help failed: {e2}");
+    assert!(o2.contains("usage: git forge"), "forge help: {o2}");
+
+    let (c3, _o3, e3) = forge(&dir, &["forge", "bogus"]);
+    assert_eq!(c3, 1, "unknown forge subcommand must fail");
+    assert!(e3.contains("unknown forge subcommand 'bogus'"), "{e3}");
+}
+
+#[test]
+fn issue_list_empty_and_closed_states() {
+    // Empty repo list -> "(no issues)"; after create+close the folded state
+    // reports "(closed)". Covers the issue list bounds and found/state arms.
+    let dir = tmpdir("ilist");
+    init_repo(&dir);
+    let (c, o, e) = forge(&dir, &["forge", "issue", "list"]);
+    assert_eq!(c, 0, "empty list failed: {e}");
+    assert!(o.contains("(no issues)"), "empty list output: {o}");
+
+    assert_eq!(forge(&dir, &["forge", "issue", "new", "T"]).0, 0);
+    assert_eq!(forge(&dir, &["forge", "issue", "close", "1"]).0, 0);
+    let (c2, o2, e2) = forge(&dir, &["forge", "issue", "list"]);
+    assert_eq!(c2, 0, "closed list failed: {e2}");
+    assert!(o2.contains("closed"), "closed list output: {o2}");
+    // show prints the closed state and the no-comments section
+    let (c3, o3, e3) = forge(&dir, &["forge", "issue", "show", "1"]);
+    assert_eq!(c3, 0, "closed show failed: {e3}");
+    assert!(o3.contains("closed"), "closed show state: {o3}");
+}

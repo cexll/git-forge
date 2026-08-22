@@ -694,4 +694,144 @@ mod tests {
         // non-hex char
         assert!(!is_uuid_v4("550e8400-e29b-41d4-a716-44665544000g"));
     }
+
+    /// Full escape set (\b \f \/), negative numbers, empty containers, and
+    /// whitespace-tolerant parsing — branches not hit by the roundtrip tests.
+    #[test]
+    fn json_parser_accepts_full_escape_set_and_negative_numbers() {
+        let v = parse_json_value(r#""\b\f\/""#).unwrap();
+        assert_eq!(v.as_str().unwrap(), "\u{0008}\u{000C}/");
+        assert_eq!(parse_json_value("-17").unwrap(), JsonValue::Number(-17));
+        assert_eq!(parse_json_value("42").unwrap(), JsonValue::Number(42));
+        // nested empty containers parse
+        assert!(parse_json_value("{}").is_some());
+        assert!(parse_json_value("[]").is_some());
+        // whitespace around structure is tolerated
+        assert!(parse_json_value(r#"  { "a" : [ 1 , 2 ] }  "#).is_some());
+        // nested object/array round value
+        let v = parse_json_value(r#"{"a":{"b":[true,null]}}"#).unwrap();
+        assert!(v.as_object().is_some());
+    }
+
+    /// JsonValue accessor fallbacks: as_str/as_u64/as_object return None for
+    /// the wrong variant, and as_u64 also rejects negative numbers.
+    #[test]
+    fn json_value_accessor_fallbacks_return_none() {
+        assert!(JsonValue::Number(1).as_str().is_none());
+        assert!(JsonValue::Null.as_str().is_none());
+        assert!(JsonValue::Bool(true).as_str().is_none());
+        assert!(JsonValue::Array(vec![]).as_str().is_none());
+        assert!(JsonValue::String("x".into()).as_u64().is_none());
+        assert!(JsonValue::Bool(true).as_u64().is_none());
+        assert!(JsonValue::Number(-1).as_u64().is_none(), "negative not u64");
+        assert!(JsonValue::Array(vec![]).as_object().is_none());
+        assert!(JsonValue::Number(1).as_object().is_none());
+        assert!(JsonValue::Null.as_object().is_none());
+        assert_eq!(JsonValue::Number(42).as_u64(), Some(42));
+    }
+
+    #[test]
+    fn uuid_v4_rejects_wrong_char_at_hyphen_slot() {
+        assert!(!is_uuid_v4("550e8400xe29b-41d4-a716-446655440000"));
+        assert!(!is_uuid_v4("550e8400-e29b041d4-a716-446655440000"));
+    }
+
+    /// from_json with a VALID non-object body: the previous fixture replaced
+    /// `"body":{` with `"body":[` producing `"body":[}}` — invalid JSON that
+    /// died in the parser before the body match. This one builds well-formed
+    /// JSON whose body is an array, so the body-match `_` arm must reject it.
+    #[test]
+    fn from_json_rejects_non_object_body_with_valid_json() {
+        let good =
+            Event::new(EventKind::IssueCreated, "issue", 1, "x@y.z", HashMap::new()).to_json();
+        let valid = good.replacen("\"body\":{}", "\"body\":[]", 1);
+        assert!(
+            valid.contains("\"body\":[]}"),
+            "fixture must be valid JSON: {valid}"
+        );
+        assert!(Event::from_json(&valid).is_none());
+    }
+
+    /// from_json field edges: an unknown wire kind fails the kind parse, and
+    /// a missing or non-string id fails the `?` accessor (not a parse error).
+    #[test]
+    fn from_json_rejects_unknown_kind_and_bad_id() {
+        let good =
+            Event::new(EventKind::IssueCreated, "issue", 1, "x@y.z", HashMap::new()).to_json();
+        let bad_kind = good.replacen("\"kind\":\"issue.created\"", "\"kind\":\"issue.bogus\"", 1);
+        assert!(Event::from_json(&bad_kind).is_none());
+        // id key absent
+        let no_id = good.replacen("\"id\":", "\"no_id\":", 1);
+        assert!(Event::from_json(&no_id).is_none());
+        // id present but not a string
+        let num_id = good.replacen("\"id\":\"", "\"id\":7,\"_x\":\"", 1);
+        assert!(Event::from_json(&num_id).is_none());
+    }
+
+    /// fold ignores unknown entities and mismatched entity/kind pairs via the
+    /// `_` arms (issue entity + PR kind, PR entity + issue kind, unknown entity).
+    #[test]
+    fn fold_ignores_unknown_entities_and_mismatched_kinds() {
+        let mk = |kind: EventKind, entity: &str, id: u64| {
+            Event::new_with_id(
+                &format!("33333333-3333-4333-8333-{:012x}", id),
+                kind,
+                entity,
+                id,
+                "a@x",
+                HashMap::new(),
+            )
+            .unwrap()
+        };
+        let state = fold(&[
+            mk(EventKind::PrCreated, "issue", 5),
+            mk(EventKind::IssueCreated, "pr", 9),
+            mk(EventKind::IssueCreated, "widget", 2),
+        ]);
+        // The issue entity id is set before the kind match, but no fields are
+        // populated by a PR-kind event on an issue entity.
+        assert_eq!(state.issue.id, 5);
+        assert_eq!(state.issue.title, None);
+        assert!(!state.issue.open);
+        assert!(state.issue.comments.is_empty());
+        // The pr entity id is set, but an issue-kind event fills no PR fields.
+        assert_eq!(state.pr.id, 9);
+        assert_eq!(state.pr.title, None);
+        assert_eq!(state.pr.effective_decision, None);
+    }
+
+    /// Parser edges: empty input (EOF peek), a `false` literal, a non-quoted
+    /// object key, and an integer that overflows i64 must all be handled.
+    #[test]
+    fn json_parser_empty_and_false_and_overflows() {
+        assert!(parse_json_value("").is_none());
+        assert!(parse_json_value("  \t\n ").is_none());
+        assert_eq!(parse_json_value("false"), Some(JsonValue::Bool(false)));
+        assert!(parse_json_value(r#"{"k": false}"#).is_some());
+        // non-string object key
+        assert!(parse_json_value("{123:1}").is_none());
+        // overflow of i64 (well-formed digits, not parseable as i64)
+        assert!(parse_json_value("9223372036854775808").is_none());
+        assert!(parse_json_value("-9223372036854775809").is_none());
+    }
+
+    /// Strict rejection: unknown escape, unterminated string, unknown leading
+    /// token, trailing garbage, missing object separators, array/object
+    /// syntax errors, empty number, and literal typos must all return None.
+    #[test]
+    fn json_parser_rejects_malformed_tokens() {
+        assert!(parse_json_value(r#""\q""#).is_none()); // unknown escape
+        assert!(parse_json_value(r#""abc"#).is_none()); // unterminated string
+        assert!(parse_json_value("z").is_none()); // unknown leading token
+        assert!(parse_json_value("1 2").is_none()); // trailing garbage after value
+        assert!(parse_json_value("{} trailing").is_none());
+        assert!(parse_json_value(r#"{"a" 1}"#).is_none()); // missing colon
+        assert!(parse_json_value(r#"{"a":1 "b":2}"#).is_none()); // missing comma
+        assert!(parse_json_value("[1 2]").is_none()); // array missing comma
+        assert!(parse_json_value("-").is_none()); // number without digits
+        assert!(parse_json_value("tru").is_none()); // literal typo
+        assert!(parse_json_value("nu").is_none()); // null literal typo
+        assert!(parse_json_value("fa").is_none()); // false literal typo
+        assert!(parse_json_value(r#"{"a":}"#).is_none()); // value missing
+    }
 }

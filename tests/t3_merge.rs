@@ -1132,3 +1132,1003 @@ fn barrier_holds_pending_ref_through_gc() {
     let (_cs, os, _) = forge(&dir, &["forge", "pr", "show", "1"]);
     assert!(os.contains("merged"), "pr.merge recorded: {os}");
 }
+
+// ── MERGE-path error/cleanup coverage (uncovered branches) ────────────────
+//
+// The tests below exercise the remaining uncovered merge-execution, worktree
+// and cleanup branches in src/pr_merge.rs and src/git.rs, each via a real
+// `git forge pr merge` invocation in a temp repo. Deterministic failure is
+// injected with either real git behavior (conflicts, hooks), a debug-only env
+// seam, or a PATH shim that selectively fails/records specific `git` calls.
+
+/// Write an executable `git` shim into a fresh temp dir and return the dir.
+/// The script defines `REAL_GIT` (resolved via PATH), runs `body`, then
+/// falls through to `exec "$REAL_GIT" "$@"`. `body` may reference `$1..$9`
+/// (git's argv) and `$REAL_GIT` for pass-through subprocesses.
+fn make_git_shim(tag: &str, body: &str) -> PathBuf {
+    let dir = tmpdir(tag);
+    let which = Command::new("sh")
+        .arg("-c")
+        .arg("command -v git")
+        .output()
+        .unwrap();
+    let real_git = String::from_utf8_lossy(&which.stdout).trim().to_string();
+    assert!(!real_git.is_empty(), "could not resolve real git path");
+    let script = format!("#!/bin/sh\nREAL_GIT=\"{real_git}\"\n{body}\nexec \"$REAL_GIT\" \"$@\"\n");
+    std::fs::write(dir.join("git"), script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    dir
+}
+
+/// Run the git-forge binary with an optional PATH shim (its dir prepended to
+/// PATH) and extra env vars, in `dir`.
+fn run_forge(
+    dir: &Path,
+    shim: Option<&Path>,
+    envs: &[(&str, &str)],
+    args: &[&str],
+) -> (i32, String, String) {
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let mut cmd = Command::new(bin);
+    cmd.args(args).current_dir(dir);
+    if let Some(s) = shim {
+        let mut path = s.display().to_string();
+        if let Ok(p) = std::env::var("PATH") {
+            path.push(':');
+            path.push_str(&p);
+        }
+        cmd.env("PATH", &path);
+    }
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    )
+}
+
+/// Assert no temp worktree remains registered (hygiene contract shared by the
+/// cleanup-path tests): `git worktree list --porcelain` must not contain the
+/// disposable `git-forge-pr1-merge` path.
+fn assert_no_temp_worktree(dir: &Path) {
+    let (wl, out, _) = git(dir, &["worktree", "list", "--porcelain"]);
+    assert_eq!(wl, 0, "worktree list must succeed");
+    assert!(
+        !out.contains("git-forge-pr1-merge"),
+        "temp worktree left behind: {out}"
+    );
+}
+
+#[test]
+fn merge_explicit_merge_flag_conflict_rejected() {
+    // pr_merge.rs:24 — the `--merge` arm's duplicate-flag check. The existing
+    // flag test only covers conflicts whose FIRST strategy flag is --squash/
+    // --rebase; this covers --merge followed by a second strategy flag.
+    let dir = tmpdir("mergeflag");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "merge flag PR");
+    checkout(&dir, "feature");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    // `--merge` as the FIRST strategy flag followed by a second one hits the
+    // `--merge` arm's duplicate check (pr_merge.rs:24); `--squash --merge`
+    // would hit the later arms, already covered by the existing flag test.
+    let (c, _, e) = forge(&dir, &["forge", "pr", "merge", "1", "--merge", "--merge"]);
+    assert_ne!(c, 0, "conflicting strategy flags must be rejected");
+    assert!(
+        e.contains("merge strategy flag specified more than once"),
+        "stderr: {e}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged"
+    );
+}
+
+#[test]
+fn merge_missing_snapshot_source_ref_rejected() {
+    // pr_merge.rs:78-82 — `PR #N snapshot source ref missing` (the immutable
+    // snapshot ref is deleted, e.g. by an external cleanup).
+    let dir = tmpdir("srcmiss");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "src miss PR");
+    checkout(&dir, "feature");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let (c, _, e) = git(&dir, &["update-ref", "-d", "refs/forge/prs/1/source"]);
+    assert!(c == 0, "delete source ref: {e}");
+    let (cm, _, em) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_ne!(cm, 0, "missing snapshot source ref must fail the merge");
+    assert!(
+        em.contains("PR #1 snapshot source ref missing"),
+        "stderr: {em}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged"
+    );
+    let (_cs, os, _) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert!(!os.contains("merged"), "no pr.merge: {os}");
+}
+
+#[test]
+fn merge_missing_snapshot_base_ref_rejected() {
+    // pr_merge.rs:83-87 — `PR #N snapshot base ref missing`.
+    let dir = tmpdir("basemiss");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "base miss PR");
+    checkout(&dir, "feature");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let (c, _, e) = git(&dir, &["update-ref", "-d", "refs/forge/prs/1/base"]);
+    assert!(c == 0, "delete base ref: {e}");
+    let (cm, _, em) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_ne!(cm, 0, "missing snapshot base ref must fail the merge");
+    assert!(
+        em.contains("PR #1 snapshot base ref missing"),
+        "stderr: {em}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged"
+    );
+}
+
+#[test]
+fn merge_unwritable_tmpdir_reports_reservation_failure() {
+    // pr_merge.rs:182-192 (lock retry) + 196-200 (exhausted reservation).
+    // TMPDIR points at a regular FILE, so every sibling-lock `create_new`
+    // fails with ENOTDIR and all 16 reservation attempts fail. A file (not a
+    // chmod-000 dir) keeps the test immune to running as root.
+    let dir = tmpdir("tmpdirfail");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "tmpdir PR");
+    checkout(&dir, "feature");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let file = dir.join("not-a-dir");
+    std::fs::write(&file, "x").unwrap();
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let out = Command::new(bin)
+        .args(["forge", "pr", "merge", "1"])
+        .current_dir(&dir)
+        .env("TMPDIR", &file)
+        .output()
+        .unwrap();
+    let code = out.status.code().unwrap_or(-1);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(code, 0, "merge must fail when no temp path can be reserved");
+    assert!(
+        stderr.contains("failed to create temporary worktree")
+            && stderr.contains("could not reserve a unique temp worktree path after 16 attempts"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged"
+    );
+    assert_no_temp_worktree(&dir);
+}
+
+#[test]
+fn worktree_add_failure_reports_and_leaves_refs_unchanged() {
+    // pr_merge.rs:179 + 198-200 and git.rs:108 — `git worktree add` fails
+    // (shim): the sibling lock is released, no worktree is registered, and
+    // the merge fails with git's diagnostic.
+    let dir = tmpdir("wtaddfail");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "wt add fail PR");
+    checkout(&dir, "feature");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let shim = make_git_shim(
+        "wtaddfail-shim",
+        "if [ \"$1\" = \"-C\" ] && [ \"$3\" = \"worktree\" ] && [ \"$4\" = \"add\" ]; then\n\
+         \x20 echo \"fatal: worktree add disabled by test shim\" >&2\n\
+         \x20 exit 128\n\
+         fi",
+    );
+    let (c, _, e) = run_forge(&dir, Some(&shim), &[], &["forge", "pr", "merge", "1"]);
+    assert_ne!(c, 0, "worktree add failure must fail the merge");
+    assert!(
+        e.contains("failed to create temporary worktree")
+            && e.contains("worktree add disabled by test shim"),
+        "stderr must surface git's worktree-add diagnostic: {e}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged"
+    );
+    assert_no_temp_worktree(&dir);
+}
+
+#[test]
+fn rebase_conflict_aborts_cleans_and_leaves_refs_unchanged() {
+    // git.rs:216 + 283-286 (rebase failure → abort when state exists) and
+    // 62-85 (`rebase_in_progress` true path). Feature and main diverge on
+    // shared.txt after the fork point, so `git rebase --onto` genuinely
+    // conflicts and creates rebase state that must be aborted.
+    let dir = tmpdir("rebconf");
+    init_repo(&dir);
+    std::fs::write(dir.join("shared.txt"), "v1\n").unwrap();
+    let (c, _, e) = git(&dir, &["add", "shared.txt"]);
+    assert!(c == 0, "add shared: {e}");
+    let (c, _, e) = git(&dir, &["commit", "-q", "-m", "shared v1"]);
+    assert!(c == 0, "commit shared: {e}");
+    let (c, _, e) = git(&dir, &["checkout", "-q", "-b", "feature"]);
+    assert!(c == 0, "co feature: {e}");
+    std::fs::write(dir.join("shared.txt"), "v2\n").unwrap();
+    let (c, _, e) = git(&dir, &["add", "shared.txt"]);
+    assert!(c == 0, "add v2: {e}");
+    let (c, _, e) = git(&dir, &["commit", "-q", "-m", "feature v2"]);
+    assert!(c == 0, "commit v2: {e}");
+    let (c, _, e) = git(&dir, &["checkout", "-q", "main"]);
+    assert!(c == 0, "co main: {e}");
+    std::fs::write(dir.join("shared.txt"), "v3\n").unwrap();
+    let (c, _, e) = git(&dir, &["add", "shared.txt"]);
+    assert!(c == 0, "add v3: {e}");
+    let (c, _, e) = git(&dir, &["commit", "-q", "-m", "main v3"]);
+    assert!(c == 0, "commit v3: {e}");
+    let (c, o, e) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "create",
+            "--source",
+            "feature",
+            "--base",
+            "main",
+            "rebase conflict PR",
+        ],
+    );
+    assert!(c == 0, "create: {e} {o}");
+    assert_eq!(
+        forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
+        0
+    );
+    checkout(&dir, "feature");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let (cm, _, em) = forge(&dir, &["forge", "pr", "merge", "1", "--rebase"]);
+    assert_ne!(cm, 0, "conflicting rebase must fail the merge");
+    assert!(
+        em.contains("git rebase failed") && em.contains("worktree cleaned up, no ref changes made"),
+        "stderr: {em}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged"
+    );
+    assert_no_temp_worktree(&dir);
+    let (_cs, os, _) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert!(
+        !os.contains("merged"),
+        "no pr.merge on rebase conflict: {os}"
+    );
+}
+
+#[test]
+fn rebase_refused_by_pre_rebase_hook_cleans_worktree() {
+    // git.rs:216 + 283-286 and 62-85 (`rebase_in_progress` false path: the
+    // hook refuses BEFORE rebase state is created, so no `rebase --abort`
+    // runs). Worktrees share the main repo's hooks dir. main must advance past
+    // the fork point before PR creation so `git rebase --onto` actually
+    // replays commits — a fast-forward rebase skips the pre-rebase hook.
+    let dir = tmpdir("prerebase");
+    init_repo(&dir);
+    make_feature(&dir, "feature", "feat\n"); // returns to main
+                                             // advance main after the fork point (different file → no rebase conflict)
+    std::fs::write(dir.join("later.txt"), "later\n").unwrap();
+    let (c, _, e) = git(&dir, &["add", "later.txt"]);
+    assert!(c == 0, "add later: {e}");
+    let (c, _, e) = git(&dir, &["commit", "-q", "-m", "main later"]);
+    assert!(c == 0, "commit later: {e}");
+    let (c, o, e) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "create",
+            "--source",
+            "feature",
+            "--base",
+            "main",
+            "pre-rebase PR",
+        ],
+    );
+    assert!(c == 0, "create: {e} {o}");
+    assert_eq!(
+        forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
+        0
+    );
+    checkout(&dir, "feature");
+    let hooks = dir.join(".git").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook_path = hooks.join("pre-rebase");
+    std::fs::write(
+        &hook_path,
+        "#!/bin/sh\necho \"pre-rebase refused\" >&2\nexit 1\n",
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&hook_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let (cm, _, em) = forge(&dir, &["forge", "pr", "merge", "1", "--rebase"]);
+    assert_ne!(cm, 0, "pre-rebase refusal must abort the merge");
+    assert!(
+        em.contains("git rebase failed") && em.contains("worktree cleaned up, no ref changes made"),
+        "stderr: {em}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged"
+    );
+    assert_no_temp_worktree(&dir);
+}
+
+#[test]
+fn squash_conflict_aborts_cleans_and_leaves_refs_unchanged() {
+    // git.rs:226 — `git merge --squash` itself fails (content conflict), a
+    // different failure site than the existing commit-msg-hook squash test
+    // (which covers the `git commit -m` failure at git.rs:238). The squash
+    // cleanup resets the detached worktree back to HEAD and removes it.
+    let dir = tmpdir("sqconf");
+    init_repo(&dir);
+    let (c, _, e) = git(&dir, &["checkout", "-q", "-b", "feature"]);
+    assert!(c == 0, "co feature: {e}");
+    std::fs::write(dir.join("base.txt"), "feature-change\n").unwrap();
+    let (c, _, e) = git(&dir, &["add", "base.txt"]);
+    assert!(c == 0, "add: {e}");
+    let (c, _, e) = git(&dir, &["commit", "-q", "-m", "feature change"]);
+    assert!(c == 0, "commit: {e}");
+    let (c, _, e) = git(&dir, &["checkout", "-q", "main"]);
+    assert!(c == 0, "co main: {e}");
+    std::fs::write(dir.join("base.txt"), "main-change\n").unwrap();
+    let (c, _, e) = git(&dir, &["add", "base.txt"]);
+    assert!(c == 0, "add: {e}");
+    let (c, _, e) = git(&dir, &["commit", "-q", "-m", "main change"]);
+    assert!(c == 0, "commit: {e}");
+    let (c, o, e) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "create",
+            "--source",
+            "feature",
+            "--base",
+            "main",
+            "squash conflict PR",
+        ],
+    );
+    assert!(c == 0, "create: {e} {o}");
+    assert_eq!(
+        forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
+        0
+    );
+    checkout(&dir, "feature");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let (cm, _, em) = forge(&dir, &["forge", "pr", "merge", "1", "--squash"]);
+    assert_ne!(cm, 0, "conflicting squash must fail the merge");
+    assert!(
+        em.contains("git squash failed") && em.contains("worktree cleaned up, no ref changes made"),
+        "stderr: {em}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged"
+    );
+    assert_no_temp_worktree(&dir);
+    let (_cs, os, _) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert!(
+        !os.contains("merged"),
+        "no pr.merge on squash conflict: {os}"
+    );
+}
+
+#[test]
+fn invalid_result_commit_cleans_worktree_and_leaves_refs_unchanged() {
+    // pr_merge.rs:227-234 — the strategy executed (result commit exists in the
+    // temp worktree) but `rev-parse HEAD` returns a non-OID (shim), so the
+    // result-commit parse fails and cleanup removes the worktree.
+    let dir = tmpdir("badoid");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "bad oid PR");
+    checkout(&dir, "feature");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let shim = make_git_shim(
+        "badoid-shim",
+        "if [ \"$1\" = \"-C\" ] && [ \"$3\" = \"rev-parse\" ] && [ \"$4\" = \"HEAD\" ]; then\n\
+         \x20 echo \"not-an-oid\"\n\
+         \x20 exit 0\n\
+         fi",
+    );
+    let (c, _, e) = run_forge(&dir, Some(&shim), &[], &["forge", "pr", "merge", "1"]);
+    assert_ne!(c, 0, "unparseable result commit must fail the merge");
+    assert!(
+        e.contains("git merge failed: invalid result commit")
+            && e.contains("worktree cleaned up, no ref changes made"),
+        "stderr: {e}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged"
+    );
+    assert_no_temp_worktree(&dir);
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_none(),
+        "pending ref must not exist (cleanup ran before it was created)"
+    );
+}
+
+#[test]
+fn preexisting_pending_result_ref_cleans_worktree_and_leaves_refs_unchanged() {
+    // pr_merge.rs:241-242 — a stale pending `/result` ref (expected absence)
+    // makes `create_pending_result_ref` fail AFTER the strategy ran, so the
+    // merge is cleaned up with no ref changes and the stale ref is untouched.
+    let dir = tmpdir("pendingexists");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "pending exists PR");
+    checkout(&dir, "feature");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let (c, _, e) = git(
+        &dir,
+        &["update-ref", "refs/forge/prs/1/result", &base_before],
+    );
+    assert!(c == 0, "pre-create stale pending ref: {e}");
+    let (cm, _, em) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_ne!(cm, 0, "preexisting pending ref must fail the merge");
+    assert!(
+        em.contains("git merge failed") && em.contains("worktree cleaned up, no ref changes made"),
+        "stderr: {em}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged"
+    );
+    assert_no_temp_worktree(&dir);
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/result").unwrap(),
+        base_before,
+        "stale pending ref untouched"
+    );
+}
+
+#[test]
+fn worktree_remove_noop_leaves_dir_and_reports_leftover() {
+    // pr_merge.rs:282-288 — `git worktree remove` reports success but the
+    // directory survives (shim makes it a no-op), so the merge reports the
+    // leftover directory and cleans the pending ref best-effort.
+    let dir = tmpdir("dirleft");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "dir left PR");
+    checkout(&dir, "feature");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let shim = make_git_shim(
+        "dirleft-shim",
+        "if [ \"$1\" = \"-C\" ] && [ \"$3\" = \"worktree\" ] && [ \"$4\" = \"remove\" ]; then\n\
+         \x20 exit 0\n\
+         fi",
+    );
+    let (c, _, e) = run_forge(&dir, Some(&shim), &[], &["forge", "pr", "merge", "1"]);
+    assert_ne!(c, 0, "leftover directory must fail the merge");
+    assert!(
+        e.contains("temp worktree directory still exists at"),
+        "stderr: {e}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged"
+    );
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_none(),
+        "pending ref cleaned best-effort"
+    );
+    // The leftover worktree is still REGISTERED with its directory intact;
+    // remove it for hygiene.
+    let (wl, wout, _) = git(&dir, &["worktree", "list", "--porcelain"]);
+    assert_eq!(wl, 0);
+    let mut removed = false;
+    for line in wout.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            if p.contains("git-forge-pr1-merge") {
+                assert!(
+                    std::path::Path::new(p).is_dir(),
+                    "leftover worktree directory must still exist: {p}"
+                );
+                let (r, _, er) = git(&dir, &["worktree", "remove", "--force", p]);
+                assert!(r == 0, "hygiene remove failed: {er}");
+                removed = true;
+            }
+        }
+    }
+    assert!(removed, "expected the leftover worktree to be cleaned");
+}
+
+#[test]
+fn worktree_still_registered_after_removal_reported() {
+    // pr_merge.rs:298-305 — the directory is gone but `git worktree list`
+    // (shim-injected on the post-removal verification call) still lists the
+    // temp path, so the merge reports the stale registration and cleans the
+    // pending ref.
+    let dir = tmpdir("stilreg");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "still reg PR");
+    checkout(&dir, "feature");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let counter = dir.join("counter");
+    let record = dir.join("record");
+    let shim = make_git_shim(
+        "stilreg-shim",
+        "COUNTER=\"$GF_COUNTER\"\nRECORD=\"$GF_RECORD\"\n\
+             if [ \"$1\" = \"-C\" ] && [ \"$3\" = \"worktree\" ]; then\n\
+             \x20 case \"$4\" in\n\
+             \x20   add)\n\
+             \x20     printf '%s\\n' \"$6\" > \"$RECORD\"\n\
+             \x20     exec \"$REAL_GIT\" \"$@\"\n\
+             \x20     ;;\n\
+             \x20   list)\n\
+             \x20     n=0\n\
+             \x20     [ -f \"$COUNTER\" ] && n=$(cat \"$COUNTER\")\n\
+             \x20     n=$((n+1))\n\
+             \x20     printf '%s\\n' \"$n\" > \"$COUNTER\"\n\
+             \x20     if [ \"$n\" -ge 2 ]; then\n\
+             \x20       out=$(\"$REAL_GIT\" \"$@\")\n\
+             \x20       tmp=$(cat \"$RECORD\" 2>/dev/null)\n\
+             \x20       printf '%s\\nworktree %s\\n' \"$out\" \"$tmp\"\n\
+             \x20       exit 0\n\
+             \x20     fi\n\
+             \x20     exec \"$REAL_GIT\" \"$@\"\n\
+             \x20     ;;\n\
+             \x20 esac\n\
+             fi",
+    );
+    let (c, _, e) = run_forge(
+        &dir,
+        Some(&shim),
+        &[
+            ("GF_COUNTER", counter.to_str().unwrap()),
+            ("GF_RECORD", record.to_str().unwrap()),
+        ],
+        &["forge", "pr", "merge", "1"],
+    );
+    assert_ne!(c, 0, "stale registration must fail the merge");
+    assert!(
+        e.contains("temp worktree still registered at"),
+        "stderr: {e}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged"
+    );
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_none(),
+        "pending ref cleaned best-effort"
+    );
+    // The real worktree registration was actually removed (only the shim
+    // claimed otherwise).
+    assert_no_temp_worktree(&dir);
+}
+
+#[test]
+fn pending_result_ref_left_in_place_reported_on_cleanup_failure() {
+    // pr_merge.rs:362 + 365 — the cleanup's CAS delete of the pending ref
+    // fails (the shim moved the ref to the base oid while also locking the
+    // temp worktree, so `worktree remove` fails), producing the "left in
+    // place" suffix on the removal-failure report.
+    let dir = tmpdir("leftinplace");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "left in place PR");
+    checkout(&dir, "feature");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let shim = make_git_shim(
+        "leftinplace-shim",
+        "if [ \"$1\" = \"-C\" ] && [ \"$3\" = \"worktree\" ] && [ \"$4\" = \"lock\" ]; then\n\
+         \x20 \"$REAL_GIT\" \"$@\" || exit $?\n\
+         \x20 base_oid=$(\"$REAL_GIT\" -C \"$2\" rev-parse refs/heads/main) || exit $?\n\
+         \x20 \"$REAL_GIT\" -C \"$2\" update-ref refs/forge/prs/1/result \"$base_oid\" || exit $?\n\
+         \x20 exit 0\n\
+         fi",
+    );
+    let (c, _, e) = run_forge(
+        &dir,
+        Some(&shim),
+        &[("GIT_FORGE_TEST_FAIL_WORKTREE_REMOVE", "1")],
+        &["forge", "pr", "merge", "1"],
+    );
+    assert_ne!(c, 0, "cleanup CAS failure must fail the merge");
+    assert!(
+        e.contains("pending result ref refs/forge/prs/1/result left in place"),
+        "stderr must report the leftover pending ref: {e}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/result").unwrap(),
+        base_before,
+        "moved pending ref left in place"
+    );
+    // Hygiene: unlock + remove the locked temp worktree, drop the moved ref.
+    let (wl, wout, _) = git(&dir, &["worktree", "list", "--porcelain"]);
+    assert_eq!(wl, 0);
+    let mut temp_path = None;
+    for line in wout.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            if p.contains("git-forge-pr1-merge") {
+                temp_path = Some(p.to_string());
+                let (u, _, eu) = git(&dir, &["worktree", "unlock", p]);
+                assert!(u == 0, "unlock failed: {eu}");
+                let (r, _, er) = git(&dir, &["worktree", "remove", "--force", p]);
+                assert!(r == 0, "remove failed: {er}");
+            }
+        }
+    }
+    assert!(
+        temp_path.is_some(),
+        "expected a leftover locked temp worktree"
+    );
+    let (dr, _, der) = git(&dir, &["update-ref", "-d", "refs/forge/prs/1/result"]);
+    assert!(dr == 0, "drop moved pending ref: {der}");
+}
+
+#[test]
+fn finalize_failure_after_barrier_leaves_refs_unchanged() {
+    // pr_merge.rs:333 + 337 — while the merge is parked in the test barrier
+    // window (pending ref exists, temp worktree already gone), the pending
+    // ref is moved to a different oid. On release the atomic completion
+    // transaction's CAS delete fails → nothing moves and the leftover pending
+    // ref is reported.
+    let dir = tmpdir("finfail");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "finalize fail PR");
+    checkout(&dir, "feature");
+    let barrier = tmpdir("finfail-window");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let head_before = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let mut child: Child = Command::new(bin)
+        .args(["forge", "pr", "merge", "1"])
+        .current_dir(&dir)
+        .env("GIT_FORGE_TEST_MERGE_BARRIER", &barrier)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !barrier.join("ready").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "merge never reached the barrier window"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // While parked: base/head unchanged, pending ref exists.
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base must be unchanged while merge is pending"
+    );
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_some(),
+        "pending result ref must exist in barrier window"
+    );
+    // Sabotage the completion transaction: move the pending ref away from the
+    // expected result commit, then release the barrier.
+    let (c, _, e) = git(
+        &dir,
+        &["update-ref", "refs/forge/prs/1/result", &base_before],
+    );
+    assert!(c == 0, "move pending ref: {e}");
+    let release_path = barrier.join("release");
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&release_path)
+            .expect("release sentinel must be created atomically");
+        let _ = f.write_all(b"go\n");
+    }
+    let status = child.wait().unwrap();
+    assert!(
+        !status.success(),
+        "merge must fail when the final transaction cannot complete"
+    );
+    let mut stderr = String::new();
+    {
+        use std::io::Read as _;
+        if let Some(mut e) = child.stderr.take() {
+            let _ = e.read_to_string(&mut stderr);
+        }
+    }
+    assert!(
+        stderr.contains("merge execution finished but final transaction failed"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("refs unchanged"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("pending result ref refs/forge/prs/1/result left in place"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        head_before,
+        "PR head chain unchanged"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/result").unwrap(),
+        base_before,
+        "pending ref left at the moved oid"
+    );
+    assert_no_temp_worktree(&dir);
+}
+
+#[test]
+fn merge_git_spawn_failure_is_clean_error() {
+    // git.rs:44-49 (spawn-failure branch) + 151-152 — the first git call in
+    // the merge flow is the checked-out-base guard's `git worktree list`; with
+    // no git on PATH it cannot spawn and the error is user-facing, no panic.
+    let dir = tmpdir("nogit");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "no git PR");
+    checkout(&dir, "feature");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let empty = tmpdir("nogit-bin");
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let out = Command::new(bin)
+        .args(["forge", "pr", "merge", "1"])
+        .current_dir(&dir)
+        .env("PATH", &empty)
+        .output()
+        .unwrap();
+    let code = out.status.code().unwrap_or(-1);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(code, 0, "merge must fail when git cannot be spawned");
+    assert!(
+        stderr.contains("git worktree list failed"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged"
+    );
+}
+
+#[test]
+fn worktree_list_failure_is_clean_error() {
+    // git.rs:155 — a nonzero `git worktree list` exit in the checked-out-base
+    // guard surfaces the BARE "git worktree list failed" message (stderr never
+    // appended), via `base_checked_out_elsewhere`'s Err propagation.
+    let dir = tmpdir("listfail");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "list fail PR");
+    checkout(&dir, "feature");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let shim = make_git_shim(
+        "listfail-shim",
+        "if [ \"$1\" = \"-C\" ] && [ \"$3\" = \"worktree\" ] && [ \"$4\" = \"list\" ]; then\n\
+         \x20 echo \"fatal: worktree list disabled by test shim\" >&2\n\
+         \x20 exit 128\n\
+         fi",
+    );
+    let (c, _, e) = run_forge(&dir, Some(&shim), &[], &["forge", "pr", "merge", "1"]);
+    assert_ne!(c, 0, "worktree list failure must fail the merge");
+    assert!(
+        e.trim().ends_with("git worktree list failed"),
+        "bare message expected: {e}"
+    );
+    assert!(
+        !e.contains("disabled by test shim"),
+        "stderr must never be appended on nonzero exit: {e}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged"
+    );
+}
+
+#[test]
+fn merge_barrier_deadline_cleans_pending_ref_and_leaves_refs_unchanged() {
+    // pr_merge.rs:400-402 + 324 — the test-only barrier's 30s deadline with
+    // the natural (clean) cleanup: no release sentinel ever appears, so the
+    // merge removes both sentinels, deletes the pending ref, and fails with
+    // the bare deadline error and no ref updates. Deterministic; ~30s runtime.
+    let dir = tmpdir("deadline-clean");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "deadline clean PR");
+    checkout(&dir, "feature");
+    let barrier = tmpdir("deadline-clean-window");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let mut child: Child = Command::new(bin)
+        .args(["forge", "pr", "merge", "1"])
+        .current_dir(&dir)
+        .env("GIT_FORGE_TEST_MERGE_BARRIER", &barrier)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Wait for the ready sentinel (bounded), then never release.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !barrier.join("ready").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "merge never reached the barrier window"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let status = child.wait().unwrap();
+    assert!(!status.success(), "barrier deadline must fail the merge");
+    let mut stderr = String::new();
+    {
+        use std::io::Read as _;
+        if let Some(mut e) = child.stderr.take() {
+            let _ = e.read_to_string(&mut stderr);
+        }
+    }
+    assert!(
+        stderr.contains("test merge barrier deadline exceeded; no ref updates made"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("left in place"),
+        "clean deadline cleanup must not report a leftover ref: {stderr}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged"
+    );
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_none(),
+        "pending ref cleaned on deadline"
+    );
+    assert_no_temp_worktree(&dir);
+}
+
+#[test]
+fn merge_barrier_deadline_reports_leftover_pending_ref() {
+    // pr_merge.rs:400-402 + 320-322 — the test-only barrier's 30s deadline:
+    // no release sentinel ever appears, so the merge removes both sentinels
+    // and fails with no ref updates. While parked, the pending ref is moved to
+    // a different oid so the deadline cleanup's CAS delete fails and the
+    // "left in place" suffix is reported. Deterministic; ~30s runtime.
+    let dir = tmpdir("deadline");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "deadline PR");
+    checkout(&dir, "feature");
+    let barrier = tmpdir("deadline-window");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let mut child: Child = Command::new(bin)
+        .args(["forge", "pr", "merge", "1"])
+        .current_dir(&dir)
+        .env("GIT_FORGE_TEST_MERGE_BARRIER", &barrier)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // Wait for the ready sentinel (bounded), then never release.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !barrier.join("ready").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "merge never reached the barrier window"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Sabotage the deadline cleanup: move the pending ref away from the
+    // expected result commit so its CAS delete cannot succeed.
+    let (c, _, e) = git(
+        &dir,
+        &["update-ref", "refs/forge/prs/1/result", &base_before],
+    );
+    assert!(c == 0, "move pending ref: {e}");
+    let status = child.wait().unwrap();
+    assert!(!status.success(), "barrier deadline must fail the merge");
+    let mut stderr = String::new();
+    {
+        use std::io::Read as _;
+        if let Some(mut e) = child.stderr.take() {
+            let _ = e.read_to_string(&mut stderr);
+        }
+    }
+    assert!(
+        stderr.contains("test merge barrier deadline exceeded; no ref updates made"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("pending result ref refs/forge/prs/1/result left in place"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/result").unwrap(),
+        base_before,
+        "moved pending ref left in place"
+    );
+    assert_no_temp_worktree(&dir);
+    // Hygiene: drop the moved pending ref.
+    let (dr, _, der) = git(&dir, &["update-ref", "-d", "refs/forge/prs/1/result"]);
+    assert!(dr == 0, "drop moved pending ref: {der}");
+}
+
+#[test]
+fn result_commit_resolution_failure_cleans_worktree_and_leaves_refs_unchanged() {
+    // git.rs:252-254 — the strategy ran, then `git rev-parse HEAD` (result
+    // resolution) exits nonzero (shim), so execute_strategy cleans up with
+    // the strategy kind and no ref changes.
+    let dir = tmpdir("revparsefail");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "rev-parse fail PR");
+    checkout(&dir, "feature");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let shim = make_git_shim(
+        "revparsefail-shim",
+        "if [ \"$1\" = \"-C\" ] && [ \"$3\" = \"rev-parse\" ] && [ \"$4\" = \"HEAD\" ]; then\n\
+         \x20 echo \"fatal: rev-parse disabled by test shim\" >&2\n\
+         \x20 exit 128\n\
+         fi",
+    );
+    let (c, _, e) = run_forge(&dir, Some(&shim), &[], &["forge", "pr", "merge", "1"]);
+    assert_ne!(c, 0, "result-commit resolution failure must fail the merge");
+    assert!(
+        e.contains("git merge failed") && e.contains("worktree cleaned up, no ref changes made"),
+        "stderr: {e}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged"
+    );
+    assert_no_temp_worktree(&dir);
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_none(),
+        "pending ref must not exist (cleanup ran before it was created)"
+    );
+}
+
+#[test]
+fn merge_help_usage_and_strategies() {
+    // pr_merge.rs:412-418 — `pr merge --help` / `-h` (the only pr_merge.rs
+    // block no existing test reached; parent `pr --help` does not dispatch
+    // into cmd_pr_merge).
+    let dir = tmpdir("mhelp");
+    init_repo(&dir);
+    let (c, o, e) = forge(&dir, &["forge", "pr", "merge", "--help"]);
+    assert_eq!(c, 0, "merge --help failed: {e}");
+    assert!(o.contains("usage: git forge pr merge"), "usage head: {o}");
+    for s in ["--merge", "--squash", "--rebase"] {
+        assert!(o.contains(s), "help must list {s}: {o}");
+    }
+    let (c2, o2, e2) = forge(&dir, &["forge", "pr", "merge", "-h"]);
+    assert_eq!(c2, 0, "merge -h failed: {e2}");
+    assert!(o2.contains("usage: git forge pr merge"), "-h: {o2}");
+}

@@ -795,3 +795,98 @@ fn nonexistent_pr_is_clean_error() {
         assert!(e.contains("#99"), "stderr for {cmd:?}: {e}");
     }
 }
+
+#[test]
+fn pr_help_lists_every_subcommand() {
+    // `git forge pr --help` (and a bare `pr`) must print usage naming all
+    // subcommands. Covers the pr_help() block.
+    let dir = tmpdir("phelp");
+    let (c, o, e) = forge(&dir, &["forge", "pr", "--help"]);
+    assert_eq!(c, 0, "pr --help failed: {e}");
+    for sub in [
+        "create", "list", "show", "comment", "review", "diff", "merge",
+    ] {
+        assert!(o.contains(sub), "pr help missing '{sub}': {o}");
+    }
+    assert!(o.contains("usage: git forge pr"), "help head: {o}");
+    let (c2, o2, e2) = forge(&dir, &["forge", "pr"]);
+    assert_eq!(c2, 0, "bare pr failed: {e2}");
+    assert!(o2.contains("usage: git forge pr"), "bare pr help: {o2}");
+}
+
+#[test]
+fn cli_arg_validation_errors_are_user_facing() {
+    // One pass covering the many CLI arg-validation branches: each misuse must
+    // surface a clean exit-1 message, never a panic or libgit2 internal leak.
+    let dir = tmpdir("argerr");
+    init_repo(&dir);
+    // The inline-anchor case needs an existing PR (the store-existence check
+    // runs before the inline requires-commit check); create PR #1 first.
+    make_feature(&dir, "feature", "feat\n");
+    let (cc, _oc, ec) = forge(
+        &dir,
+        &[
+            "forge", "pr", "create", "--source", "feature", "--base", "main", "t",
+        ],
+    );
+    assert_eq!(cc, 0, "pr create failed: {ec}");
+    let cases: [(&[&str], &str); 11] = [
+        (&["forge", "issue", "new"], "usage: git forge issue new"),
+        (
+            &["forge", "issue", "comment", "1"],
+            "usage: git forge issue comment",
+        ),
+        (
+            &["forge", "issue", "show", "0"],
+            "entity id must be positive",
+        ),
+        (&["forge", "pr", "create"], "usage: git forge pr create"),
+        (
+            &["forge", "pr", "create", "--source", "feature"],
+            "usage: git forge pr create",
+        ),
+        (
+            &["forge", "pr", "review", "1"],
+            "usage: git forge pr review",
+        ),
+        (
+            &["forge", "pr", "comment", "1"],
+            "usage: git forge pr comment",
+        ),
+        (&["forge", "pr", "merge", "--squash"], "empty entity id"),
+        (
+            &["forge", "pr", "merge", "1", "--squash", "--rebase"],
+            "merge strategy flag specified more than once",
+        ),
+        (
+            &[
+                "forge",
+                "pr",
+                "review",
+                "1",
+                "--approve",
+                "--file",
+                "x",
+                "--line",
+                "1",
+            ],
+            "inline review requires --commit",
+        ),
+        (
+            &["forge", "pr", "merge", "1", "--bogus-flag"],
+            "unknown option",
+        ),
+    ];
+    for (cmd, needle) in &cases {
+        let (c, _o, e) = forge(&dir, cmd);
+        assert_ne!(c, 0, "cmd {cmd:?} must fail: {e}");
+        assert!(
+            e.contains(needle),
+            "cmd {cmd:?} stderr should contain '{needle}': {e}"
+        );
+        assert!(
+            !e.contains("class=Repository") && !e.contains("could not find repository"),
+            "cmd {cmd:?} must not leak libgit2 internals: {e}"
+        );
+    }
+}
