@@ -44,12 +44,13 @@ lint:
 # `tokei missing — run brew install tokei`.
 #
 # CONFIG ISOLATION (F-015): tokei loads user configuration from
-# $HOME/tokei.toml and $XDG_CONFIG_HOME/tokei/config.toml. A hostile config
-# such as `types = ["Python"]` can remove Rust from its language table and make
-# an over-limit file invisible. Pointing HOME and XDG_CONFIG_HOME at the fresh
-# temporary directory prevents user configuration from loading. The python3
-# reader receives the same absolute `$REPO/src` prefix as argv and evaluates
-# the per-file `reports[]` against that prefix.
+# $XDG_CONFIG_HOME/tokei.toml (or $HOME/.config/tokei.toml when XDG is unset),
+# $HOME/tokei.toml, and the current directory (`./tokei.toml`). A hostile
+# config such as `types = ["Python"]` can remove Rust from its language table
+# and make an over-limit file invisible. The fresh temporary cwd (`cd "$T"`)
+# plus HOME/XDG_CONFIG_HOME redirection to that directory neutralizes all three
+# sources. The python3 reader receives the same absolute `$REPO/src` prefix as
+# argv and evaluates the per-file `reports[]` against that prefix.
 size-gate:
     @set -o pipefail; \
     if ! command -v tokei >/dev/null 2>&1; then \
