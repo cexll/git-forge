@@ -196,7 +196,7 @@ verification:
       required_at: "L3"
     e2e:
       command: "just e2e"
-      evidence: "exit-code; runs both 45/45 dogfood oracles (master-default + main-default) on disposable clones; fails loudly on any oracle failure"
+      evidence: "exit-code; runs both 45/45 dogfood oracles (master-default + main-default) plus the SEC-01 eval-injection regression on disposable clones; fails loudly on any oracle failure"
       required_at: "L3"
     cli:
       command: "just verify-cli"

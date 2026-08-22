@@ -65,7 +65,7 @@ Local, git-native forge: issues, pull requests, review, and merge inside an ordi
 
 ```
 git-forge/
-├── Cargo.toml            # root manifest (scaffold now; real deps land per feature)
+├── Cargo.toml            # root manifest
 ├── AGENTS.md             # this file
 ├── CONTEXT.md            # canonical glossary
 ├── constraints.yaml      # machine-readable thresholds (L3)
@@ -153,7 +153,7 @@ All commands route through `justfile`. Do not invent ad-hoc commands; add missin
 | Lint | clippy `-D warnings` | `just lint` | exit 0 |
 | Unit tests | cargo test --lib | `just unit` | exit 0 + test names |
 | All tests | cargo test --all-targets | `just test` | exit 0 |
-| E2E (real surfaces, both default branches) | tests/t2_pr.rs + tests/t3_merge.rs integration (via `just test`, independent surface) + scripts/gf-dogfood.sh + scripts/gf-dogfood-main-default.sh | `just e2e` (= `just dogfood-all`) | exit 0; two `DOGFOOD SUMMARY pass=45 fail=0` lines |
+| E2E (real surfaces, both default branches) | tests/t2_pr.rs + tests/t3_merge.rs integration (via `just test`, independent surface) + scripts/gf-dogfood.sh + scripts/gf-dogfood-main-default.sh + tests/dogfood-eval-injection-regression.sh (SEC-01, part of gate) | `just e2e` (= `just dogfood-all`) | exit 0; two `DOGFOOD SUMMARY pass=45 fail=0` lines + SEC-01 regression prints no injection marker |
 | Coverage | llvm-cov ≥80% lines | `just coverage` | report ≥ threshold |
 | Guardrails | scripts/test-guardrails.sh | `just test-guardrails` | 5/5 pass (accept clean, reject violation, size-gate hostile-config regression) |
 | Size gate | tokei per-file code lines over src/ | `just size-gate` | exit 0; non-zero if any src/ file exceeds 800 code lines (wired into `just check`) |
@@ -161,7 +161,7 @@ All commands route through `justfile`. Do not invent ad-hoc commands; add missin
 | CLI surface | built binary run | `just verify-cli` | exit code + --help output |
 
 - Every row resolves to a real justfile target. A surface with no verification command is review-only and the change must say so.
-- The root `Cargo.toml` exists (scaffold with empty `lib.rs`/`main.rs`). `just check` runs fmt/lint/test for real; until devflow t0 lands the product modules (`event`, `fold`, tests), the suite legitimately exercises only the scaffold and coverage has little to measure — the first product commit must flip them to meaningful green.
+- The root `Cargo.toml` is the real manifest (`event`, `fold`, `store`, `cli`, `git`, `main` + the t0–t3 integration tests all landed; `just check` runs fmt/lint/test/guardrails/decisions/size-gate for real).
 
 ## Conventions
 
