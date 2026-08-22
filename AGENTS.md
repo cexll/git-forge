@@ -115,9 +115,9 @@ git config core.hooksPath .git-hooks   # one-time hook install
 
 > **Prerequisite — GDOGFOOD_SRC for `just e2e` / `just dogfood-all` / `just dogfood`:** scripts/gf-dogfood.sh dogfoods a
 > disposable clone of `$GDOGFOOD_SRC` (default /Users/chenwenjie/workspaces/dsh-deepwork).
-> The path must exist, be a git repository, and hold the checks' working files (PLAN.md);
-> the script preflights this and exits 1 with a clear one-line error when any requirement
-> is missing.
+> The path must exist, be a git repository, resolve to that repository's canonical worktree root
+> (not a subdirectory), and hold the checks' working files (PLAN.md); the script preflights this
+> and exits 1 with a clear one-line error when any requirement is missing.
 
 ### Daily commands
 
