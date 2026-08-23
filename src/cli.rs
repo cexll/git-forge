@@ -264,19 +264,18 @@ fn store_has_ref(store: &EventStore, r: &str) -> bool {
     store.repo().find_reference(r).is_ok()
 }
 
+/// Open the workspace store for a READ command (read-only command surface).
+fn open_store() -> Result<EventStore, String> {
+    EventStore::open(".").map_err(|e| format!("{e}"))
+}
+
 /// Dispatch a `git forge issue` subcommand. `argv` excludes the `issue` token.
 pub fn run_issue(argv: &[String]) -> Result<String, String> {
     let sub = argv.first().map(|s| s.as_str()).unwrap_or("");
     match sub {
         "new" => cmd_new(&argv[1..]),
-        "list" => {
-            let store = EventStore::open(".").map_err(|e| format!("{e}"))?;
-            cmd_list(&store)
-        }
-        "show" => {
-            let store = EventStore::open(".").map_err(|e| format!("{e}"))?;
-            cmd_show(&store, &argv[1..])
-        }
+        "list" => cmd_list(&open_store()?),
+        "show" => cmd_show(&open_store()?, &argv[1..]),
         "comment" => cmd_comment(&argv[1..]),
         "close" | "reopen" => {
             let kind = if sub == "close" {
@@ -442,6 +441,14 @@ fn cmd_pr_create(args: &[String]) -> Result<String, String> {
             body.as_deref().filter(|b| !b.is_empty()),
             &labels,
         )
+        .map_err(|e| e.to_string())?;
+    // Record a pending CI Check marker: no plan executes here (fast +
+    // non-destructive); the plan runs on-demand via `git forge ci run <pr>`.
+    let mut ci_body = HashMap::new();
+    ci_body.insert("status".into(), json_str("pending"));
+    let ci_ev = Event::new(EventKind::CiCheck, "pr", id, &actor, ci_body);
+    store
+        .append_event(&crate::store::pr_head_ref(id), &ci_ev)
         .map_err(|e| e.to_string())?;
     Ok(format!("PR #{id} created: {title} ({source} -> {base})"))
 }
@@ -697,24 +704,12 @@ pub fn run_pr(argv: &[String]) -> Result<String, String> {
     let sub = argv.first().map(|s| s.as_str()).unwrap_or("");
     match sub {
         "create" => cmd_pr_create(&argv[1..]),
-        "list" => {
-            let store = EventStore::open(".").map_err(|e| format!("{e}"))?;
-            cmd_pr_list(&store)
-        }
-        "show" => {
-            let store = EventStore::open(".").map_err(|e| format!("{e}"))?;
-            cmd_pr_show(&store, &argv[1..])
-        }
+        "list" => cmd_pr_list(&open_store()?),
+        "show" => cmd_pr_show(&open_store()?, &argv[1..]),
         "comment" => cmd_pr_comment(&argv[1..]),
         "review" => cmd_pr_review(&argv[1..]),
-        "diff" => {
-            let store = EventStore::open(".").map_err(|e| format!("{e}"))?;
-            cmd_pr_diff(&store, &argv[1..])
-        }
-        "merge" => {
-            let store = EventStore::open(".").map_err(|e| format!("{e}"))?;
-            crate::pr_merge::cmd_pr_merge(store, &argv[1..])
-        }
+        "diff" => cmd_pr_diff(&open_store()?, &argv[1..]),
+        "merge" => crate::pr_merge::cmd_pr_merge(open_store()?, &argv[1..]),
         "help" | "-h" | "--help" => Ok(pr_help()),
         "" => Ok(pr_help()),
         other => Err(format!("unknown pr subcommand '{other}'")),

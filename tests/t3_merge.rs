@@ -1007,8 +1007,8 @@ fn pr_chain_events_carry_configured_user_email_as_actor() {
     let actors = pr_chain_actors(&dir, "refs/forge/prs/1/head");
     assert_eq!(
         actors.len(),
-        4,
-        "four events: pr.created + pr.comment + pr.review + pr.merge"
+        5,
+        "five events: pr.created + ci.check + pr.comment + pr.review + pr.merge"
     );
     assert!(
         actors.iter().all(|a| a == "someone@example.com"),
@@ -1048,7 +1048,11 @@ fn pr_events_carry_user_email_when_only_email_is_configured() {
     );
 
     let actors = pr_chain_actors(&dir, "refs/forge/prs/1/head");
-    assert_eq!(actors.len(), 3, "pr.created + pr.comment + pr.review");
+    assert_eq!(
+        actors.len(),
+        4,
+        "pr.created + ci.check + pr.comment + pr.review"
+    );
     assert!(
         actors.iter().all(|a| a == "practor@example.com"),
         "email-only PR events must carry the configured email, got: {actors:?}"

@@ -105,9 +105,11 @@ fn pr_create_show_snapshot() {
     assert!(ref_oid(&dir, "refs/forge/prs/1/meta").is_some());
     let head_oid = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
     let meta_oid = ref_oid(&dir, "refs/forge/prs/1/meta").unwrap();
-    assert_eq!(
+    // `meta` stays pinned at the pr.created snapshot; `pr create` appends the
+    // pending ci.check on the head chain, so head advances one commit past it.
+    assert_ne!(
         head_oid, meta_oid,
-        "head and meta must point at the same pr.created snapshot commit"
+        "head must advance past the immutable pr.created snapshot (pending ci.check)"
     );
     let src = ref_oid(&dir, "refs/forge/prs/1/source").unwrap();
     let base = ref_oid(&dir, "refs/forge/prs/1/base").unwrap();
@@ -121,10 +123,10 @@ fn pr_create_show_snapshot() {
     assert!(cs.1.contains("main"), "show base: {}", cs.1);
     assert!(cs.1.contains("no review yet"), "show decision: {}", cs.1);
 
-    // The shared commit must carry a real pr.created event (not a bare genesis
+    // The meta commit carries the real pr.created event (not a bare genesis
     // root): `.forge/event.json` is present and encodes kind=pr.created + title.
-    let (ct, ot, et) = git(&dir, &["show", &format!("{head_oid}:.forge/event.json")]);
-    assert_eq!(ct, 0, "head commit must carry .forge/event.json: {et}");
+    let (ct, ot, et) = git(&dir, &["show", &format!("{meta_oid}:.forge/event.json")]);
+    assert_eq!(ct, 0, "meta commit must carry .forge/event.json: {et}");
     assert!(
         ot.contains("\"pr.created\""),
         "event kind must be pr.created: {ot}"
@@ -132,6 +134,15 @@ fn pr_create_show_snapshot() {
     assert!(
         ot.contains("Add feature"),
         "event body must carry the PR title: {ot}"
+    );
+
+    // The head chain tip is the pending ci.check marker appended by `pr create`.
+    let (ht, hott, het) = git(&dir, &["show", &format!("{head_oid}:.forge/event.json")]);
+    assert_eq!(ht, 0, "head commit must carry .forge/event.json: {het}");
+    assert!(hott.contains("\"ci.check\""), "head event kind: {hott}");
+    assert!(
+        hott.contains("\"status\":\"pending\""),
+        "head ci status: {hott}"
     );
 }
 
@@ -1388,6 +1399,107 @@ fn ci_help_lists_run_subcommand() {
     assert_eq!(c, 0, "ci --help failed: {e}");
     assert!(o.contains("usage: git forge ci"), "help head: {o}");
     assert!(o.contains("run"), "help missing 'run': {o}");
+}
+
+/// VAL-004: `pr create` records a pending CI Check marker (fast, non-destructive,
+/// no plan executed), and a subsequent `ci run` executes the plan so the fold
+/// reflects the latest status — without changing the developer's working tree
+/// or current branch.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn pr_create_records_pending_ci_then_ci_run_reflects_latest() {
+    let dir = tmpdir("ci-pending");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    // A PASSING plan committed in the PR's own commits. Because it exits 0,
+    // `pr create` could only record `pending` (not `success`) if it did NOT
+    // execute the plan.
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    std::fs::write(dir.join(".forge").join("ci.sh"), "#!/bin/bash\nexit 0\n").unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "feature + passing ci plan"]);
+    git(&dir, &["checkout", "-q", "main"]);
+
+    let before_branch = git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).1;
+    let before_main = git(&dir, &["rev-parse", "refs/heads/main"]).1;
+
+    // `pr create` must be fast + non-destructive: it records pending only.
+    let (c, o, e) = forge(
+        &dir,
+        &[
+            "forge", "pr", "create", "--source", "feature", "--base", "main", "PR1",
+        ],
+    );
+    assert_eq!(c, 0, "pr create must succeed: {e}");
+    assert!(o.contains("PR #1 created"), "create output: {o}");
+
+    // The PR chain now carries the pending ci.check as its LATEST event.
+    let event = head_event(&dir, 1);
+    assert!(event.contains("\"ci.check\""), "event kind: {event}");
+    assert!(event.contains("\"status\":\"pending\""), "status: {event}");
+    assert!(
+        event.contains("\"actor\":\"ci@example.com\""),
+        "actor: {event}"
+    );
+
+    // No plan ran: no CI temp worktree, and the working tree + current branch
+    // are unchanged.
+    let (wl, wl_out, _) = git(&dir, &["worktree", "list", "--porcelain"]);
+    assert_eq!(wl, 0, "worktree list must succeed");
+    assert!(
+        !wl_out.contains("git-forge-pr1-ci"),
+        "create must not touch a CI worktree: {wl_out}"
+    );
+    assert_eq!(
+        git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).1,
+        before_branch,
+        "current branch must be unchanged"
+    );
+    assert_eq!(
+        git(&dir, &["rev-parse", "refs/heads/main"]).1,
+        before_main,
+        "branch tip must be unchanged"
+    );
+    let (_, status, _) = git(&dir, &["status", "--porcelain"]);
+    assert_eq!(status.trim(), "", "working tree must be clean: {status}");
+
+    // The fold surfaces the pending marker right after create.
+    let (cs, os, es) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert_eq!(cs, 0, "pr show after create failed: {es}");
+    assert!(
+        os.contains("ci: pending"),
+        "show ci status after create: {os}"
+    );
+
+    // Now `ci run` executes the plan in the PR's own commits; the fold keeps
+    // the LATEST status (success overwrites the pending marker).
+    let (cr, or_, er) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_eq!(cr, 0, "ci run on a passing plan must pass: {er}");
+    assert!(or_.contains("passed"), "ci run output: {or_}");
+    let event = head_event(&dir, 1);
+    assert!(
+        event.contains("\"status\":\"success\""),
+        "status after run: {event}"
+    );
+    let (cs, os, es) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert_eq!(cs, 0, "pr show after ci run failed: {es}");
+    assert!(os.contains("ci: success"), "show ci status after run: {os}");
+
+    // Still no working-tree / current-branch change after the run.
+    assert_eq!(
+        git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).1,
+        before_branch,
+        "current branch must be unchanged"
+    );
+    assert_eq!(
+        git(&dir, &["rev-parse", "refs/heads/main"]).1,
+        before_main,
+        "branch tip must be unchanged"
+    );
+    let (_, status, _) = git(&dir, &["status", "--porcelain"]);
+    assert_eq!(status.trim(), "", "working tree must be clean: {status}");
 }
 
 /// Make a PR with a passing `.forge/ci.sh` plan and a `feature` branch.
