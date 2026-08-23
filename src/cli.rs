@@ -717,63 +717,6 @@ fn pr_help() -> String {
 
 // ─────────────────────────── CI commands (t0) ───────────────────────────
 
-/// Run the repo CI plan inside the temp worktree (the PR's own commits) and
-/// return its exit status (`None` when the process could not be spawned or
-/// when the plan exceeded the bounded deadline). `.forge/ci.sh` is executed
-/// with `bash` (respects the script's own shell semantics); the `just check`
-/// fallback runs the `just` recipe directly. Both run with the worktree as the
-/// working directory, so they validate exactly the PR tree. The plan's
-/// stdout/stderr are redirected to the null device (never buffered in memory —
-/// only the exit status is retained), so a high-volume plan cannot grow
-/// git-forge's heap. The wait is bounded (`GIT_FORGE_CI_TIMEOUT` seconds,
-/// default 300) so a NONTERMINATING plan (e.g. `#!/bin/sh\nexec yes`) cannot
-/// hang `cmd_ci_run` forever: on expiry the plan process is killed and reaped
-/// and `None` is returned, which maps to a failed CI Check and lets the
-/// existing append + temp-worktree cleanup path run (F-002).
-fn run_ci_plan(worktree: &std::path::Path, plan: &str, timeout_secs: u64) -> Option<i32> {
-    let (prog, args): (&str, &[&str]) = if plan == "just check" {
-        ("just", &["check"])
-    } else {
-        ("bash", &[".forge/ci.sh"])
-    };
-    let mut child = std::process::Command::new(prog)
-        .args(args)
-        .current_dir(worktree)
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .ok()?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    while std::time::Instant::now() < deadline {
-        if let Some(st) = child.try_wait().ok()? {
-            return st.code();
-        }
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-    let _ = child.kill();
-    child.wait().ok()?.code()
-}
-
-/// Determine the immutable-snapshot CI plan (F-001): `.forge/ci.sh` when it is
-/// a regular file in the snapshot, the `just check` fallback when absent, and a
-/// refusal when `.forge/ci.sh` is a symlink or otherwise not a regular file —
-/// so CI never follows a tracked link to mutable bytes outside the snapshot.
-fn snapshot_ci_plan(repo: &git2::Repository, oid: git2::Oid) -> Result<&'static str, String> {
-    let tree = repo
-        .find_commit(oid)
-        .and_then(|c| c.tree())
-        .map_err(|_| "cannot read PR snapshot source tree".to_string())?;
-    match tree.get_path(std::path::Path::new(".forge/ci.sh")) {
-        Err(_) => Ok("just check"),
-        Ok(e) => match e.filemode() {
-            0o100644 | 0o100755 | 0o100664 => Ok(".forge/ci.sh"),
-            0o120000 => Err("refusing .forge/ci.sh: symlink (F-001)".to_string()),
-            _ => Err("refusing .forge/ci.sh: not a regular file (F-001)".to_string()),
-        },
-    }
-}
-
 /// `git forge ci run <pr>` — execute the repo CI plan against the PR's own
 /// commits in a temporary worktree, append a CI Check event recording the
 /// outcome, and leave the developer's working tree and current branch
@@ -802,10 +745,12 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
         .ok_or_else(|| "cannot resolve repository working directory".to_string())?;
 
     // Determine the plan from the PR's IMMUTABLE source snapshot up front
-    // (F-001): a symlink/non-regular `.forge/ci.sh` is refused before a
-    // worktree is even created, so CI never follows a tracked link to mutable
-    // bytes outside the detached worktree. Absent -> the `just check` fallback.
-    let plan = snapshot_ci_plan(store.repo(), source_oid)?;
+    // (F-001/F-012): a symlink/non-regular `.forge/ci.sh`, or a symlink
+    // justfile for the `just check` fallback, is refused before a worktree is
+    // even created, so CI never follows a tracked link to mutable bytes
+    // outside the detached worktree. Absent `.forge/ci.sh` -> the pinned
+    // `just check` fallback (F-012).
+    let plan = crate::git::snapshot_ci_plan(store.repo(), source_oid)?;
 
     // Reserve a unique temp worktree path (sibling lock) so concurrent CI runs
     // on the same repo never collide on the global temp dir.
@@ -837,7 +782,7 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
         {
             Ok(h) => {
                 lock_handle = Some(h);
-                match crate::git::worktree_add(&repo_dir, &tmp, &source_oid) {
+                match crate::git::worktree_add_ci(&repo_dir, &tmp, &source_oid) {
                     Ok(()) => break (true, String::new()),
                     Err(err) => break (false, err),
                 }
@@ -863,26 +808,23 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
         ));
     }
 
-    // Run the plan. The exit status is captured; the plan's stderr/stdout stay
-    // in the worktree (not surfaced), only the recorded status matters here.
-    // `GIT_FORGE_CI_TIMEOUT` (seconds, default 300) bounds the wait so a
-    // nonterminating plan cannot hang this command (F-002).
-    let timeout_secs: u64 = std::env::var("GIT_FORGE_CI_TIMEOUT")
-        .ok()
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(300);
-    let script_status = run_ci_plan(&tmp, plan, timeout_secs);
+    // Run the plan. The exact immutable snapshot bytes are materialized and
+    // executed (F-013), the wait is bounded by `GIT_FORGE_CI_TIMEOUT`
+    // (clamped, F-011), and on expiry the WHOLE process group is killed and
+    // reaped (F-015) so a background descendant cannot survive the deadline.
+    let timeout = crate::git::ci_timeout(std::env::var("GIT_FORGE_CI_TIMEOUT").ok().as_deref());
+    let run = crate::git::run_ci_plan(store.repo(), source_oid, &tmp, &plan, timeout);
 
     // Always append the CI Check outcome — a failing plan must still record a
     // `failure` CI Check (VAL-002) before the command exits nonzero.
-    let status = if script_status == Some(0) {
+    let status = if run.status == Some(0) {
         "success"
     } else {
         "failed"
     };
     let mut body = HashMap::new();
     body.insert("status".into(), json_str(status));
-    body.insert("plan".into(), json_str(plan));
+    body.insert("plan".into(), json_str(plan.label));
     let ev = Event::new(EventKind::CiCheck, "pr", id, &actor, body);
     // Record the outcome — a failing plan still appends a `failure` CI Check
     // (VAL-002) before the command exits nonzero.
@@ -920,14 +862,19 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
     }
     append.map_err(|e| format!("CI run completed but recording the CI Check failed: {e}"))?;
 
-    if script_status == Some(0) {
-        Ok(format!("CI run for PR #{id} passed ({plan})"))
+    if run.status == Some(0) {
+        Ok(format!("CI run for PR #{id} passed ({})", plan.label))
     } else {
-        Err(format!(
-            "CI run for PR #{id} failed ({plan}){}",
-            script_status
+        let detail = if run.timed_out {
+            ": timed out".to_string()
+        } else {
+            run.status
                 .map(|c| format!(": exited with status {c}"))
                 .unwrap_or_default()
+        };
+        Err(format!(
+            "CI run for PR #{id} failed ({}){detail}",
+            plan.label
         ))
     }
 }

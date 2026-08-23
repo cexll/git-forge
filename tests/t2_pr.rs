@@ -1220,6 +1220,18 @@ fn remove_leftover_ci_worktree(dir: &Path) {
     panic!("expected a leftover CI worktree to clean; list: {out}");
 }
 
+/// True if the process with the given pid still exists (running OR a not-yet-
+/// reaped zombie); false when it is gone (ESRCH). Used by the F-015
+/// background-descendant regression to poll for the group reaping.
+fn process_alive(pid: u32) -> bool {
+    let out = Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .output()
+        .unwrap();
+    out.status.code() == Some(0)
+}
+
 /// VAL-001: a passing plan records a CI Check `success`, the command exits 0,
 /// and the developer's working tree + current branch are unchanged.
 #[test]
@@ -1580,6 +1592,432 @@ fn ci_run_refuses_symlink_escape_after_target_changes() {
     let (_, status, _) = git(&dir, &["status", "--porcelain"]);
     assert_eq!(status.trim(), "", "working tree must be clean: {status}");
     assert_no_ci_worktree(&dir);
+}
+
+/// F-012 regression: a `justfile` (the `just check` fallback plan) that is a
+/// tracked symlink redirecting CI to mutable bytes OUTSIDE the PR's immutable
+/// source snapshot must be refused — clean error, exit nonzero, and no green
+/// Check. The external target changes AFTER the PR snapshot is taken, so a run
+/// that followed the link (or that searched an ancestor/global justfile) would
+/// execute external mutable bytes instead of the frozen snapshot.
+#[test]
+fn ci_run_refuses_symlink_justfile_escape_after_target_changes() {
+    let dir = tmpdir("ci-justfile-symlink");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+
+    // An external, mutable justfile that lives OUTSIDE the repo (never
+    // committed). It fails initially, then is flipped to pass AFTER PR
+    // creation.
+    let ext = tmpdir("ci-justfile-symlink-ext");
+    let ext_justfile = ext.join("justfile");
+    std::fs::write(&ext_justfile, "check:\n    exit 1\n").unwrap();
+
+    // Commit `justfile` as a symlink pointing at the external justfile.
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::os::unix::fs::symlink(&ext_justfile, dir.join("justfile")).unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(
+        &dir,
+        &["commit", "-q", "-m", "feature + symlinked justfile"],
+    );
+    git(&dir, &["checkout", "-q", "main"]);
+
+    let (c, o, e) = forge(
+        &dir,
+        &[
+            "forge", "pr", "create", "--source", "feature", "--base", "main", "PR1",
+        ],
+    );
+    assert_eq!(c, 0, "pr create failed: {e} {o}");
+
+    // The external symlink target CHANGES to a passing justfile after the PR's
+    // immutable snapshot was taken.
+    std::fs::write(&ext_justfile, "check:\n    echo ok\n").unwrap();
+
+    // The hardened selector must refuse to follow the justfile symlink out of
+    // the snapshot: clean error, exit nonzero, and no green CI Check recorded.
+    let (cr, or_, er) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_ne!(cr, 0, "ci run must refuse a symlinked justfile: {or_} {er}");
+    assert!(
+        er.contains("symlink"),
+        "stderr must name the justfile symlink refusal: {er}"
+    );
+
+    let event = head_event(&dir, 1);
+    assert!(
+        !event.contains("\"status\":\"success\""),
+        "must not record a green Check from external bytes: {event}"
+    );
+
+    // Working tree + current branch unchanged, no temp worktree left behind.
+    assert_eq!(git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).1, "main");
+    let (_, status, _) = git(&dir, &["status", "--porcelain"]);
+    assert_eq!(status.trim(), "", "working tree must be clean: {status}");
+    assert_no_ci_worktree(&dir);
+}
+
+/// F-012 fallback edge: a snapshot with no `.forge/ci.sh` AND no justfile must
+/// refuse the `just check` fallback up front, so an ancestor/global justfile
+/// cannot supply a green Check. The refusal is a clean error with no green CI
+/// Check recorded and no temp worktree created.
+#[test]
+fn ci_run_fallback_refuses_when_snapshot_has_no_justfile() {
+    let dir = tmpdir("ci-nojustfile");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "feature without a CI plan"]);
+    git(&dir, &["checkout", "-q", "main"]);
+
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+    // The source tree must carry neither a ci.sh nor a justfile.
+    assert!(!dir.join(".forge").join("ci.sh").exists());
+    assert!(!dir.join("justfile").exists());
+
+    let (c, _o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_ne!(
+        c, 0,
+        "a snapshot with no .forge/ci.sh and no justfile must refuse the fallback: {e}"
+    );
+    assert!(
+        e.contains("no justfile"),
+        "stderr must name the missing justfile: {e}"
+    );
+
+    // No green Check and no temp worktree left behind.
+    let event = head_event(&dir, 1);
+    assert!(
+        !event.contains("\"status\":\"success\""),
+        "must not record a green Check: {event}"
+    );
+    assert_eq!(git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).1, "main");
+    let (_, status, _) = git(&dir, &["status", "--porcelain"]);
+    assert_eq!(status.trim(), "", "working tree must be clean: {status}");
+    assert_no_ci_worktree(&dir);
+}
+
+/// F-013 regression: a checkout smudge/attribute filter must NOT replace the CI
+/// plan that runs. A `.gitattributes` filter rewrites `.forge/ci.sh` so that
+/// the checked-out file is `exit 0` while the immutable blob is `exit 1`; a run
+/// that executed the smudged file would record a green Check. The F-013 fix
+/// materializes the exact immutable blob bytes, so the failing plan runs.
+#[test]
+fn ci_run_smudge_filter_cannot_replace_plan() {
+    let dir = tmpdir("ci-smudge");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    // A smudge/attribute filter that rewrites `exit 1` -> `exit 0` on checkout.
+    git(&dir, &["config", "filter.evil.clean", "cat"]);
+    git(
+        &dir,
+        &["config", "filter.evil.smudge", "sed 's/exit 1/exit 0/'"],
+    );
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    std::fs::write(dir.join(".gitattributes"), "*.sh filter=evil\n").unwrap();
+    std::fs::write(dir.join(".forge").join("ci.sh"), "#!/bin/bash\nexit 1\n").unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(
+        &dir,
+        &["commit", "-q", "-m", "feature + smudge-rewritten ci plan"],
+    );
+    git(&dir, &["checkout", "-q", "main"]);
+
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+
+    // The blob is `exit 1`, but the checkout smudge rewrites it to `exit 0`.
+    // A run that executed the smudged file would record a green Check; the
+    // F-013 fix materializes the exact blob bytes so the FAILING plan runs.
+    let (c, o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_ne!(
+        c, 0,
+        "the immutable plan (exit 1) must fail, not the smudged one: {e} {o}"
+    );
+    let event = head_event(&dir, 1);
+    assert!(event.contains("\"status\":\"failed\""), "status: {event}");
+    assert!(event.contains("\"plan\":\".forge/ci.sh\""), "plan: {event}");
+
+    // The temp CI worktree must be removed, and the developer's working tree is
+    // clean.
+    assert_no_ci_worktree(&dir);
+    let (_, status, _) = git(&dir, &["status", "--porcelain"]);
+    assert_eq!(status.trim(), "", "working tree must be clean: {status}");
+}
+
+/// F-014 regression: the CI temp worktree must be created WITHOUT running
+/// repository-relative hooks (post-checkout) that a snapshot's environment
+/// could supply, so CI cannot hang or accumulate output before the deadline.
+/// A post-checkout hook that writes a marker proves whether it ran; the F-014
+/// fix (`core.hooksPath=/dev/null` on the CI worktree add) keeps it from
+/// running at all.
+#[test]
+fn ci_run_does_not_run_post_checkout_hook() {
+    let dir = tmpdir("ci-hook");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    std::fs::write(dir.join(".forge").join("ci.sh"), "#!/bin/bash\nexit 0\n").unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "feature + passing ci plan"]);
+    git(&dir, &["checkout", "-q", "main"]);
+
+    // A post-checkout hook (in the repository's git dir) that a hostile
+    // snapshot's environment could arrange to hang or spam output. It writes a
+    // marker to prove whether git ran it during the CI worktree checkout. It is
+    // installed AFTER the test's own branch checkouts, so the only checkout left
+    // that could invoke it is the CI temp worktree add.
+    std::fs::create_dir_all(dir.join(".git").join("hooks")).unwrap();
+    let marker = dir.join("hook-ran.txt");
+    std::fs::write(
+        dir.join(".git").join("hooks").join("post-checkout"),
+        format!("#!/bin/sh\necho ran > '{}'\n", marker.display()),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        dir.join(".git").join("hooks").join("post-checkout"),
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .unwrap();
+
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+
+    // The CI worktree add must not run the post-checkout hook (F-014).
+    let (c, o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_eq!(c, 0, "ci run must succeed: {e} {o}");
+    assert!(o.contains("passed"), "ci run output: {o}");
+    assert!(
+        !marker.exists(),
+        "post-checkout hook must NOT run during CI worktree creation"
+    );
+
+    assert_no_ci_worktree(&dir);
+    let (_, status, _) = git(&dir, &["status", "--porcelain"]);
+    assert_eq!(status.trim(), "", "working tree must be clean: {status}");
+}
+
+/// F-015 regression: on timeout the CI plan must terminate the COMPLETE process
+/// group, so a background descendant whose leader exits cannot survive the
+/// bounded deadline. The plan spawns `sleep 60` in the background and records
+/// its pid; F-015 kills+reaps the whole group so the descendant is gone after
+/// `ci run` returns, and the run records a failed Check + cleans the worktree.
+#[test]
+fn ci_run_kills_background_descendant_on_timeout() {
+    let dir = tmpdir("ci-desc");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    // The descendant pid is recorded OUTSIDE the repo so it does not dirty the
+    // developer's working tree after the run.
+    let pid_dir = tmpdir("ci-desc-pid");
+    let desc_file = pid_dir.join("desc.pid");
+    std::fs::write(
+        dir.join(".forge").join("ci.sh"),
+        format!(
+            "#!/bin/bash\nsh -c 'sleep 60 & echo $! > \"{}\"; wait'\n",
+            desc_file.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(
+        &dir,
+        &["commit", "-q", "-m", "feature + background-descendant plan"],
+    );
+    git(&dir, &["checkout", "-q", "main"]);
+
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+
+    let t0 = std::time::SystemTime::now();
+    let (c, _o, e) = forge_with_env(
+        &dir,
+        &["forge", "ci", "run", "1"],
+        &[("GIT_FORGE_CI_TIMEOUT", "1")],
+    );
+    let elapsed = t0.elapsed().unwrap().as_secs();
+    assert_ne!(
+        c, 0,
+        "nonterminating descendant plan must exit nonzero: {e}"
+    );
+    assert!(
+        elapsed < 30,
+        "ci run must return within the bounded deadline (took {elapsed}s)"
+    );
+
+    let pid: u32 = std::fs::read_to_string(&desc_file)
+        .unwrap()
+        .trim()
+        .parse()
+        .expect("descendant pid must have been written by the plan");
+    // The descendant must be reaped within a short window after the group kill.
+    let mut gone = false;
+    for _ in 0..100 {
+        if !process_alive(pid) {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        gone,
+        "background descendant pid {pid} survived the CI deadline (F-015)"
+    );
+
+    let event = head_event(&dir, 1);
+    assert!(event.contains("\"status\":\"failed\""), "status: {event}");
+
+    assert_no_ci_worktree(&dir);
+    let (_, status, _) = git(&dir, &["status", "--porcelain"]);
+    assert_eq!(status.trim(), "", "working tree must be clean: {status}");
+}
+
+/// F-011 regression: an extreme `GIT_FORGE_CI_TIMEOUT` (e.g. `u64::MAX`) must
+/// not overflow the deadline computation and panic after the child/worktree are
+/// created (which would skip the kill/reap, the failed-Check append and the
+/// cleanup). The configured deadline is bounded/clamped, so a passing plan
+/// still records a success Check and the temp worktree is cleaned.
+#[test]
+fn ci_run_extreme_timeout_does_not_panic() {
+    let dir = tmpdir("ci-extreme-timeout");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    std::fs::write(dir.join(".forge").join("ci.sh"), "#!/bin/bash\nexit 0\n").unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "feature + passing ci plan"]);
+    git(&dir, &["checkout", "-q", "main"]);
+
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+
+    // u64::MAX as the configured timeout would overflow the deadline
+    // computation in the naive `Instant::now() + Duration` and panic after the
+    // child/worktree are created, skipping the Check append and cleanup (F-011).
+    let (c, o, e) = forge_with_env(
+        &dir,
+        &["forge", "ci", "run", "1"],
+        &[("GIT_FORGE_CI_TIMEOUT", "18446744073709551615")],
+    );
+    assert_eq!(
+        c, 0,
+        "extreme timeout must not panic and must still succeed: {e} {o}"
+    );
+    assert!(o.contains("passed"), "ci run output: {o}");
+
+    let event = head_event(&dir, 1);
+    assert!(event.contains("\"status\":\"success\""), "status: {event}");
+
+    assert_no_ci_worktree(&dir);
+    let (_, status, _) = git(&dir, &["status", "--porcelain"]);
+    assert_eq!(status.trim(), "", "working tree must be clean: {status}");
+}
+
+/// F-016 regression: unbounded output capture must not be silently restored.
+/// A plan writes a deterministic marker whenever its stdout/stderr are a PIPE
+/// (i.e. being captured, as with `Command::output()`) rather than redirected to
+/// `/dev/null` (the bounded impl). Under the bounded impl the marker is never
+/// written; if `Command::output()` unbounded capture is restored, the marker is
+/// written and this test fails — deterministically, without needing an OOM.
+#[test]
+fn ci_run_detects_unbounded_output_capture() {
+    let dir = tmpdir("ci-capture");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    let marker = dir.join("unbounded-capture-marker.txt");
+    std::fs::write(
+        dir.join(".forge").join("ci.sh"),
+        format!(
+            "#!/bin/bash\n\
+             if [ -p /dev/stdout ] || [ -p /dev/stderr ]; then\n\
+             \x20 echo 'unbounded output capture detected' > \"{marker}\"\n\
+             fi\n\
+             echo 'noise on stdout'\n\
+             echo 'noise on stderr' >&2\n\
+             exit 1\n",
+            marker = marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(
+        &dir,
+        &["commit", "-q", "-m", "feature + capture detector ci plan"],
+    );
+    git(&dir, &["checkout", "-q", "main"]);
+
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+    assert!(!marker.exists(), "marker must not exist before ci run");
+
+    let (c, _o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_ne!(c, 0, "failing capture-detector plan must exit nonzero: {e}");
+    assert!(
+        !marker.exists(),
+        "the bounded impl must redirect plan output to /dev/null; a marker here \
+         proves unbounded Command::output() capture was restored (F-016)"
+    );
+
+    let event = head_event(&dir, 1);
+    assert!(event.contains("\"status\":\"failed\""), "status: {event}");
+
+    assert_no_ci_worktree(&dir);
+    let (_, status, _) = git(&dir, &["status", "--porcelain"]);
+    assert_eq!(status.trim(), "", "working tree must be clean: {status}");
 }
 
 /// `ci run` on a nonexistent PR is a clean error (no worktree side effects).
