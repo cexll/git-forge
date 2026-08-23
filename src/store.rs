@@ -543,6 +543,8 @@ impl BoundEventStore {
         base_oid: Oid,
         merge_base: Oid,
         actor: &str,
+        description: Option<&str>,
+        labels: &[String],
     ) -> Result<u64, StoreError> {
         for _ in 0..MAX_ALLOC_RETRIES {
             let (counter_tip, counter_new, next, genesis) =
@@ -579,6 +581,20 @@ impl BoundEventStore {
                 "merge_base".into(),
                 JsonValue::String(merge_base.to_string()),
             );
+            if let Some(d) = description {
+                body.insert("description".into(), JsonValue::String(d.to_string()));
+            }
+            if !labels.is_empty() {
+                body.insert(
+                    "labels".into(),
+                    JsonValue::Array(
+                        labels
+                            .iter()
+                            .map(|l| JsonValue::String(l.clone()))
+                            .collect(),
+                    ),
+                );
+            }
             let event = Event::new(EventKind::PrCreated, "pr", next, actor, body);
             let message = format!("forge:{}:{}", event.kind.as_str(), event.entity_id);
             let event_oid = self.write_event_commit(&event, &[genesis], &message)?;

@@ -239,6 +239,7 @@ pub struct IssueState {
     pub id: u64,
     pub title: Option<String>,
     pub description: Option<String>,
+    pub labels: Vec<String>,
     pub comments: Vec<String>,
     pub open: bool,
 }
@@ -248,6 +249,7 @@ pub struct PrState {
     pub id: u64,
     pub title: Option<String>,
     pub description: Option<String>,
+    pub labels: Vec<String>,
     pub source_ref: Option<String>,
     pub base_ref: Option<String>,
     pub source_head: Option<String>,
@@ -267,6 +269,7 @@ impl PrState {
             EventKind::PrCreated => {
                 self.title = str_field(&event.body, "title");
                 self.description = str_field(&event.body, "description");
+                self.labels = labels_from(&event.body);
                 self.source_ref = str_field(&event.body, "source_ref");
                 self.base_ref = str_field(&event.body, "base_ref");
                 self.source_head = str_field(&event.body, "source_head");
@@ -315,6 +318,7 @@ pub fn fold(events: &[Event]) -> FoldState {
                             .get("description")
                             .and_then(JsonValue::as_str)
                             .map(String::from);
+                        state.issue.labels = labels_from(&event.body);
                         state.issue.open = true;
                     }
                     EventKind::IssueComment => {
@@ -344,6 +348,20 @@ pub struct SeqState {
 
 pub fn first_allocation() -> (u64, SeqState) {
     (1, SeqState { next: 2 })
+}
+
+/// Extract the `labels` array from an event body. Only string items are kept;
+/// a missing/non-array/non-string `labels` field yields an empty vec (lenient
+/// forward-compat: unknown or malformed payloads never break the fold).
+fn labels_from(body: &HashMap<String, JsonValue>) -> Vec<String> {
+    match body.get("labels") {
+        Some(JsonValue::Array(items)) => items
+            .iter()
+            .filter_map(JsonValue::as_str)
+            .map(String::from)
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 fn json_string(value: &str) -> String {
@@ -713,91 +731,11 @@ mod tests {
         assert!(v.as_object().is_some());
     }
 
-    /// JsonValue accessor fallbacks: as_str/as_u64/as_object return None for
-    /// the wrong variant, and as_u64 also rejects negative numbers.
-    #[test]
-    fn json_value_accessor_fallbacks_return_none() {
-        assert!(JsonValue::Number(1).as_str().is_none());
-        assert!(JsonValue::Null.as_str().is_none());
-        assert!(JsonValue::Bool(true).as_str().is_none());
-        assert!(JsonValue::Array(vec![]).as_str().is_none());
-        assert!(JsonValue::String("x".into()).as_u64().is_none());
-        assert!(JsonValue::Bool(true).as_u64().is_none());
-        assert!(JsonValue::Number(-1).as_u64().is_none(), "negative not u64");
-        assert!(JsonValue::Array(vec![]).as_object().is_none());
-        assert!(JsonValue::Number(1).as_object().is_none());
-        assert!(JsonValue::Null.as_object().is_none());
-        assert_eq!(JsonValue::Number(42).as_u64(), Some(42));
-    }
-
+    /// JsonValue accessor fallbacks are covered in tests/t0_core.rs.
     #[test]
     fn uuid_v4_rejects_wrong_char_at_hyphen_slot() {
         assert!(!is_uuid_v4("550e8400xe29b-41d4-a716-446655440000"));
         assert!(!is_uuid_v4("550e8400-e29b041d4-a716-446655440000"));
-    }
-
-    /// from_json with a VALID non-object body: the previous fixture replaced
-    /// `"body":{` with `"body":[` producing `"body":[}}` — invalid JSON that
-    /// died in the parser before the body match. This one builds well-formed
-    /// JSON whose body is an array, so the body-match `_` arm must reject it.
-    #[test]
-    fn from_json_rejects_non_object_body_with_valid_json() {
-        let good =
-            Event::new(EventKind::IssueCreated, "issue", 1, "x@y.z", HashMap::new()).to_json();
-        let valid = good.replacen("\"body\":{}", "\"body\":[]", 1);
-        assert!(
-            valid.contains("\"body\":[]}"),
-            "fixture must be valid JSON: {valid}"
-        );
-        assert!(Event::from_json(&valid).is_none());
-    }
-
-    /// from_json field edges: an unknown wire kind fails the kind parse, and
-    /// a missing or non-string id fails the `?` accessor (not a parse error).
-    #[test]
-    fn from_json_rejects_unknown_kind_and_bad_id() {
-        let good =
-            Event::new(EventKind::IssueCreated, "issue", 1, "x@y.z", HashMap::new()).to_json();
-        let bad_kind = good.replacen("\"kind\":\"issue.created\"", "\"kind\":\"issue.bogus\"", 1);
-        assert!(Event::from_json(&bad_kind).is_none());
-        // id key absent
-        let no_id = good.replacen("\"id\":", "\"no_id\":", 1);
-        assert!(Event::from_json(&no_id).is_none());
-        // id present but not a string
-        let num_id = good.replacen("\"id\":\"", "\"id\":7,\"_x\":\"", 1);
-        assert!(Event::from_json(&num_id).is_none());
-    }
-
-    /// fold ignores unknown entities and mismatched entity/kind pairs via the
-    /// `_` arms (issue entity + PR kind, PR entity + issue kind, unknown entity).
-    #[test]
-    fn fold_ignores_unknown_entities_and_mismatched_kinds() {
-        let mk = |kind: EventKind, entity: &str, id: u64| {
-            Event::new_with_id(
-                &format!("33333333-3333-4333-8333-{:012x}", id),
-                kind,
-                entity,
-                id,
-                "a@x",
-                HashMap::new(),
-            )
-            .unwrap()
-        };
-        let state = fold(&[
-            mk(EventKind::PrCreated, "issue", 5),
-            mk(EventKind::IssueCreated, "pr", 9),
-            mk(EventKind::IssueCreated, "widget", 2),
-        ]);
-        // The issue entity id is set before the kind match, but no fields are
-        // populated by a PR-kind event on an issue entity.
-        assert_eq!(state.issue.id, 5);
-        assert_eq!(state.issue.title, None);
-        assert!(!state.issue.open);
-        assert!(state.issue.comments.is_empty());
-        // The pr entity id is set, but an issue-kind event fills no PR fields.
-        assert_eq!(state.pr.id, 9);
-        assert_eq!(state.pr.title, None);
-        assert_eq!(state.pr.effective_decision, None);
     }
 
     /// Parser edges: empty input (EOF peek), a `false` literal, a non-quoted
@@ -833,5 +771,72 @@ mod tests {
         assert!(parse_json_value("nu").is_none()); // null literal typo
         assert!(parse_json_value("fa").is_none()); // false literal typo
         assert!(parse_json_value(r#"{"a":}"#).is_none()); // value missing
+    }
+
+    /// labels_from: keeps only string items, tolerates missing/non-array
+    /// payloads (forward-compat), and never panics on malformed labels.
+    #[test]
+    fn labels_from_string_items_only_and_lenient() {
+        let mut body = HashMap::new();
+        body.insert(
+            "labels".into(),
+            JsonValue::Array(vec![
+                JsonValue::String("a".into()),
+                JsonValue::Number(1),
+                JsonValue::String("b".into()),
+            ]),
+        );
+        assert_eq!(labels_from(&body), vec!["a".to_string(), "b".to_string()]);
+        // missing labels -> empty
+        assert!(labels_from(&HashMap::new()).is_empty());
+        // non-array labels -> empty (never a panic)
+        let mut m = HashMap::new();
+        m.insert("labels".into(), JsonValue::String("not-array".into()));
+        assert!(labels_from(&m).is_empty());
+        // empty array
+        let mut e = HashMap::new();
+        e.insert("labels".into(), JsonValue::Array(vec![]));
+        assert!(labels_from(&e).is_empty());
+    }
+
+    /// fold derives labels for both issue.created and pr.created events.
+    #[test]
+    fn fold_sets_labels_from_created_events() {
+        let mk = |kind: EventKind, entity: &str, id: u64, body: HashMap<String, JsonValue>| {
+            Event::new_with_id(
+                &format!("22222222-2222-4222-8222-{:012x}", id),
+                kind,
+                entity,
+                id,
+                "a@x",
+                body,
+            )
+            .unwrap()
+        };
+        let mut ib = HashMap::new();
+        ib.insert("title".into(), JsonValue::String("T".into()));
+        ib.insert(
+            "labels".into(),
+            JsonValue::Array(vec![
+                JsonValue::String("bug".into()),
+                JsonValue::String("urgent".into()),
+            ]),
+        );
+        let mut pb = HashMap::new();
+        pb.insert("description".into(), JsonValue::String("body".into()));
+        pb.insert(
+            "labels".into(),
+            JsonValue::Array(vec![JsonValue::String("enhancement".into())]),
+        );
+        let st = fold(&[
+            mk(EventKind::IssueCreated, "issue", 1, ib),
+            mk(EventKind::PrCreated, "pr", 2, pb),
+        ]);
+        assert_eq!(
+            st.issue.labels,
+            vec!["bug".to_string(), "urgent".to_string()]
+        );
+        assert_eq!(st.pr.labels, vec!["enhancement".to_string()]);
+        assert_eq!(st.pr.description.as_deref(), Some("body"));
     }
 }

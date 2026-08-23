@@ -815,6 +815,42 @@ fn pr_help_lists_every_subcommand() {
 }
 
 #[test]
+fn pr_create_supports_body_and_labels() {
+    // `pr create --source <b> --base <b> <title> --body <text> --label <x>...`
+    // stores a description and labels; `pr show` renders both.
+    let dir = tmpdir("prlabel");
+    init_repo(&dir);
+    make_feature(&dir, "feature", "x\n");
+    let (c, _o, e) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "create",
+            "--source",
+            "feature",
+            "--base",
+            "main",
+            "T",
+            "--body",
+            "the body",
+            "--label",
+            "enhancement",
+            "--label",
+            "docs",
+        ],
+    );
+    assert_eq!(c, 0, "pr create with body/labels failed: {e}");
+    let (cs, os, es) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert_eq!(cs, 0, "pr show failed: {es}");
+    assert!(os.contains("description: the body"), "body shown: {os}");
+    assert!(
+        os.contains("labels: enhancement, docs"),
+        "labels shown: {os}"
+    );
+}
+
+#[test]
 fn cli_arg_validation_errors_are_user_facing() {
     // One pass covering the many CLI arg-validation branches: each misuse must
     // surface a clean exit-1 message, never a panic or libgit2 internal leak.

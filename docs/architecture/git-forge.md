@@ -147,11 +147,11 @@ Kinds and body fields:
 
 | kind | entity | body |
 |---|---|---|
-| `issue.created` | issue | `{title, description?}` |
+| `issue.created` | issue | `{title, description?, labels?}` |
 | `issue.comment` | issue | `{body}` |
 | `issue.close` | issue | `{}` |
 | `issue.reopen` | issue | `{}` |
-| `pr.created` | pr | `{title, description?, source_ref, base_ref, source_head, base_head, merge_base}` |
+| `pr.created` | pr | `{title, description?, labels?, source_ref, base_ref, source_head, base_head, merge_base}` |
 | `pr.comment` | pr | `{body}` |
 | `pr.review` | pr | `{decision: "approve"|"reject", body?, file?, line?, commit?}` |
 | `pr.merge` | pr | `{strategy: "merge"|"squash"|"rebase", result_commit}` |
@@ -163,7 +163,7 @@ Kinds and body fields:
 ### PR Lifecycle (L1: immutable snapshot)
 
 - L1 PRs are **one-shot immutable snapshots**: `pr.created` fixes `source_head` and `base_head`; the PR never follows later branch movement. An approval authorizes exactly that snapshot (`merge_base..source_head`). To propose new commits, create a new PR. `pr.update` events are L2.
-- `git forge pr create --source <branch> --base <branch> <title>` — L1 requires `--source`, `--base`, and a non-empty title positional argument; missing `--source`, missing `--base`, or empty/whitespace-only title errors (no heuristic defaults; no self-PR). `--source` and `--base` must resolve to canonical local `refs/heads/*` branches: tags, remote-tracking refs, OIDs, and revision expressions are rejected (merge later CASes `refs/heads/<base>` and the checked-out-base guard operates on local branches). Explicit `--source` equal to `--base` (or distinct local branches resolving to the same commit) is rejected — no self-PR. Deferred to L2: derive default base from `refs/remotes/<remote>/HEAD` when present.
+- `git forge pr create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]...` — L1 requires `--source`, `--base`, and a non-empty title positional argument; missing `--source`, missing `--base`, or empty/whitespace-only title errors (no heuristic defaults; no self-PR). `--body` sets the optional PR description; `--label` (repeatable) attaches labels. `--source` and `--base` must resolve to canonical local `refs/heads/*` branches: tags, remote-tracking refs, OIDs, and revision expressions are rejected (merge later CASes `refs/heads/<base>` and the checked-out-base guard operates on local branches). Explicit `--source` equal to `--base` (or distinct local branches resolving to the same commit) is rejected — no self-PR. Deferred to L2: derive default base from `refs/remotes/<remote>/HEAD` when present.
 - `pr.created` records `source_ref`, `base_ref`, `source_head`, `base_head`, and `merge_base` (= `git merge-base(base_head, source_head)` at creation). **L1 requires exactly one merge base, checked with `git merge-base --all base_head source_head`**: count != 1 rejects with a clear error and creates no PR. Zero bases covers unrelated histories and shallow repositories (incomplete history); for shallow repos the error must ask the user to deepen/unshallow. Multiple bases covers criss-cross histories. Review diff and rebase are undefined without a single base.
 - Immutable snapshot refs `refs/forge/prs/<n>/source` (→ `source_head`) and `/base` (→ `base_head`) are created atomically with `/head` and `/meta`, keeping PR commits reachable through `git gc` and providing the merge inputs after branch deletion/rebasing.
 - **Review content**: the PR patch is `merge_base..source_head` (equivalently `git diff base_head...source_head`). An approval authorizes this exact patch; it never includes base-only commits or their reversions.

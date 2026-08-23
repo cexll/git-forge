@@ -454,7 +454,17 @@ fn create_pr_creates_head_meta_source_base_atomically() {
     assert_eq!(merge_base, base, "head descends from base; one merge base");
 
     let id = store
-        .create_pr("PR title", "feature", "main", head, base, merge_base, "a@x")
+        .create_pr(
+            "PR title",
+            "feature",
+            "main",
+            head,
+            base,
+            merge_base,
+            "a@x",
+            None,
+            &[],
+        )
         .unwrap();
     assert_eq!(id, 1, "first PR gets id 1");
 
@@ -526,7 +536,17 @@ fn create_pr_creates_head_meta_source_base_atomically() {
 
     // Next allocation takes id 2; the counter advanced to {next:2}.
     let id2 = store
-        .create_pr("second", "feature", "main", head, base, merge_base, "a@x")
+        .create_pr(
+            "second",
+            "feature",
+            "main",
+            head,
+            base,
+            merge_base,
+            "a@x",
+            None,
+            &[],
+        )
         .unwrap();
     assert_eq!(id2, 2, "second PR gets id 2");
     assert!(repo.find_reference(&pr_head_ref(2)).is_ok());
@@ -554,7 +574,17 @@ fn create_pr_rejects_preexisting_ref_without_touching_counter() {
     let merge_base = repo.merge_base(base, head).unwrap();
     // Pre-create the ref the fresh counter would target (#1) → forced collision.
     repo.reference(&pr_head_ref(1), head, false, "pre").unwrap();
-    let res = store.create_pr("T", "feature", "main", head, base, merge_base, "a@x");
+    let res = store.create_pr(
+        "T",
+        "feature",
+        "main",
+        head,
+        base,
+        merge_base,
+        "a@x",
+        None,
+        &[],
+    );
     assert!(res.is_err());
     assert!(matches!(res, Err(StoreError::RefExists(_))));
     assert!(

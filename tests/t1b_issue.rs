@@ -682,3 +682,22 @@ fn issue_list_empty_and_closed_states() {
     assert_eq!(c3, 0, "closed show failed: {e3}");
     assert!(o3.contains("closed"), "closed show state: {o3}");
 }
+
+#[test]
+fn issue_new_supports_body_and_labels_shown_in_show() {
+    // `issue new <title> [description] --label <x>...` stores both the body
+    // and labels, and `issue show` renders them.
+    let dir = tmpdir("ilabel");
+    init_repo(&dir);
+    let (c, _o, e) = forge(
+        &dir,
+        &[
+            "forge", "issue", "new", "T", "a body", "--label", "bug", "--label", "urgent",
+        ],
+    );
+    assert_eq!(c, 0, "issue new with labels failed: {e}");
+    let (cs, os, es) = forge(&dir, &["forge", "issue", "show", "1"]);
+    assert_eq!(cs, 0, "issue show failed: {es}");
+    assert!(os.contains("description: a body"), "body shown: {os}");
+    assert!(os.contains("labels: bug, urgent"), "labels shown: {os}");
+}

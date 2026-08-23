@@ -51,15 +51,36 @@ fn issue_event(kind: EventKind, id: u64, actor: &str, body: HashMap<String, Json
 /// `git forge issue new <title> [description]`
 fn cmd_new(args: &[String]) -> Result<String, String> {
     // Pure argument validation first — a usage error must not be masked by a
-    // later config-open failure (error precedence, F-028).
-    if args.is_empty() || args[0].trim().is_empty() {
+    // later config-open failure (error precedence, F-028). Supports
+    // `--label <x>` (repeatable) alongside the positional `<title> [description]`.
+    let mut labels: Vec<String> = Vec::new();
+    let mut positional: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--label" | "-l" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--label requires a value".into());
+                }
+                let v = args[i].trim().to_string();
+                if v.is_empty() {
+                    return Err("--label requires a non-empty value".into());
+                }
+                labels.push(v);
+            }
+            _ => positional.push(args[i].clone()),
+        }
+        i += 1;
+    }
+    if positional.is_empty() || positional[0].trim().is_empty() {
         return Err(
-            "usage: git forge issue new <title> [description] — title is required and non-empty"
+            "usage: git forge issue new <title> [description] [--label <x>]... — title is required and non-empty"
                 .into(),
         );
     }
-    let title = args[0].trim().to_string();
-    let description = args
+    let title = positional[0].trim().to_string();
+    let description = positional
         .get(1)
         .map(|d| d.trim().to_string())
         .filter(|d| !d.is_empty());
@@ -71,11 +92,24 @@ fn cmd_new(args: &[String]) -> Result<String, String> {
     if let Some(d) = description {
         body.insert("description".into(), json_str(&d));
     }
+    if !labels.is_empty() {
+        body.insert("labels".into(), json_labels(&labels));
+    }
     let ev = issue_event(EventKind::IssueCreated, id, &actor, body);
     store
         .append_event(&crate::store::issue_ref(id), &ev)
         .map_err(|e| e.to_string())?;
     Ok(format!("issue #{id} created: {title}"))
+}
+
+/// Build a `JsonValue::Array` of string labels for an event body.
+fn json_labels(labels: &[String]) -> JsonValue {
+    JsonValue::Array(
+        labels
+            .iter()
+            .map(|l| JsonValue::String(l.clone()))
+            .collect(),
+    )
 }
 
 /// `git forge issue list`
@@ -131,6 +165,9 @@ fn cmd_show(store: &EventStore, args: &[String]) -> Result<String, String> {
     );
     if let Some(d) = &state.description {
         out.push_str(&format!("description: {d}\n"));
+    }
+    if !state.labels.is_empty() {
+        out.push_str(&format!("labels: {}\n", state.labels.join(", ")));
     }
     out.push('\n');
     if !state.comments.is_empty() {
@@ -223,7 +260,7 @@ pub fn run_issue(argv: &[String]) -> Result<String, String> {
 fn issue_help() -> String {
     "usage: git forge issue <new|list|show|comment|close|reopen> ...\n\
      \nsubcommands:\n\
-     \x20 new <title> [description]\n\
+     \x20 new <title> [description] [--label <x>]...\n\
      \x20 list\n\
      \x20 show <n>\n\
      \x20 comment <n> <body>\n\
@@ -273,11 +310,13 @@ fn resolve_local_branch(store: &EventStore, arg: &str) -> Result<(String, git2::
     Ok((name, oid))
 }
 
-/// `git forge pr create --source <branch> --base <branch> <title>`
+/// `git forge pr create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]...`
 fn cmd_pr_create(args: &[String]) -> Result<String, String> {
     let mut source = None;
     let mut base = None;
     let mut title = None;
+    let mut body = None;
+    let mut labels: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -294,6 +333,20 @@ fn cmd_pr_create(args: &[String]) -> Result<String, String> {
                     return Err("--base requires a branch name".into());
                 }
                 base = Some(args[i].clone());
+            }
+            "--body" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--body requires a description".into());
+                }
+                body = Some(args[i].clone());
+            }
+            "--label" | "-l" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--label requires a value".into());
+                }
+                labels.push(args[i].clone());
             }
             a if a.starts_with("--") || a.starts_with('-') => {
                 return Err(format!("unknown option '{a}'"));
@@ -336,6 +389,8 @@ fn cmd_pr_create(args: &[String]) -> Result<String, String> {
             base_oid,
             merge_base,
             &actor,
+            body.as_deref().filter(|b| !b.trim().is_empty()),
+            &labels,
         )
         .map_err(|e| e.to_string())?;
     Ok(format!("PR #{id} created: {title} ({source} -> {base})"))
@@ -374,6 +429,12 @@ fn cmd_pr_show(store: &EventStore, args: &[String]) -> Result<String, String> {
     }
     if let (Some(b), Some(s)) = (&state.base_head, &state.source_head) {
         out.push_str(&format!("diff: {b}...{s}\n"));
+    }
+    if let Some(d) = &state.description {
+        out.push_str(&format!("description: {d}\n"));
+    }
+    if !state.labels.is_empty() {
+        out.push_str(&format!("labels: {}\n", state.labels.join(", ")));
     }
     for c in &state.comments {
         out.push_str(&format!("comment: {c}\n"));
@@ -595,7 +656,7 @@ pub fn run_pr(argv: &[String]) -> Result<String, String> {
 fn pr_help() -> String {
     "usage: git forge pr <create|list|show|comment|review|diff|merge> ...\n\
      \nsubcommands:\n\
-     \x20 create --source <branch> --base <branch> <title>\n\
+     \x20 create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]...\n\
      \x20 list\n\
      \x20 show <n>\n\
      \x20 comment <n> <body>\n\

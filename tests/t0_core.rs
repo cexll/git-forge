@@ -156,3 +156,60 @@ fn sequential_allocation_from_absent() {
     assert_eq!(id, 1);
     assert_eq!(next.next, 2);
 }
+
+/// JsonValue accessor fallbacks: as_str/as_u64/as_object return None for the
+/// wrong variant, and as_u64 also rejects negative numbers.
+#[test]
+fn json_value_accessor_fallbacks_return_none() {
+    assert!(JsonValue::Number(1).as_str().is_none());
+    assert!(JsonValue::Null.as_str().is_none());
+    assert!(JsonValue::Bool(true).as_str().is_none());
+    assert!(JsonValue::Array(vec![]).as_str().is_none());
+    assert!(JsonValue::String("x".into()).as_u64().is_none());
+    assert!(JsonValue::Bool(true).as_u64().is_none());
+    assert!(JsonValue::Number(-1).as_u64().is_none(), "negative not u64");
+    assert!(JsonValue::Array(vec![]).as_object().is_none());
+    assert!(JsonValue::Number(1).as_object().is_none());
+    assert!(JsonValue::Null.as_object().is_none());
+    assert_eq!(JsonValue::Number(42).as_u64(), Some(42));
+}
+
+/// from_json rejects a valid-JSON non-object body, an unknown wire kind, and
+/// a missing/non-string id (the `?`/match arms, not parse errors).
+#[test]
+fn from_json_rejects_non_object_body_and_bad_fields() {
+    let good = event(EventKind::IssueCreated, "issue", 1, "a@x", &[]).to_json();
+    // well-formed body that is an array, not an object
+    let non_obj = good.replacen("\"body\":{}", "\"body\":[]", 1);
+    assert!(Event::from_json(&non_obj).is_none());
+    // unknown wire kind
+    let bad_kind = good.replacen("\"kind\":\"issue.created\"", "\"kind\":\"issue.bogus\"", 1);
+    assert!(Event::from_json(&bad_kind).is_none());
+    // id key absent
+    let no_id = good.replacen("\"id\":", "\"no_id\":", 1);
+    assert!(Event::from_json(&no_id).is_none());
+    // id present but not a string
+    let num_id = good.replacen("\"id\":\"", "\"id\":7,\"_x\":\"", 1);
+    assert!(Event::from_json(&num_id).is_none());
+}
+
+/// fold ignores unknown entities and mismatched entity/kind pairs via the `_`
+/// arms (issue entity + PR kind, PR entity + issue kind, unknown entity).
+#[test]
+fn fold_ignores_unknown_entities_and_mismatched_kinds() {
+    let state = fold(&[
+        event(EventKind::PrCreated, "issue", 5, "a@x", &[]),
+        event(EventKind::IssueCreated, "pr", 9, "a@x", &[]),
+        event(EventKind::IssueCreated, "widget", 2, "a@x", &[]),
+    ]);
+    // The issue entity id is set before the kind match, but no fields are
+    // populated by a PR-kind event on an issue entity.
+    assert_eq!(state.issue.id, 5);
+    assert_eq!(state.issue.title, None);
+    assert!(!state.issue.open);
+    assert!(state.issue.comments.is_empty());
+    // The pr entity id is set, but an issue-kind event fills no PR fields.
+    assert_eq!(state.pr.id, 9);
+    assert_eq!(state.pr.title, None);
+    assert_eq!(state.pr.effective_decision, None);
+}
