@@ -337,3 +337,96 @@ fn fold_keeps_latest_ci_check_status() {
     let st2 = fold(&[mk(3, "pending"), mk(4, "success")]);
     assert_eq!(st2.pr.ci_status.as_deref(), Some("success"));
 }
+
+/// Parse `YYYY-MM-DDTHH:MM:SSZ` (RFC3339 UTC) into seconds since the Unix
+/// epoch. The test-time independent oracle for the event timestamp: it is a
+/// days-from-civil conversion, deliberately NOT the serialization formatter
+/// under test, so a bug that always returns the epoch would break this test.
+fn parse_rfc3339_utc(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() != 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'Z'
+    {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| -> Option<i64> {
+        let mut n = 0i64;
+        for &c in &b[r] {
+            if !c.is_ascii_digit() {
+                return None;
+            }
+            n = n * 10 + (c - b'0') as i64;
+        }
+        Some(n)
+    };
+    let year = num(0..4)?;
+    let month = num(5..7)?;
+    let day = num(8..10)?;
+    let hour = num(11..13)?;
+    let min = num(14..16)?;
+    let sec = num(17..19)?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    // days-from-civil (Howard Hinnant), the inverse of the RFC3339 formatter.
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(days * 86400 + hour * 3600 + min * 60 + sec)
+}
+
+/// The RFC3339 UTC formatter is byte-correct at known epochs (independent
+/// oracle: a fixed literal, not a recomputation).
+#[test]
+fn rfc3339_utc_formatter_known_values() {
+    assert_eq!(format_rfc3339_utc(0), "1970-01-01T00:00:00Z");
+    assert_eq!(format_rfc3339_utc(1_000_000_000), "2001-09-09T01:46:40Z");
+    // Round-trips through the independent parser for a mid-range sample.
+    for v in [0i64, 1_234_567_890, 2_000_000_000] {
+        let s = format_rfc3339_utc(v as u64);
+        assert_eq!(parse_rfc3339_utc(&s), Some(v), "roundtrip {s}");
+    }
+}
+
+/// F-001 regression: a CI Check event must carry the actual run timestamp in
+/// RFC3339 UTC — the fold's `ci_ts` must expose that same run time, never the
+/// hard-coded 1970 epoch placeholder.
+#[test]
+fn ci_check_event_uses_run_time_timestamp_not_epoch() {
+    let ev = Event::new(
+        EventKind::CiCheck,
+        "pr",
+        1,
+        "ci@example.com",
+        body_with(vec![
+            ("status", JsonValue::String("success".into())),
+            ("plan", JsonValue::String(".forge/ci.sh".into())),
+        ]),
+    );
+    assert_ne!(
+        ev.ts, "1970-01-01T00:00:00Z",
+        "CI Check ts must not be the hard-coded epoch placeholder"
+    );
+    let parsed = parse_rfc3339_utc(&ev.ts).expect("CI Check ts must be RFC3339 UTC");
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    assert!(
+        (parsed - now).abs() < 60,
+        "CI Check ts must be ~the run time (parsed {parsed}, now {now}, ts {})",
+        ev.ts
+    );
+    // The fold exposes the same run time through PrState::ci_ts.
+    let state = fold(std::slice::from_ref(&ev));
+    assert_eq!(state.pr.ci_ts.as_deref(), Some(ev.ts.as_str()));
+}

@@ -1,7 +1,7 @@
 //! t2 PR integration tests. Run the built `git-forge` binary as a subprocess
 //! inside an isolated temp git repository.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn tmpdir(tag: &str) -> PathBuf {
@@ -1076,6 +1076,129 @@ fn head_event(dir: &PathBuf, pr: u64) -> String {
     event
 }
 
+/// Parse `YYYY-MM-DDTHH:MM:SSZ` (RFC3339 UTC) into seconds since the Unix
+/// epoch — the independent test oracle for the CI Check run-time timestamp.
+fn parse_rfc3339_utc(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() != 20
+        || b[4] != b'-'
+        || b[7] != b'-'
+        || b[10] != b'T'
+        || b[13] != b':'
+        || b[16] != b':'
+        || b[19] != b'Z'
+    {
+        return None;
+    }
+    let num = |r: std::ops::Range<usize>| -> Option<i64> {
+        let mut n = 0i64;
+        for &c in &b[r] {
+            if !c.is_ascii_digit() {
+                return None;
+            }
+            n = n * 10 + (c - b'0') as i64;
+        }
+        Some(n)
+    };
+    let year = num(0..4)?;
+    let month = num(5..7)?;
+    let day = num(8..10)?;
+    let hour = num(11..13)?;
+    let min = num(14..16)?;
+    let sec = num(17..19)?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) || hour > 23 || min > 59 || sec > 60 {
+        return None;
+    }
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = if month > 2 { month - 3 } else { month + 9 };
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146097 + doe - 719468;
+    Some(days * 86400 + hour * 3600 + min * 60 + sec)
+}
+
+/// Write an executable `git` shim into a fresh temp dir and return the dir.
+/// The script defines `REAL_GIT`, runs `body`, then falls through to
+/// `exec "$REAL_GIT" "$@"`. Used to deterministically fail/record specific
+/// `git` calls during a `ci run` (F-002/F-003).
+fn make_git_shim(tag: &str, body: &str) -> PathBuf {
+    let dir = tmpdir(tag);
+    let which = Command::new("sh")
+        .arg("-c")
+        .arg("command -v git")
+        .output()
+        .unwrap();
+    let real_git = String::from_utf8_lossy(&which.stdout).trim().to_string();
+    assert!(!real_git.is_empty(), "could not resolve real git path");
+    let script = format!("#!/bin/sh\nREAL_GIT=\"{real_git}\"\n{body}\nexec \"$REAL_GIT\" \"$@\"\n");
+    std::fs::write(dir.join("git"), script).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(dir.join("git"), std::fs::Permissions::from_mode(0o755)).unwrap();
+    dir
+}
+
+/// Run the git-forge binary with an optional PATH shim (its dir prepended to
+/// PATH) and extra env vars, in `dir`.
+fn run_forge(
+    dir: &Path,
+    shim: Option<&Path>,
+    envs: &[(&str, &str)],
+    args: &[&str],
+) -> (i32, String, String) {
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let mut cmd = Command::new(bin);
+    cmd.args(args).current_dir(dir);
+    if let Some(s) = shim {
+        let mut path = s.display().to_string();
+        if let Ok(p) = std::env::var("PATH") {
+            path.push(':');
+            path.push_str(&p);
+        }
+        cmd.env("PATH", &path);
+    }
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    )
+}
+
+/// Assert no CI temp worktree remains registered: `git worktree list
+/// --porcelain` must not contain the disposable `git-forge-pr1-ci` path.
+fn assert_no_ci_worktree(dir: &Path) {
+    let (wl, out, _) = git(&dir.to_path_buf(), &["worktree", "list", "--porcelain"]);
+    assert_eq!(wl, 0, "worktree list must succeed");
+    assert!(
+        !out.contains("git-forge-pr1-ci"),
+        "CI temp worktree left behind: {out}"
+    );
+}
+
+/// Best-effort hygiene for the F-002/F-003 regression tests: remove the
+/// leftover CI worktree (registered under the `git-forge-pr1-ci` pattern)
+/// using the REAL git — the run that produced it ran under a shim, so this
+/// must not go through that shim.
+fn remove_leftover_ci_worktree(dir: &Path) {
+    let (wl, out, _) = git(&dir.to_path_buf(), &["worktree", "list", "--porcelain"]);
+    assert_eq!(wl, 0, "worktree list must succeed");
+    for line in out.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            if p.contains("git-forge-pr1-ci") {
+                let (r, _, er) = git(&dir.to_path_buf(), &["worktree", "remove", "--force", p]);
+                assert!(r == 0, "hygiene worktree remove failed: {er}");
+                return;
+            }
+        }
+    }
+    panic!("expected a leftover CI worktree to clean; list: {out}");
+}
+
 /// VAL-001: a passing plan records a CI Check `success`, the command exits 0,
 /// and the developer's working tree + current branch are unchanged.
 #[test]
@@ -1104,7 +1227,15 @@ fn ci_run_success_records_success_and_leaves_worktree_unchanged() {
     let before_branch = git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).1;
     let before_main = git(&dir, &["rev-parse", "refs/heads/main"]).1;
 
+    let t0 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
     let (c, o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    let t1 = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
     assert_eq!(c, 0, "ci run must exit 0 on a passing plan: {e}");
     assert!(o.contains("passed"), "ci run output: {o}");
 
@@ -1115,6 +1246,22 @@ fn ci_run_success_records_success_and_leaves_worktree_unchanged() {
     assert!(
         event.contains("\"actor\":\"ci@example.com\""),
         "actor: {event}"
+    );
+    // F-001: the persisted CI Check ts must be the actual RFC3339 UTC run
+    // time, never the hard-coded 1970 epoch placeholder.
+    let ts = event
+        .split("\"ts\":\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .expect("persisted event must carry a ts field");
+    assert_ne!(
+        ts, "1970-01-01T00:00:00Z",
+        "persisted CI Check ts must not be epoch: {event}"
+    );
+    let ts_secs = parse_rfc3339_utc(ts).expect("persisted CI Check ts must be RFC3339 UTC");
+    assert!(
+        ts_secs >= t0 && ts_secs <= t1,
+        "persisted CI Check ts {ts} must fall in the run window [{t0},{t1}]"
     );
 
     // The fold exposes the latest CI status on the PR chain (readable via show).
@@ -1241,4 +1388,92 @@ fn ci_help_lists_run_subcommand() {
     assert_eq!(c, 0, "ci --help failed: {e}");
     assert!(o.contains("usage: git forge ci"), "help head: {o}");
     assert!(o.contains("run"), "help missing 'run': {o}");
+}
+
+/// Make a PR with a passing `.forge/ci.sh` plan and a `feature` branch.
+fn make_passing_ci_pr(dir: &PathBuf) {
+    init_repo(dir);
+    git(dir, &["config", "user.email", "ci@example.com"]);
+    git(dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    std::fs::write(dir.join(".forge").join("ci.sh"), "#!/bin/bash\nexit 0\n").unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-q", "-m", "feature + passing ci plan"]);
+    git(dir, &["checkout", "-q", "main"]);
+    let (c, o, e) = forge(
+        dir,
+        &[
+            "forge", "pr", "create", "--source", "feature", "--base", "main", "PR1",
+        ],
+    );
+    assert_eq!(c, 0, "pr create failed: {e} {o}");
+}
+
+/// F-003 regression: a zero exit from `git worktree remove --force` must NOT
+/// be taken as proof of cleanup when the directory survives (deterministic
+/// no-op-removal). `ci run` must fail and report the leftover, never print
+/// `passed`.
+#[test]
+fn ci_run_reports_leftover_when_worktree_remove_is_noop() {
+    let dir = tmpdir("ci-noremove");
+    make_passing_ci_pr(&dir);
+    let shim = make_git_shim(
+        "ci-noremove-shim",
+        "if [ \"$1\" = \"-C\" ] && [ \"$3\" = \"worktree\" ] && [ \"$4\" = \"remove\" ]; then\n\
+         \x20 exit 0\n\
+         fi",
+    );
+    let (c, o, e) = run_forge(&dir, Some(&shim), &[], &["forge", "ci", "run", "1"]);
+    assert_ne!(
+        c, 0,
+        "leftover worktree must fail ci run (got stdout {o:?})"
+    );
+    assert!(
+        e.contains("temp worktree directory still exists"),
+        "stderr must report the leftover directory: {e}"
+    );
+    assert!(
+        e.contains("worktree left at"),
+        "stderr must name the path: {e}"
+    );
+    assert!(!o.contains("passed"), "must not claim success: {o}");
+    remove_leftover_ci_worktree(&dir);
+    assert_no_ci_worktree(&dir);
+}
+
+/// F-002 regression: when recording the CI Check fails, the cleanup must not
+/// silently discard a concurrent `worktree remove` failure — both the append
+/// error AND the removal leftover path must be surfaced.
+#[test]
+fn ci_run_append_failure_reports_removal_failure() {
+    let dir = tmpdir("ci-appendfail");
+    make_passing_ci_pr(&dir);
+    let shim = make_git_shim(
+        "ci-appendfail-shim",
+        "if [ \"$1\" = \"--git-dir\" ] && [ \"$3\" = \"update-ref\" ]; then\n\
+         \x20 echo \"fatal: append disabled by test shim\" >&2\n\
+         \x20 exit 1\n\
+         fi\n\
+         if [ \"$1\" = \"-C\" ] && [ \"$3\" = \"worktree\" ] && [ \"$4\" = \"remove\" ]; then\n\
+         \x20 echo \"fatal: worktree remove disabled by test shim\" >&2\n\
+         \x20 exit 1\n\
+         fi",
+    );
+    let (c, _o, e) = run_forge(&dir, Some(&shim), &[], &["forge", "ci", "run", "1"]);
+    assert_ne!(c, 0, "append failure must fail ci run");
+    assert!(
+        e.contains("recording the CI Check failed"),
+        "append error must be reported: {e}"
+    );
+    assert!(
+        e.contains("temp worktree removal failed"),
+        "removal failure must NOT be discarded: {e}"
+    );
+    assert!(
+        e.contains("worktree left at"),
+        "removal failure must name the leftover path: {e}"
+    );
+    remove_leftover_ci_worktree(&dir);
+    assert_no_ci_worktree(&dir);
 }

@@ -862,25 +862,41 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
     body.insert("status".into(), json_str(status));
     body.insert("plan".into(), json_str(&plan));
     let ev = Event::new(EventKind::CiCheck, "pr", id, &actor, body);
-    if let Err(e) = store.append_event(&head, &ev) {
-        release_lock(&mut lock_handle, &tmp);
-        let _ = crate::git::worktree_remove(&repo_dir, &tmp);
-        return Err(format!(
-            "CI run completed but recording the CI Check failed: {e}"
-        ));
-    }
+    // Record the outcome — a failing plan still appends a `failure` CI Check
+    // (VAL-002) before the command exits nonzero.
+    let append = store.append_event(&head, &ev);
 
-    // Clean up the temp worktree regardless of the plan outcome.
-    let remove_err = crate::git::worktree_remove(&repo_dir, &tmp).err();
+    // Clean up the temp worktree regardless of the plan/append outcome,
+    // holding the sibling lock until the worktree is removed AND verified
+    // gone (directory absent + path unregistered), mirroring the merge-path
+    // postconditions (F-002/F-003): a leftover is reported, never silently
+    // discarded, and success is never claimed over a still-present worktree.
+    let leftover = crate::git::worktree_remove(&repo_dir, &tmp)
+        .err()
+        .map(|e| format!("temp worktree removal failed: {e}"))
+        .or_else(|| {
+            let (ok, list, err_l) = crate::git::worktree_list_raw(&repo_dir);
+            if tmp.exists() {
+                Some("temp worktree directory still exists".to_string())
+            } else if !ok {
+                Some(format!("worktree verification failed: {err_l}"))
+            } else if list.contains(&tmp.to_string_lossy().to_string()) {
+                Some("temp worktree still registered".to_string())
+            } else {
+                None
+            }
+        })
+        .map(|reason| format!("{reason} (worktree left at {})", tmp.display()));
     release_lock(&mut lock_handle, &tmp);
 
-    if let Some(err_rm) = remove_err {
-        return Err(format!(
-            "CI run recorded {status} but temp worktree removal failed: {err_rm} \
-             (worktree left at {})",
-            tmp.display()
-        ));
+    if let Some(leftover) = leftover {
+        let prefix = match append.as_ref().err() {
+            Some(ar) => format!("CI run completed but recording the CI Check failed: {ar};"),
+            None => format!("CI run recorded {status} but"),
+        };
+        return Err(format!("{prefix} temp worktree cleanup failed: {leftover}"));
     }
+    append.map_err(|e| format!("CI run completed but recording the CI Check failed: {e}"))?;
 
     if script_status == Some(0) {
         Ok(format!("CI run for PR #{id} passed ({plan})"))

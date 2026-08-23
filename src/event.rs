@@ -137,6 +137,44 @@ fn uuid_v4_from_seed(seed: u64) -> String {
     )
 }
 
+/// Current system time as an RFC3339 UTC timestamp, seconds granularity
+/// (`YYYY-MM-DDTHH:MM:SSZ`). The v1 event schema contract is `"ts":
+/// "<RFC3339 UTC>"`; a std-only epoch→civil conversion keeps the schema
+/// dependency-free (no chrono).
+fn rfc3339_utc_now() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    format_rfc3339_utc(secs)
+}
+
+/// Format seconds-since-epoch as RFC3339 UTC `YYYY-MM-DDTHH:MM:SSZ`.
+fn format_rfc3339_utc(secs: u64) -> String {
+    let days = (secs / 86_400) as i64;
+    let secs_of_day = secs % 86_400;
+    let (y, m, d) = civil_from_days(days);
+    let h = secs_of_day / 3600;
+    let min = (secs_of_day % 3600) / 60;
+    let s = secs_of_day % 60;
+    format!("{y:04}-{m:02}-{d:02}T{h:02}:{min:02}:{s:02}Z")
+}
+
+/// Days-since-1970-01-01 → proleptic-Gregorian `(year, month, day)`, the
+/// inverse of the standard days-from-civil algorithm (Howard Hinnant).
+fn civil_from_days(z: i64) -> (i64, u32, u32) {
+    let z = z + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = yoe as i64 + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
 impl Event {
     /// Creates an event with a UUID-v4-shaped id from a std-only seed.
     /// The seed is not a cryptographic entropy source; production id
@@ -159,7 +197,7 @@ impl Event {
             kind,
             entity: entity.to_string(),
             entity_id,
-            ts: "1970-01-01T00:00:00Z".to_string(),
+            ts: rfc3339_utc_now(),
             actor: actor.to_string(),
             body,
         }
@@ -184,7 +222,7 @@ impl Event {
             kind,
             entity: entity.to_string(),
             entity_id,
-            ts: "1970-01-01T00:00:00Z".to_string(),
+            ts: rfc3339_utc_now(),
             actor: actor.to_string(),
             body,
         })
