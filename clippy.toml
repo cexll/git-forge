@@ -1,0 +1,6 @@
+# Clippy thresholds — enforced by `just lint` (and pre-commit) via
+# `-D clippy::cognitive_complexity -D clippy::too_many_lines`.
+# Values are the repo's declared size_limits (constraints.yaml). Raising them
+# is a size_limits change, not a lint-local edit.
+cognitive-complexity-threshold = 15
+too-many-lines-threshold = 150

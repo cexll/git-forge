@@ -79,6 +79,7 @@ fn ref_oid(dir: &PathBuf, r: &str) -> Option<String> {
 }
 
 #[test]
+#[allow(clippy::cognitive_complexity)]
 fn pr_create_show_snapshot() {
     let dir = tmpdir("create");
     init_repo(&dir);

@@ -214,3 +214,12 @@ Recorded in `docs/adr/`:
 - L2: single-file export format (`git forge export project.forge`) — SQLite snapshot vs bundle.
 - L2: CI plan format (shell script in repo vs config file) and status event schema.
 - L2: web UI surface (read-only browse vs write paths).
+
+## Known Limitations
+
+- The L1 merge gate is command-level only; direct `git merge` bypasses it. Bare-remote pre-receive enforcement is L2 (ADR-0003).
+- L1 PRs are one-shot immutable snapshots; there is no `pr.update` to amend a PR's commit set (ADR-0006).
+- Stale-base rejection is L1: if `refs/heads/<base>` moves after `pr.created`, the merge refuses and the PR must be recreated (live-base merge is L2).
+- Identity is resolved through the `git` binary before any write, never a libgit2 `repo.config()` read — that path can SIGSEGV on a config corrupted after `Repository::open` (VAL-115). The trade-off is git-binary spawn cost per write.
+- `git forge pr merge` refuses while `base_ref` is checked out in any non-temporary worktree; safe post-merge worktree refresh is L2.
+- The test-only `GIT_FORGE_TEST_MERGE_BARRIER` seam exists only in test/debug builds and is ignored in release.

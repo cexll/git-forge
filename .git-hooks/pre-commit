@@ -9,5 +9,6 @@ bash "$(dirname "$0")/check-naming.sh"
 # before that, product checks are unavailable and reported by `just check`.
 if [ -f Cargo.toml ]; then
   cargo fmt --check
-  cargo clippy --all-targets -- -D warnings
+  cargo clippy --all-targets -- -D warnings -D clippy::cognitive_complexity -D clippy::too_many_lines
+  cargo machete
 fi

@@ -14,6 +14,10 @@ use crate::store::{BoundEventStore, EventStore};
 /// the immutable snapshot (`source_head` → `base_ref` tip) via the git binary
 /// in a temporary worktree, and atomically finalize: delete pending result
 /// ref + CAS base branch + CAS PR head chain in ONE ref transaction.
+//
+// Baseline exemption (removal trigger in constraints.yaml baseline.lint_allow):
+// the sole lib/src function over the 150-line clippy::too_many_lines threshold.
+#[allow(clippy::too_many_lines)]
 pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String, String> {
     let mut id_arg = None;
     let mut strategy: Option<&str> = None; // merge | squash | rebase

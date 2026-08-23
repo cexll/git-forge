@@ -680,6 +680,7 @@ fn merge_flag_parser_accepts_explicit_and_rejects_conflicts() {
 }
 
 #[test]
+#[allow(clippy::cognitive_complexity)]
 fn worktree_removal_failure_reports_and_cleans_pending_ref() {
     let dir = tmpdir("rmfail");
     init_repo(&dir);
@@ -754,6 +755,7 @@ fn worktree_removal_failure_reports_and_cleans_pending_ref() {
 }
 
 #[test]
+#[allow(clippy::cognitive_complexity)]
 fn seam_lock_failure_releases_lock_and_cleans_pending_ref() {
     // F-019 regression: when the debug seam's own `git worktree lock` call
     // fails (shim forces it), the merge must route through the shared cleanup

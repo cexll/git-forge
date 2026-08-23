@@ -1,2 +1,4 @@
 /target/
 .DS_Store
+# Python bytecode cache from the repo's tracked gate scripts (scripts/*.py)
+__pycache__/

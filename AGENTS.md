@@ -113,6 +113,11 @@ git config core.hooksPath .git-hooks   # one-time hook install
 > tokei makes `size-gate` exit 1 with `tokei missing — run brew install tokei` so a fresh clone
 > fails loudly instead of silently passing the size gate.
 
+> **Prerequisite — cargo-machete (required, not auto-installed):** the blocking `just deps-check`
+> drives off `cargo-machete`, installed once via `cargo install cargo-machete`. `just setup` does
+> not install it; a missing command makes `deps-check` exit non-zero with cargo's
+> "no such command" error, so a fresh clone fails loudly instead of silently passing the gate.
+
 > **Prerequisite — GDOGFOOD_SRC for `just e2e` / `just dogfood-all` / `just dogfood`:** scripts/gf-dogfood.sh dogfoods a
 > disposable clone of `$GDOGFOOD_SRC` (default /Users/chenwenjie/workspaces/dsh-deepwork).
 > The path must exist, be a git repository, resolve to that repository's canonical worktree root
@@ -150,18 +155,21 @@ All commands route through `justfile`. Do not invent ad-hoc commands; add missin
 | Surface | Verify with | Command | Evidence required |
 |---------|-------------|---------|-------------------|
 | Format | rustfmt check | `just fmt-check` | exit 0 |
-| Lint | clippy `-D warnings` | `just lint` | exit 0 |
+| Lint | clippy `-D warnings` + `clippy::cognitive_complexity`/`too_many_lines` (thresholds in `clippy.toml`) | `just lint` | exit 0 |
 | Unit tests | cargo test --lib | `just unit` | exit 0 + test names |
 | All tests | cargo test --all-targets | `just test` | exit 0 |
-| E2E (real surfaces, both default branches) | tests/t2_pr.rs + tests/t3_merge.rs integration (via `just test`, independent surface) + scripts/gf-dogfood.sh + scripts/gf-dogfood-main-default.sh + tests/dogfood-eval-injection-regression.sh (SEC-01, part of gate) | `just e2e` (= `just dogfood-all`) | exit 0; two `DOGFOOD SUMMARY pass=45 fail=0` lines + SEC-01 regression prints no injection marker |
+| E2E (real surfaces, both default branches) | tests/t2_pr.rs + tests/t3_merge.rs integration (via `just test`, independent surface) + scripts/gf-dogfood.sh + scripts/gf-dogfood-main-default.sh + tests/dogfood-eval-injection-regression.sh (SEC-01, part of gate) | `just e2e` | exit 0; two `DOGFOOD SUMMARY pass=45 fail=0` lines + SEC-01 regression prints no injection marker |
 | Coverage | llvm-cov ≥94% lines | `just coverage` | report ≥ threshold |
 | Guardrails | scripts/test-guardrails.sh | `just test-guardrails` | 5/5 pass (accept clean, reject violation, size-gate hostile-config regression) |
 | Size gate | tokei per-file code lines over src/ | `just size-gate` | exit 0; non-zero if any src/ file exceeds 800 code lines (wired into `just check`) |
 | Decision records | scripts/check-decisions.py | `just decisions-check` | exit 0 |
+| Unused dependencies | cargo-machete | `just deps-check` | exit 0 |
+| Rendered harness | check_rendered_harness.py (AGENTS.md sections/matrix/enforcement/mirror) | `just harness-check` | exit 0 |
+| Documentation gate | check_docs.py (wire-contract Known Limitations + doc cross-refs) | `just docs-check` | exit 0 |
 | CLI surface | built binary run | `just verify-cli` | exit code + --help output |
 
 - Every row resolves to a real justfile target. A surface with no verification command is review-only and the change must say so.
-- The root `Cargo.toml` is the real manifest (`event`, `fold`, `store`, `cli`, `git`, `main` + the t0–t3 integration tests all landed; `just check` runs fmt/lint/test/guardrails/decisions/size-gate for real).
+- The root `Cargo.toml` is the real manifest (`event`, `fold`, `store`, `cli`, `git`, `main` + the t0–t3 integration tests all landed; `just check` runs fmt/lint/deps/test/guardrails/decisions/size-gate/harness/docs for real).
 
 ## Conventions
 
@@ -203,15 +211,19 @@ White-box review required for changes touching these (L3): `src/store.rs` (git2 
 | Rule | Where | Checked by | Level |
 |------|-------|------------|-------|
 | rustfmt `--check` | pre-commit + just check | `.git-hooks/pre-commit`, `just fmt-check` | block |
-| clippy `-D warnings` | pre-commit + just check | `.git-hooks/pre-commit`, `just lint` | block |
+| clippy `-D warnings` + `clippy::cognitive_complexity`/`too_many_lines` (thresholds in `clippy.toml`) | pre-commit + just check | `.git-hooks/pre-commit`, `just lint` | block |
 | Naming guard (forbidden suffixes, scratchpad dirs) | pre-commit | `.git-hooks/pre-commit` runs `.git-hooks/check-naming.sh` | block |
 | Guardrail self-test | just check | `just test-guardrails` (accept clean, reject violation) | block |
 | Decision-record structure | just check | `just decisions-check` (scripts/check-decisions.py) | block |
 | File ≤800 code lines (src/) | just check | `just size-gate` (tokei) | block |
+| Unused `[dependencies]` (cargo-machete) | pre-commit + just check | `.git-hooks/pre-commit`, `just deps-check` | block |
+| Rendered harness drift (AGENTS.md sections/matrix/enforcement/mirror) | just check | `just harness-check` | block |
+| Doc cross-refs + Known Limitations | just check | `just docs-check` | block |
 | Devflow receipt integrity | devflow scheduler | `just devflow ARGS=end-feature` (git hard checks) | block |
 | Coverage ≥94% lines | standalone | `just coverage` (llvm-cov) | review-only |
 | TDD red→green | review | Code Review Self-Check | review-only |
-| Complexity ≤15 / fn ≤150 lines | review | review checklist | review-only |
+| Complexity ≤15 / fn ≤150 lines | pre-commit + just check | `.git-hooks/pre-commit`, `just lint` | block |
 | PR diff ≤400 lines | review | review checklist | review-only |
 | Conventional commits | review | review checklist | review-only |
-| Duplicate/dead code | review | review checklist | review-only |
+| Dead code / unused deps (`rustc` dead_code + cargo-machete) | pre-commit + just check | `.git-hooks/pre-commit`, `just lint`, `just deps-check` | block |
+| Duplicate code | review | review checklist | review-only |

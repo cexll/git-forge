@@ -14,7 +14,7 @@ setup:
 # pre-commit/just-check, and there is no CI runner to host it as a blocking
 # gate; it stays a standalone review-only check for single-user local dev (see
 # constraints.yaml downgrades).
-check: fmt-check lint test test-guardrails decisions-check size-gate
+check: fmt-check lint deps-check test test-guardrails decisions-check size-gate harness-check docs-check
     echo "fast checks passed"
 
 # Format
@@ -26,7 +26,26 @@ fmt:
 
 # Lint (L3 block)
 lint:
-    @if [ -f Cargo.toml ]; then cargo clippy --all-targets -- -D warnings; else echo "lint: no Cargo.toml yet — lands with devflow t0"; fi
+    @if [ -f Cargo.toml ]; then cargo clippy --all-targets -- -D warnings -D clippy::cognitive_complexity -D clippy::too_many_lines; else echo "lint: no Cargo.toml yet — lands with devflow t0"; fi
+
+# Unused-dependency gate (class B, block): cargo-machete exits non-zero on an
+# unused [dependencies] entry. Previously the unused_dependencies criterion was
+# review-only.
+deps-check:
+    @if [ -f Cargo.toml ]; then cargo machete; else echo "deps-check: no Cargo.toml yet — lands with devflow t0"; fi
+
+# Rendered eng-init harness validation (agents_md_validation): proves that
+# AGENTS.md Verification Matrix commands, Enforcement Index paths, and the
+# constraints.yaml verification mirror all still resolve. Owns the
+# check_rendered_harness.py gate.
+harness-check:
+    @python3 scripts/check_rendered_harness.py . --require-section "Verification Matrix" --require-section "Code Canonicality" --require-enforcement-index --require-generated-section-registry --forbid-root-backups
+
+# Documentation gate (documentation_gates): fails when the wire contract loses
+# its Known Limitations section or a doc cross-reference points at a missing
+# file. Content drift stays review-only; structural drift blocks.
+docs-check:
+    @python3 scripts/check_docs.py
 
 # ── Size gate (L3: block) ───────────────────────────────────────
 # Per-file cap: every src/ file must stay at or under 800 code lines

@@ -12,24 +12,16 @@ strictness_profile:
     # L3 profile-blocked limits that are NOT machine-enforced in this repo —
     # recorded honestly as review-only rather than falsely claimed as blocking.
     # These are tool-availability gaps, not user relaxations; all are repo-correctable
-    # (add a complexity gate / commitlint / PR CI) without changing the profile.
-    # size_limits.max_file_lines is NOT listed: converted review-only → block in f3
-    # (just size-gate + tokei wired into just check; removal trigger fulfilled).
+    # (add a PR CI / commitlint) without changing the profile.
+    # NOT listed (converted review-only → block): size_limits.max_file_lines (just
+    # size-gate), size_limits.max_complexity + max_function_lines (clippy
+    # ::cognitive_complexity / ::too_many_lines at -D warnings), anti_drift.dead_code
+    # (rustc dead_code under -D warnings + cargo-machete for unused deps).
     - control: testing.min_line_coverage
       profile_default: block (94)
       chosen: review-only
       reason: "llvm-cov is a slow instrumented build (~50s) unsuitable for pre-commit/just-check, and there is no CI runner to host it as a blocking gate; it stays a standalone review-only check for single-user local dev"
       removal_trigger: "a CI runner (or equivalent) is wired to run `just coverage` as a blocking aggregate gate — not the first product commit, which has long since landed"
-    - control: size_limits.max_complexity
-      profile_default: block (15)
-      chosen: review-only
-      reason: "clippy::cognitive_complexity is allow-by-default; not gated"
-      removal_trigger: "add clippy::cognitive_complexity to -D warnings in just lint"
-    - control: size_limits.max_function_lines
-      profile_default: block (150)
-      chosen: review-only
-      reason: "clippy too_many_lines not gated at -D warnings"
-      removal_trigger: "add clippy::too_many_lines to -D warnings in just lint"
     - control: size_limits.max_pr_diff_lines
       profile_default: block (400)
       chosen: review-only
@@ -45,11 +37,6 @@ strictness_profile:
       chosen: review-only
       reason: "no Rust duplicate-code detector installed"
       removal_trigger: "install a Rust duplicate-code detector (e.g. SonarQube, manual review→tool)"
-    - control: anti_drift.dead_code_min_confidence
-      profile_default: block (80)
-      chosen: review-only
-      reason: "cargo-machete not installed"
-      removal_trigger: "install cargo-machete or cargo-udeps and wire into just lint"
   # Every row above stays L3-profile-valid; the gate is the honest gap, not a
   # silent relaxation. Re-eng-init or add tooling to convert review-only→block.
 
@@ -118,10 +105,6 @@ code_canonicality:
     enforced_by: ".git-hooks/check-naming.sh + .gitignore"
 
 # ── Size Limits (L3) ───────────────────────────────────────────
-# Honest severity: clippy -D warnings blocks; file-line count is now
-# machine-enforced by just size-gate (tokei, wired into just check). Complexity
-# and function-line limits remain review-only — clippy::cognitive_complexity /
-# too_many_lines are not gated.
 size_limits:
   max_file_lines:
     value: 800
@@ -129,12 +112,12 @@ size_limits:
     enforced_by: "just size-gate (tokei)"
   max_complexity:
     value: 15
-    severity: "review-only"          # clippy::cognitive_complexity is allow-by-default; not gated
-    enforced_by: "PR review only (no gate wired)"
+    severity: "block"          # clippy::cognitive_complexity gated at -D warnings (threshold 15, clippy.toml)
+    enforced_by: "just lint + pre-commit: clippy -D clippy::cognitive_complexity"
   max_function_lines:
     value: 150
-    severity: "review-only"          # clippy too_many_lines non-gated
-    enforced_by: "PR review only (no gate wired)"
+    severity: "block"          # clippy too_many_lines gated at -D warnings (threshold 150, clippy.toml)
+    enforced_by: "just lint + pre-commit: clippy -D clippy::too_many_lines"
   max_pr_diff_lines:
     value: 400
     severity: "review-only"          # no remote PR CI
@@ -171,8 +154,8 @@ anti_drift:
     enforced_by: "PR review only (no tool wired)"
   dead_code_min_confidence:
     value: 80
-    severity: "review-only"          # cargo-machete not installed — honest gap
-    enforced_by: "PR review only (no tool wired)"
+    severity: "block"                # within-crate dead code via rustc dead_code under clippy -D warnings; unused deps via cargo-machete
+    enforced_by: "just lint + pre-commit (rustc dead_code under -D warnings) + just deps-check (cargo machete)"
 
 # ── Commit Discipline ───────────────────────────────────────────
 commits:
@@ -204,7 +187,7 @@ verification:
       required_at: "L2+"
     lint:
       command: "just lint"
-      evidence: "exit-0 (clippy -D warnings)"
+      evidence: "exit-0 (clippy -D warnings, incl. clippy::cognitive_complexity + too_many_lines at clippy.toml thresholds)"
       required_at: "L3"
     fmt:
       command: "just fmt-check"
@@ -230,6 +213,21 @@ verification:
       evidence: "tokei json over src/; exit 0 iff every src/ file <= 800 code lines; wired into just check (block)"
       required_at: "L3"
       level: "block"
+    deps:
+      command: "just deps-check"
+      evidence: "cargo-machete exits 0 (no unused [dependencies] entry); wired into just check (block)"
+      required_at: "L3"
+      level: "block"
+    harness:
+      command: "just harness-check"
+      evidence: "check_rendered_harness.py exits 0 — AGENTS.md required sections, Verification Matrix commands, Enforcement Index paths, and the constraints.yaml verification mirror all resolve"
+      required_at: "L3"
+      level: "block"
+    docs:
+      command: "just docs-check"
+      evidence: "check_docs.py exits 0 — wire-contract Known Limitations present and doc cross-references resolve to real files"
+      required_at: "L3"
+      level: "block"
   enforced_by: "Stage 4 matrix-to-target check over constraints.yaml + AGENTS.md Verification Matrix"
 
 # ── Exemptions ──────────────────────────────────────────────────
@@ -245,6 +243,27 @@ baseline:
     dead_code: 0
     size_violations: 0
     coverage_gap: 0
+  lint_allow:
+    # Scoped `#[allow]` baseline exemptions: the repo's clippy thresholds are now
+    # enforced at -D warnings (size_limits), and these are the only legacy
+    # violations. Each names the refactor that closes it; delete the #[allow]
+    # and this entry together when the function is split / scenario broken up.
+    - control: clippy::too_many_lines
+      target: "src/pr_merge.rs::cmd_pr_merge"
+      reason: "single 240-line merge orchestration boundary; splitting into step helpers is a critical-path refactor"
+      removal_trigger: "cmd_pr_merge split below 150 lines (then delete the #[allow] and this entry)"
+    - control: clippy::cognitive_complexity
+      target: "tests/t2_pr.rs::pr_create_show_snapshot"
+      reason: "long branchy PR-create scenario test (16 > 15)"
+      removal_trigger: "break the scenario into helper fns (then delete the #[allow] and this entry)"
+    - control: clippy::cognitive_complexity
+      target: "tests/t3_merge.rs::worktree_removal_failure_reports_and_cleans_pending_ref"
+      reason: "long worktree-removal failure-path scenario test (16 > 15)"
+      removal_trigger: "break the scenario into helper fns (then delete the #[allow] and this entry)"
+    - control: clippy::cognitive_complexity
+      target: "tests/t3_merge.rs::seam_lock_failure_releases_lock_and_cleans_pending_ref"
+      reason: "long seam-lock failure-path scenario test (17 > 15)"
+      removal_trigger: "break the scenario into helper fns (then delete the #[allow] and this entry)"
   enforced_by: "no CI baseline step needed — all counts 0 (fix-now disposition)"
 
 # ── Rehabilitation State ────────────────────────────────────────
