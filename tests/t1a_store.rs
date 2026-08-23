@@ -427,7 +427,11 @@ fn counter_collision_aborts_without_partial_state() {
     );
 }
 
+// Both the pr.created and the pending ci.check payloads are asserted directly,
+// so this grew past the default cognitive-complexity threshold; consistent with
+// the suite's other multi-assertion tests.
 #[test]
+#[allow(clippy::cognitive_complexity)]
 fn create_pr_creates_head_meta_source_base_atomically() {
     let dir = tmpdir("pralloc");
     let store = bound(&dir);
@@ -468,8 +472,9 @@ fn create_pr_creates_head_meta_source_base_atomically() {
         .unwrap();
     assert_eq!(id, 1, "first PR gets id 1");
 
-    // head and meta point at the SAME pr.created event commit; source/base pin
-    // the immutable snapshot OIDs.
+    // /meta stays pinned at the immutable pr.created snapshot; /head advances
+    // one commit past it to the pending ci.check child (F-006 publishes both in
+    // the same atomic transaction, so a failed publication changes neither).
     let head_tip = repo
         .find_reference(&pr_head_ref(1))
         .unwrap()
@@ -480,18 +485,67 @@ fn create_pr_creates_head_meta_source_base_atomically() {
         .unwrap()
         .target()
         .unwrap();
-    assert_eq!(
+    assert_ne!(
         head_tip, meta_tip,
-        "head must equal meta (same snapshot commit)"
+        "head must advance past the pr.created snapshot (pending ci.check)"
     );
-    let head_commit = repo.find_commit(head_tip).unwrap();
+
+    // /meta is the pr.created snapshot commit: sole parent = genesis root, and
+    // its event payload carries the snapshot fields.
+    let meta_commit = repo.find_commit(meta_tip).unwrap();
     assert_eq!(
-        head_commit.parent_ids().count(),
+        meta_commit.parent_ids().count(),
         1,
         "pr.created commit's parent is the genesis root"
     );
-    // The event payload carries the snapshot fields.
-    let body = git_forge::event::Event::from_json(
+    let meta_body = git_forge::event::Event::from_json(
+        std::str::from_utf8(
+            meta_commit
+                .tree()
+                .unwrap()
+                .get_path(std::path::Path::new(".forge/event.json"))
+                .unwrap()
+                .to_object(repo)
+                .unwrap()
+                .as_blob()
+                .unwrap()
+                .content(),
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(meta_body.kind, EventKind::PrCreated);
+    assert_eq!(meta_body.entity_id, 1);
+    assert_eq!(
+        meta_body.body.get("title").unwrap().as_str(),
+        Some("PR title")
+    );
+    let source_head_s = head.to_string();
+    let base_head_s = base.to_string();
+    let merge_base_s = merge_base.to_string();
+    assert_eq!(
+        meta_body.body.get("source_head").unwrap().as_str(),
+        Some(source_head_s.as_str())
+    );
+    assert_eq!(
+        meta_body.body.get("base_head").unwrap().as_str(),
+        Some(base_head_s.as_str())
+    );
+    assert_eq!(
+        meta_body.body.get("merge_base").unwrap().as_str(),
+        Some(merge_base_s.as_str())
+    );
+
+    // /head is the pending ci.check child: sole parent is the pr.created commit
+    // (/meta), and its event payload records the pending CI Check marker.
+    let head_commit = repo.find_commit(head_tip).unwrap();
+    let head_parents: Vec<_> = head_commit.parent_ids().collect();
+    assert_eq!(head_parents.len(), 1, "ci.check commit has one parent");
+    assert_eq!(
+        head_parents[0], meta_tip,
+        "ci.check's parent is the pr.created commit"
+    );
+    let head_body = git_forge::event::Event::from_json(
         std::str::from_utf8(
             head_commit
                 .tree()
@@ -507,24 +561,13 @@ fn create_pr_creates_head_meta_source_base_atomically() {
         .unwrap(),
     )
     .unwrap();
-    assert_eq!(body.kind, EventKind::PrCreated);
-    assert_eq!(body.entity_id, 1);
-    assert_eq!(body.body.get("title").unwrap().as_str(), Some("PR title"));
-    let source_head_s = head.to_string();
-    let base_head_s = base.to_string();
-    let merge_base_s = merge_base.to_string();
+    assert_eq!(head_body.kind, EventKind::CiCheck);
+    assert_eq!(head_body.entity_id, 1);
     assert_eq!(
-        body.body.get("source_head").unwrap().as_str(),
-        Some(source_head_s.as_str())
+        head_body.body.get("status").unwrap().as_str(),
+        Some("pending")
     );
-    assert_eq!(
-        body.body.get("base_head").unwrap().as_str(),
-        Some(base_head_s.as_str())
-    );
-    assert_eq!(
-        body.body.get("merge_base").unwrap().as_str(),
-        Some(merge_base_s.as_str())
-    );
+    assert_eq!(head_body.actor, "a@x");
     assert_eq!(
         repo.find_reference(&pr_source_ref(1)).unwrap().target(),
         Some(head)
@@ -607,6 +650,75 @@ fn create_pr_rejects_preexisting_ref_without_touching_counter() {
     assert_eq!(
         repo.find_reference(&pr_head_ref(1)).unwrap().target(),
         Some(head)
+    );
+}
+
+/// F-006 regression: PR publication (counter CAS + /head + /meta + /source +
+/// /base + the pending ci.check child) is ONE atomic store transaction. Inject
+/// a failure on a different ref than the head (the immutable /source ref PR #1
+/// would target) and prove the whole batch rolls back: the counter is untouched
+/// and no PR ref is left behind, so a failed `pr create` can never strand a
+/// durable PR without its pending CI Check.
+#[test]
+fn create_pr_failed_publication_leaves_counter_and_pr_refs_unchanged() {
+    let dir = tmpdir("prfail");
+    let store = bound(&dir);
+    let repo = store.repo();
+    let sig = repo.signature().unwrap();
+    let tree_oid = repo.treebuilder(None).unwrap().write().unwrap();
+    let tree = repo.find_tree(tree_oid).unwrap();
+    let base = repo.commit(None, &sig, &sig, "base", &tree, &[]).unwrap();
+    let head = repo
+        .commit(
+            None,
+            &sig,
+            &sig,
+            "head",
+            &tree,
+            &[&repo.find_commit(base).unwrap()],
+        )
+        .unwrap();
+    let merge_base = repo.merge_base(base, head).unwrap();
+    // Inject a publication failure: pre-create a ref the transaction would try
+    // to create, forcing the single update-ref batch (counter + all four PR
+    // refs) to abort atomically.
+    repo.reference(&pr_source_ref(1), head, false, "pre")
+        .unwrap();
+    let res = store.create_pr(
+        "T",
+        "feature",
+        "main",
+        head,
+        base,
+        merge_base,
+        "a@x",
+        None,
+        &[],
+    );
+    assert!(res.is_err());
+    assert!(matches!(res, Err(StoreError::RefExists(_))));
+    // The whole publication rolled back: counter untouched, no PR ref created.
+    assert!(
+        repo.find_reference(COUNTER_REF).is_err(),
+        "counter must be untouched by a failed publication"
+    );
+    assert!(
+        repo.find_reference(&pr_head_ref(1)).is_err(),
+        "no partial head ref after failed publication"
+    );
+    assert!(
+        repo.find_reference(&pr_meta_ref(1)).is_err(),
+        "no partial meta ref after failed publication"
+    );
+    assert!(
+        repo.find_reference(&pr_base_ref(1)).is_err(),
+        "no partial base ref after failed publication"
+    );
+    // The pre-existing immutable snapshot ref is exactly as it was.
+    assert_eq!(
+        repo.find_reference(&pr_source_ref(1)).unwrap().target(),
+        Some(head),
+        "the pre-existing source ref must be untouched"
     );
 }
 

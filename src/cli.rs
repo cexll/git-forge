@@ -442,14 +442,11 @@ fn cmd_pr_create(args: &[String]) -> Result<String, String> {
             &labels,
         )
         .map_err(|e| e.to_string())?;
-    // Record a pending CI Check marker: no plan executes here (fast +
-    // non-destructive); the plan runs on-demand via `git forge ci run <pr>`.
-    let mut ci_body = HashMap::new();
-    ci_body.insert("status".into(), json_str("pending"));
-    let ci_ev = Event::new(EventKind::CiCheck, "pr", id, &actor, ci_body);
-    store
-        .append_event(&crate::store::pr_head_ref(id), &ci_ev)
-        .map_err(|e| e.to_string())?;
+    // The pending CI Check marker is published INSIDE `create_pr`'s single
+    // atomic store transaction (F-006), so a failure leaves neither the counter
+    // nor any PR refs changed — no separate append step can strand a durable PR
+    // without its pending marker. No plan executes here (fast + non-destructive);
+    // the plan runs on-demand via `git forge ci run <pr>`.
     Ok(format!("PR #{id} created: {title} ({source} -> {base})"))
 }
 

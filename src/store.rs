@@ -400,6 +400,23 @@ impl BoundEventStore {
         self.write_forge_commit("event.json", event.to_json().as_bytes(), parents, message)
     }
 
+    /// Write the initial pending CI Check `ci.check` child for a freshly
+    /// created PR, parented on the `pr.created` commit (F-006). It carries only
+    /// `status: "pending"` — no plan executes at creation time — and becomes
+    /// the `/head` chain tip so the fold surfaces the newest CI outcome.
+    fn write_pending_ci_check_commit(
+        &self,
+        pr_id: u64,
+        created_oid: Oid,
+        actor: &str,
+    ) -> Result<Oid, StoreError> {
+        let mut body = HashMap::new();
+        body.insert("status".into(), JsonValue::String("pending".to_string()));
+        let event = Event::new(EventKind::CiCheck, "pr", pr_id, actor, body);
+        let message = format!("forge:{}:{}", event.kind.as_str(), event.entity_id);
+        self.write_event_commit(&event, &[created_oid], &message)
+    }
+
     fn write_counter_commit(&self, next: u64, parent: Option<Oid>) -> Result<Oid, StoreError> {
         let value = format!("{{\"v\":1,\"next\":{next}}}");
         let parents: Vec<Oid> = parent.into_iter().collect();
@@ -524,12 +541,15 @@ impl BoundEventStore {
     /// swap with the `&str`s), then the event actor (`user.email`), then the
     /// optional PR description and the label list (both None/empty when
     /// absent). The `pr.created` event commit
-    /// (parent = genesis) is written first, then ONE `git update-ref --stdin`
-    /// transaction CASes the counter and creates `/head` → event commit,
-    /// `/meta` → same event commit (convenience pointer), `/source` →
-    /// `source_oid`, `/base` → `base_oid`, all with expected absence. Any
-    /// failure leaves counter and all four PR refs unchanged; a pre-existing
-    /// PR ref for the target id is `RefExists`.
+    /// (parent = genesis) is written first, followed by its pending `ci.check`
+    /// child (parent = `pr.created`), then ONE `git update-ref --stdin`
+    /// transaction CASes the counter and creates `/head` → the `ci.check`
+    /// commit, `/meta` → the `pr.created` commit (convenience pointer),
+    /// `/source` → `source_oid`, `/base` → `base_oid`, all with expected
+    /// absence. Any failure leaves counter and all four PR refs unchanged (the
+    /// pending CI Check marker is published atomically with PR allocation, so a
+    /// failed `pr create` cannot strand a durable PR without it — F-006); a
+    /// pre-existing PR ref for the target id is `RefExists`.
     ///
     /// Clippy `too-many-arguments` is suppressed: the positional order is a
     /// documented, test-pinned wire contract, and bundling the snapshot OIDs
@@ -592,8 +612,12 @@ impl BoundEventStore {
             let event = Event::new(EventKind::PrCreated, "pr", next, actor, body);
             let message = format!("forge:{}:{}", event.kind.as_str(), event.entity_id);
             let event_oid = self.write_event_commit(&event, &[genesis], &message)?;
+            // Publish the initial pending CI Check marker in the SAME atomic
+            // transaction as PR allocation: /head points at the ci.check child,
+            // /meta stays pinned at the pr.created snapshot commit (F-006).
+            let ci_oid = self.write_pending_ci_check_commit(next, event_oid, actor)?;
             let plan = [
-                (pr_head_ref(next), event_oid),
+                (pr_head_ref(next), ci_oid),
                 (pr_meta_ref(next), event_oid),
                 (pr_source_ref(next), source_oid),
                 (pr_base_ref(next), base_oid),
