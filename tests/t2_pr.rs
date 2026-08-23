@@ -47,12 +47,17 @@ fn init_repo(dir: &PathBuf) {
 }
 
 fn forge(dir: &PathBuf, args: &[&str]) -> (i32, String, String) {
+    forge_with_env(dir, args, &[])
+}
+
+fn forge_with_env(dir: &PathBuf, args: &[&str], envs: &[(&str, &str)]) -> (i32, String, String) {
     let bin = env!("CARGO_BIN_EXE_git-forge");
-    let out = Command::new(bin)
-        .args(args)
-        .current_dir(dir)
-        .output()
-        .unwrap();
+    let mut cmd = Command::new(bin);
+    cmd.args(args).current_dir(dir);
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
+    let out = cmd.output().unwrap();
     (
         out.status.code().unwrap_or(-1),
         String::from_utf8_lossy(&out.stdout).trim().to_string(),
@@ -1385,6 +1390,67 @@ fn ci_run_high_volume_plan_records_failure_and_cleans_worktree() {
     assert!(
         e.contains("exited with status 1"),
         "the retained exit status must be reported: {e}"
+    );
+
+    let event = head_event(&dir, 1);
+    assert!(event.contains("\"ci.check\""), "event kind: {event}");
+    assert!(event.contains("\"status\":\"failed\""), "status: {event}");
+    assert!(event.contains("\"plan\":\".forge/ci.sh\""), "plan: {event}");
+
+    // The temp CI worktree must be removed (no leftover), and the developer's
+    // working tree / current branch are unchanged.
+    assert_no_ci_worktree(&dir);
+    let (_, status, _) = git(&dir, &["status", "--porcelain"]);
+    assert_eq!(status.trim(), "", "working tree must be clean: {status}");
+    assert_eq!(git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).1, "main");
+}
+
+/// F-002 regression: a NONTERMINATING CI plan (e.g. `#!/bin/sh\nexec yes`) must
+/// not hang `ci run` forever. The wait is bounded by `GIT_FORGE_CI_TIMEOUT`;
+/// on expiry the plan process is killed and reaped, a `failure` CI Check is
+/// recorded, the temp worktree is removed, and the developer's working tree /
+/// branch are untouched (F-002 round 2).
+#[test]
+fn ci_run_nonterminating_plan_times_out_records_failure_and_cleans() {
+    let dir = tmpdir("ci-nonterm");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    // `exec yes` replaces the shell with a never-exiting process; without a
+    // bounded deadline the run would hang and never reach the failed Check
+    // append or the temp-worktree cleanup (F-002).
+    std::fs::write(dir.join(".forge").join("ci.sh"), "#!/bin/sh\nexec yes\n").unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(
+        &dir,
+        &["commit", "-q", "-m", "feature + nonterminating ci plan"],
+    );
+    git(&dir, &["checkout", "-q", "main"]);
+
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+
+    // Bound the wait to 1s: a hung run would never return here (stalling the
+    // gate), while a fixed run returns in ~1s and records a failed Check.
+    let t0 = std::time::SystemTime::now();
+    let (c, _o, e) = forge_with_env(
+        &dir,
+        &["forge", "ci", "run", "1"],
+        &[("GIT_FORGE_CI_TIMEOUT", "1")],
+    );
+    let elapsed = t0.elapsed().unwrap().as_secs();
+    assert_ne!(c, 0, "nonterminating plan must exit nonzero: {e}");
+    assert!(
+        elapsed < 30,
+        "ci run must return within the bounded deadline (took {elapsed}s)"
     );
 
     let event = head_event(&dir, 1);

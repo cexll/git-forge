@@ -577,31 +577,20 @@ fn cmd_pr_review(args: &[String]) -> Result<String, String> {
     let mut line = None;
     let mut commit = None;
     let mut i = 1;
+    let next_arg = |i: &mut usize, msg: &str| -> Result<String, String> {
+        *i += 1;
+        if *i >= args.len() {
+            return Err(msg.into());
+        }
+        Ok(args[*i].clone())
+    };
     while i < args.len() {
         match args[i].as_str() {
             "--approve" => decision = Some("approve".to_string()),
             "--reject" => decision = Some("reject".to_string()),
-            "--file" => {
-                i += 1;
-                if i >= args.len() {
-                    return Err("--file requires a path".into());
-                }
-                file = Some(args[i].clone());
-            }
-            "--line" => {
-                i += 1;
-                if i >= args.len() {
-                    return Err("--line requires a number".into());
-                }
-                line = Some(args[i].clone());
-            }
-            "--commit" => {
-                i += 1;
-                if i >= args.len() {
-                    return Err("--commit requires a hash".into());
-                }
-                commit = Some(args[i].clone());
-            }
+            "--file" => file = Some(next_arg(&mut i, "--file requires a path")?),
+            "--line" => line = Some(next_arg(&mut i, "--line requires a number")?),
+            "--commit" => commit = Some(next_arg(&mut i, "--commit requires a hash")?),
             a if a.starts_with('-') => return Err(format!("unknown option '{a}'")),
             _ => {}
         }
@@ -729,30 +718,41 @@ fn pr_help() -> String {
 // ─────────────────────────── CI commands (t0) ───────────────────────────
 
 /// Run the repo CI plan inside the temp worktree (the PR's own commits) and
-/// return its exit status (`None` when the process could not be spawned).
-/// `.forge/ci.sh` is executed with `bash` (respects the script's own shell
-/// semantics); the `just check` fallback runs the `just` recipe directly.
-/// Both run with the worktree as the working directory, so they validate
-/// exactly the PR tree. The plan's stdout/stderr are redirected to the null
-/// device (never buffered in memory — only the exit status is retained), so a
-/// high-volume or nonterminating plan cannot grow git-forge's heap before the
-/// result is recorded and the temp worktree is cleaned up (F-002).
-fn run_ci_plan(worktree: &std::path::Path, plan: &str) -> Option<i32> {
-    use std::process::{Command, Stdio};
+/// return its exit status (`None` when the process could not be spawned or
+/// when the plan exceeded the bounded deadline). `.forge/ci.sh` is executed
+/// with `bash` (respects the script's own shell semantics); the `just check`
+/// fallback runs the `just` recipe directly. Both run with the worktree as the
+/// working directory, so they validate exactly the PR tree. The plan's
+/// stdout/stderr are redirected to the null device (never buffered in memory —
+/// only the exit status is retained), so a high-volume plan cannot grow
+/// git-forge's heap. The wait is bounded (`GIT_FORGE_CI_TIMEOUT` seconds,
+/// default 300) so a NONTERMINATING plan (e.g. `#!/bin/sh\nexec yes`) cannot
+/// hang `cmd_ci_run` forever: on expiry the plan process is killed and reaped
+/// and `None` is returned, which maps to a failed CI Check and lets the
+/// existing append + temp-worktree cleanup path run (F-002).
+fn run_ci_plan(worktree: &std::path::Path, plan: &str, timeout_secs: u64) -> Option<i32> {
     let (prog, args): (&str, &[&str]) = if plan == "just check" {
         ("just", &["check"])
     } else {
         ("bash", &[".forge/ci.sh"])
     };
-    Command::new(prog)
+    let mut child = std::process::Command::new(prog)
         .args(args)
         .current_dir(worktree)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .ok()?
-        .code()
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .ok()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    while std::time::Instant::now() < deadline {
+        if let Some(st) = child.try_wait().ok()? {
+            return st.code();
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let _ = child.kill();
+    child.wait().ok()?.code()
 }
 
 /// Determine the immutable-snapshot CI plan (F-001): `.forge/ci.sh` when it is
@@ -822,6 +822,12 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
     let mut tmp = mk(0);
     let mut attempt = 0u32;
     let mut lock_handle: Option<std::fs::File> = None;
+    // Release the path lock once the worktree is registered (or once a reserved
+    // path is abandoned); every early return after the loop must drop it too.
+    let release_lock = |lock_handle: &mut Option<std::fs::File>, path: &std::path::Path| {
+        *lock_handle = None;
+        let _ = std::fs::remove_file(path.with_extension("lock"));
+    };
     let (ok_wt, err_wt) = loop {
         let lock = tmp.with_extension("lock");
         match std::fs::OpenOptions::new()
@@ -851,22 +857,21 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
         }
     };
     if !ok_wt {
-        drop(lock_handle.take());
-        let _ = std::fs::remove_file(tmp.with_extension("lock"));
+        release_lock(&mut lock_handle, &tmp);
         return Err(format!(
             "failed to create temporary worktree for CI run: {err_wt}"
         ));
     }
-    // Release the path lock now that the worktree is registered; every early
-    // return after this point must drop it too.
-    let release_lock = |lock_handle: &mut Option<std::fs::File>, path: &std::path::Path| {
-        *lock_handle = None;
-        let _ = std::fs::remove_file(path.with_extension("lock"));
-    };
 
     // Run the plan. The exit status is captured; the plan's stderr/stdout stay
     // in the worktree (not surfaced), only the recorded status matters here.
-    let script_status = run_ci_plan(&tmp, plan);
+    // `GIT_FORGE_CI_TIMEOUT` (seconds, default 300) bounds the wait so a
+    // nonterminating plan cannot hang this command (F-002).
+    let timeout_secs: u64 = std::env::var("GIT_FORGE_CI_TIMEOUT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(300);
+    let script_status = run_ci_plan(&tmp, plan, timeout_secs);
 
     // Always append the CI Check outcome — a failing plan must still record a
     // `failure` CI Check (VAL-002) before the command exits nonzero.
