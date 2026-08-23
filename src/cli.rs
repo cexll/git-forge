@@ -750,7 +750,7 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
     // even created, so CI never follows a tracked link to mutable bytes
     // outside the detached worktree. Absent `.forge/ci.sh` -> the pinned
     // `just check` fallback (F-012).
-    let plan = crate::git::snapshot_ci_plan(store.repo(), source_oid)?;
+    let plan = crate::ci::snapshot_ci_plan(store.repo(), source_oid)?;
 
     // Reserve a unique temp worktree path (sibling lock) so concurrent CI runs
     // on the same repo never collide on the global temp dir.
@@ -812,29 +812,13 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
     // executed (F-013), the wait is bounded by `GIT_FORGE_CI_TIMEOUT`
     // (clamped, F-011), and on expiry the WHOLE process group is killed and
     // reaped (F-015) so a background descendant cannot survive the deadline.
-    let timeout = crate::git::ci_timeout(std::env::var("GIT_FORGE_CI_TIMEOUT").ok().as_deref());
-    let run = crate::git::run_ci_plan(store.repo(), source_oid, &tmp, &plan, timeout);
+    let timeout = crate::ci::ci_timeout(std::env::var("GIT_FORGE_CI_TIMEOUT").ok().as_deref());
+    let run = crate::ci::run_ci_plan(store.repo(), source_oid, &tmp, &plan, timeout);
 
-    // Always append the CI Check outcome — a failing plan must still record a
-    // `failure` CI Check (VAL-002) before the command exits nonzero.
-    let status = if run.status == Some(0) {
-        "success"
-    } else {
-        "failed"
-    };
-    let mut body = HashMap::new();
-    body.insert("status".into(), json_str(status));
-    body.insert("plan".into(), json_str(plan.label));
-    let ev = Event::new(EventKind::CiCheck, "pr", id, &actor, body);
-    // Record the outcome — a failing plan still appends a `failure` CI Check
-    // (VAL-002) before the command exits nonzero.
-    let append = store.append_event(&head, &ev);
-
-    // Clean up the temp worktree regardless of the plan/append outcome,
-    // holding the sibling lock until the worktree is removed AND verified
-    // gone (directory absent + path unregistered), mirroring the merge-path
-    // postconditions (F-002/F-003): a leftover is reported, never silently
-    // discarded, and success is never claimed over a still-present worktree.
+    // Clean up the temp worktree regardless of the plan outcome, holding the
+    // sibling lock until the worktree is removed AND verified gone (directory
+    // absent + path unregistered), mirroring the merge-path postconditions
+    // (F-002/F-003): a leftover is reported, never silently discarded.
     let leftover = crate::git::worktree_remove(&repo_dir, &tmp)
         .err()
         .map(|e| format!("temp worktree removal failed: {e}"))
@@ -853,12 +837,34 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
         .map(|reason| format!("{reason} (worktree left at {})", tmp.display()));
     release_lock(&mut lock_handle, &tmp);
 
+    // F-025: do NOT publish a green Check until cleanup verified succeeded — a
+    // passing plan that locks its worktree (so removal fails) must leave a
+    // failed/non-green latest Check, otherwise the merge gate would accept a
+    // green Check whose CI command actually failed integrity.
+    let status = if run.status == Some(0) && leftover.is_none() {
+        "success"
+    } else {
+        "failed"
+    };
+    let mut body = HashMap::new();
+    body.insert("status".into(), json_str(status));
+    body.insert("plan".into(), json_str(plan.label));
+    let ev = Event::new(EventKind::CiCheck, "pr", id, &actor, body);
+    // Record the outcome — a failing plan still appends a `failure` CI Check
+    // (VAL-002) before the command exits nonzero.
+    let append = store.append_event(&head, &ev);
+    if let Some(ar) = append.as_ref().err() {
+        let msg = format!("CI run completed but recording the CI Check failed: {ar}");
+        return Err(match leftover {
+            Some(l) => format!("{msg}; temp worktree cleanup failed: {l}"),
+            None => msg,
+        });
+    }
+
     if let Some(leftover) = leftover {
-        let prefix = match append.as_ref().err() {
-            Some(ar) => format!("CI run completed but recording the CI Check failed: {ar};"),
-            None => format!("CI run recorded {status} but"),
-        };
-        return Err(format!("{prefix} temp worktree cleanup failed: {leftover}"));
+        return Err(format!(
+            "CI run recorded {status} but temp worktree cleanup failed: {leftover}"
+        ));
     }
     append.map_err(|e| format!("CI run completed but recording the CI Check failed: {e}"))?;
 
