@@ -1,0 +1,54 @@
+{
+  "topic": "git-forge L2 scope (grill session 2026-08-23)",
+  "confirmedRequirements": [
+    "CI 门控: per-repo shell plan `.forge/ci.sh`, falling back to `just check` when absent.",
+    "CI 门控: triggered by a git hook on PR creation AND explicitly via `git forge ci run <pr>`; no daemon (zero-resident-process preserved).",
+    "CI 门控: a CI Check Forge Event records the outcome (status pending/success/failed + plan + ts + actor); the Merge Gate requires the latest CI Check green.",
+    "CI 门控: L2 Merge Gate = approved Review event AND latest CI Check == success (approval-only remains the L1 gate).",
+    "Sync: single canonical bare remote (GitLab-style), not a fork network.",
+    "Sync: `git forge push` explicitly pushes `refs/forge/*`; `git forge clone/init` installs an additive fetch refspec; `git forge pull` converges local forge refs.",
+    "Sync: the bare remote runs a pre-receive hook that enforces the Merge Gate (approved Review + latest CI Check green) on non-base pushes.",
+    "Sync convergence: fast-forward pull + append-only push; on divergence the push is rejected loudly and the user re-pulls and re-pushes (no automatic DAG merge).",
+    "devflow consumes L2 by pushing/pulling one bare remote and relying on the CI Check + Merge Gate.",
+    "Web: `git forge web` is a transient (on-demand) HTTP server rendering issue list/show + PR list/show/diff.",
+    "Web: stack is axum/actix (user-selected); strictly read-only; renders by folding `refs/forge/*` directly (no Local Index)."
+  ],
+  "nonGoals": [
+    "Domain enrichment — milestones, assignees, body/title editing, and `Closes #N` cross-links are deferred out of L2.",
+    "Export + Local Index — single-file export (`git forge export project.forge`) and the SQLite Local Index are deferred out of L2; the web UI therefore folds refs directly.",
+    "Fork-network sync (GitHub-style multi-remote) is rejected; a single canonical remote is the chosen shape.",
+    "CI is not SaaS/daemon-hosted; no resident process or webhook service is introduced."
+  ],
+  "constraints": [
+    "Zero resident processes / git-protocol-only, extended to all L2 capabilities (hooks and CLI are the only triggers).",
+    "Dependency policy: MIT-only; new dependencies need justification (axum/tokio chosen for the web stack, to be size-gate-watched).",
+    "Core (`src/event.rs`, `src/fold.rs`) remains zero external dependencies.",
+    "L1 Merge Gate stays approval-only; L2 adds the CI Check condition (Merge Gate broadened in CONTEXT.md)."
+  ],
+  "assumptions": [
+    "Primary consumers are the single developer and the devflow multi-agent pipeline; single-user permission model persists in L2.",
+    "The CI plan is per-repo; git-forge itself is zero-config via the `just check` fallback.",
+    "The bare remote is reachable/there for sync to function; sync is an explicit user/devflow action, not a background watch."
+  ],
+  "openQuestions": [
+    "Web renderer HTML-escape policy (distinct from terminal `sanitize_terminal`) — implementation detail.",
+    "CI Check fold mapping and merge-gate wiring — implementation detail.",
+    "Exact pre-receive rule set (which refs are gated, base-ref exceptions) — implementation detail."
+  ],
+  "domainTerms": [
+    "CI Check (added) — a Forge Event recording a CI Run outcome on a PR; gated by Merge Gate.",
+    "Merge Gate (broadened) — approved Review AND (L2) latest CI Check green.",
+    "Canonical Remote (added) — the single authoritative bare remote for forge refs sync.",
+    "CI Run (existing) — on-demand configured shell plan; result written back as a Forge Event.",
+    "On-demand Web (existing) — transient `git forge web`; fossil ui analogue."
+  ],
+  "adrReferences": [
+    "docs/decisions/proposed/feature/ci-check-merge-gate.md",
+    "docs/decisions/proposed/architecture/forge-sync-single-remote.md",
+    "docs/decisions/proposed/feature/on-demand-web-browse.md"
+  ],
+  "sourceDocuments": [
+    "docs/architecture/git-forge.md (L2 declared topics, L1 must-not-haves)",
+    "CONTEXT.md (glossary: CI Check, Merge Gate, Canonical Remote, CI Run, On-demand Web)"
+  ]
+}
