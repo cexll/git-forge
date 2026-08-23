@@ -880,7 +880,7 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
                 Some("temp worktree directory still exists".to_string())
             } else if !ok {
                 Some(format!("worktree verification failed: {err_l}"))
-            } else if list.contains(&tmp.to_string_lossy().to_string()) {
+            } else if crate::event::worktree_registered_path(&list, &tmp) {
                 Some("temp worktree still registered".to_string())
             } else {
                 None

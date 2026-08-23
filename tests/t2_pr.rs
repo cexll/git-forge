@@ -1477,3 +1477,55 @@ fn ci_run_append_failure_reports_removal_failure() {
     remove_leftover_ci_worktree(&dir);
     assert_no_ci_worktree(&dir);
 }
+
+/// F-004 regression: a passing `ci run` must not false-fail when an unrelated
+/// registered worktree shares the owned temp-path prefix. A `.forge/ci.sh`
+/// that creates a sibling `${PWD}-other` worktree and exits 0 leaves that
+/// sibling registered after CI removes its own `$PWD` worktree; the
+/// post-removal guard must compare each registered path EXACTLY with the owned
+/// temp path, so the distinct sibling is never mistaken for the owned path (the
+/// old substring `contains(tmp)` check falsely reported a leftover here).
+#[test]
+fn ci_run_passes_when_sibling_worktree_shares_temp_prefix() {
+    let dir = tmpdir("ci-prefix-sibling");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    std::fs::write(
+        dir.join(".forge").join("ci.sh"),
+        "#!/bin/bash\n\
+         git worktree add --detach \"${PWD}-other\" HEAD\n\
+         exit 0\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(
+        &dir,
+        &["commit", "-q", "-m", "feature + prefix-sibling ci plan"],
+    );
+    git(&dir, &["checkout", "-q", "main"]);
+
+    let (c, _, e) = forge(
+        &dir,
+        &[
+            "forge", "pr", "create", "--source", "feature", "--base", "main", "PR1",
+        ],
+    );
+    assert_eq!(c, 0, "pr create failed: {e}");
+
+    // The sibling `${PWD}-other` shares the owned temp path as a prefix and is
+    // still registered after the owned temp worktree is removed, so the guard
+    // must NOT report a leftover and the passing run must exit 0.
+    let (c, o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_eq!(
+        c, 0,
+        "prefix-sibling worktree must not false-fail ci run: {e} {o}"
+    );
+    assert!(o.contains("passed"), "ci run output: {o}");
+
+    // Hygiene: remove the sibling the CI plan left registered.
+    remove_leftover_ci_worktree(&dir);
+    assert_no_ci_worktree(&dir);
+}

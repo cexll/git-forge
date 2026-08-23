@@ -392,9 +392,77 @@ fn rfc3339_utc_formatter_known_values() {
     assert_eq!(format_rfc3339_utc(1_000_000_000), "2001-09-09T01:46:40Z");
     // Round-trips through the independent parser for a mid-range sample.
     for v in [0i64, 1_234_567_890, 2_000_000_000] {
-        let s = format_rfc3339_utc(v as u64);
+        let s = format_rfc3339_utc(v);
         assert_eq!(parse_rfc3339_utc(&s), Some(v), "roundtrip {s}");
     }
+}
+
+/// F-001 deterministic boundary: a wall clock BEFORE the Unix epoch (a reset
+/// or misconfigured host clock) must format a real pre-1970 RFC3339 UTC string
+/// (negative offset from epoch), never the fabricated `1970-01-01T00:00:00Z`.
+/// The fold must carry that real pre-epoch ts into `PrState::ci_ts`.
+#[test]
+fn pre_epoch_wall_clock_formats_real_time_not_epoch() {
+    let t = std::time::UNIX_EPOCH - std::time::Duration::from_secs(1);
+    let ts = format_rfc3339_system_time(t);
+    assert_eq!(ts, "1969-12-31T23:59:59Z");
+    let ev = Event {
+        v: 1,
+        id: "550e8400-e29b-41d4-a716-446655440000".to_string(),
+        kind: EventKind::CiCheck,
+        entity: "pr".to_string(),
+        entity_id: 1,
+        ts,
+        actor: "ci@example.com".to_string(),
+        body: body_with(vec![
+            ("status", JsonValue::String("success".into())),
+            ("plan", JsonValue::String("just check".into())),
+        ]),
+    };
+    let state = fold(std::slice::from_ref(&ev));
+    assert_eq!(state.pr.ci_ts.as_deref(), Some("1969-12-31T23:59:59Z"));
+}
+
+/// F-004: `worktree_registered_path` compares each porcelain `worktree <path>`
+/// record EXACTLY, so a registered sibling that shares the owned path's prefix
+/// (e.g. `/tmp/owned-other` when `/tmp/owned` was removed) is never mistaken
+/// for the owned path — the old substring `contains` check false-matched here.
+#[test]
+fn worktree_registered_path_exact_not_substring() {
+    let porcelain = "worktree /repo\n\
+                     HEAD a\n\
+                     branch refs/heads/main\n\
+                     \n\
+                     worktree /repo/owned-other\n\
+                     HEAD b\n\
+                     detached\n";
+    // Owned path was removed; only the prefix-sharing sibling remains.
+    assert!(!worktree_registered_path(
+        porcelain,
+        std::path::Path::new("/repo/owned")
+    ));
+    // The sibling is exactly registered, so it is found.
+    assert!(worktree_registered_path(
+        porcelain,
+        std::path::Path::new("/repo/owned-other")
+    ));
+    // A non-prefix path is not reported either.
+    assert!(!worktree_registered_path(
+        porcelain,
+        std::path::Path::new("/repo/none")
+    ));
+
+    let with_owned = "worktree /repo\n\
+                      HEAD a\n\
+                      branch refs/heads/main\n\
+                      \n\
+                      worktree /repo/owned\n\
+                      HEAD c\n\
+                      detached\n";
+    assert!(worktree_registered_path(
+        with_owned,
+        std::path::Path::new("/repo/owned")
+    ));
 }
 
 /// F-001 regression: a CI Check event must carry the actual run timestamp in

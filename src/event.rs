@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -142,17 +143,28 @@ fn uuid_v4_from_seed(seed: u64) -> String {
 /// "<RFC3339 UTC>"`; a std-only epoch→civil conversion keeps the schema
 /// dependency-free (no chrono).
 fn rfc3339_utc_now() -> String {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    format_rfc3339_utc(secs)
+    format_rfc3339_system_time(SystemTime::now())
 }
 
-/// Format seconds-since-epoch as RFC3339 UTC `YYYY-MM-DDTHH:MM:SSZ`.
-fn format_rfc3339_utc(secs: u64) -> String {
-    let days = (secs / 86_400) as i64;
-    let secs_of_day = secs % 86_400;
+/// Format an arbitrary `SystemTime` as RFC3339 UTC seconds. A clock BEFORE the
+/// Unix epoch (reset/misconfigured wall clock) must format a real pre-1970
+/// time, never the fabricated `1970-01-01T00:00:00Z` (F-001).
+fn format_rfc3339_system_time(t: SystemTime) -> String {
+    match t.duration_since(UNIX_EPOCH) {
+        Ok(d) => format_rfc3339_utc(d.as_secs() as i64),
+        Err(e) => format_rfc3339_utc(-(e.duration().as_secs() as i64)),
+    }
+}
+
+/// Format signed seconds-since-epoch as RFC3339 UTC `YYYY-MM-DDTHH:MM:SSZ`.
+/// Negative seconds (a wall clock before the Unix epoch) format to a real
+/// pre-1970 civil time via floor/euclid division, never a fabricated
+/// `1970-01-01T00:00:00Z` (F-001). The `civil_from_days` inverse already
+/// accepts signed day counts, so the same proleptic-Gregorian conversion
+/// produces the correct pre-epoch date.
+fn format_rfc3339_utc(secs: i64) -> String {
+    let days = secs.div_euclid(86_400);
+    let secs_of_day = secs.rem_euclid(86_400);
     let (y, m, d) = civil_from_days(days);
     let h = secs_of_day / 3600;
     let min = (secs_of_day % 3600) / 60;
@@ -173,6 +185,18 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
     let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
     (if m <= 2 { y + 1 } else { y }, m, d)
+}
+
+/// True if `git worktree list --porcelain` output (`porcelain`) registers a
+/// worktree whose path EXACTLY equals `target`. Each `worktree <path>` record's
+/// path is compared exactly, not by substring, so a distinct registered path
+/// that merely shares the target's prefix (e.g. `<target>-other`) is never
+/// mistaken for the owned path (F-004 — post-removal CI worktree verification).
+pub(crate) fn worktree_registered_path(porcelain: &str, target: &Path) -> bool {
+    porcelain
+        .lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .any(|p| p == target.to_string_lossy().as_ref())
 }
 
 impl Event {
