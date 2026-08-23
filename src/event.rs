@@ -364,6 +364,13 @@ fn labels_from(body: &HashMap<String, JsonValue>) -> Vec<String> {
     }
 }
 
+/// Build a `JsonValue::Array` of string items — the single serialization
+/// source for label arrays, shared by the CLI and store so `issue.created`
+/// and `pr.created` wire payloads never drift.
+pub fn json_string_array(items: &[String]) -> JsonValue {
+    JsonValue::Array(items.iter().map(|s| JsonValue::String(s.clone())).collect())
+}
+
 fn json_string(value: &str) -> String {
     let mut out = String::from("\"");
     for c in value.chars() {
@@ -373,6 +380,14 @@ fn json_string(value: &str) -> String {
             '\n' => out.push_str("\\n"),
             '\t' => out.push_str("\\t"),
             '\r' => out.push_str("\\r"),
+            '\u{0008}' => out.push_str("\\b"),
+            '\u{000C}' => out.push_str("\\f"),
+            c if (c as u32) < 0x20 => {
+                // Unescaped C0 controls (other than the short forms above) are
+                // invalid in JSON; emit the \u00XX form so stored events stay
+                // standards-compliant and round-trip through any parser.
+                out.push_str(&format!("\\u{:04x}", c as u32));
+            }
             c => out.push(c),
         }
     }
@@ -546,18 +561,23 @@ impl<'a> Parser<'a> {
             return None;
         }
         self.pos += 1;
-        let mut out = String::new();
+        // Accumulate raw bytes (including multi-byte UTF-8 from the input) and
+        // decode once at the end. Decoding byte-by-byte via `c as char` would
+        // turn every non-ASCII byte into a Latin-1 char (mojibake); the final
+        // from_utf8 validates the sequence and yields the real string.
+        let mut bytes: Vec<u8> = Vec::new();
         while self.pos < self.bytes.len() {
             let c = self.bytes[self.pos];
             if c == b'"' {
                 self.pos += 1;
-                return Some(out);
+                let s = std::str::from_utf8(&bytes).ok()?;
+                return Some(s.to_string());
             }
             if c == b'\\' {
                 self.pos += 1;
                 let esc = *self.bytes.get(self.pos)?;
                 self.pos += 1;
-                out.push(match esc {
+                let decoded: char = match esc {
                     b'n' => '\n',
                     b't' => '\t',
                     b'r' => '\r',
@@ -566,14 +586,72 @@ impl<'a> Parser<'a> {
                     b'\\' => '\\',
                     b'"' => '"',
                     b'/' => '/',
+                    b'u' => {
+                        // \uXXXX — four hex digits, decoded to a Unicode
+                        // scalar. JSON \u escapes may encode a UTF-16 surrogate
+                        // pair (supplementary-plane chars): a high surrogate
+                        // must be immediately followed by \uXXXX low surrogate
+                        // and the pair combines into one scalar. A lone
+                        // low-surrogate (or a high surrogate not followed by a
+                        // low surrogate) is invalid and rejected.
+                        let code = self.read_hex4()?;
+                        let code = if (0xD800..=0xDBFF).contains(&code) {
+                            // The low surrogate must be IMMEDIATELY adjacent
+                            // (`\uD83D\uDE00`): JSON allows no whitespace between
+                            // the two escapes, so use direct byte access instead
+                            // of `peek()` (which skips spaces/tabs/CR/LF).
+                            if self.bytes.get(self.pos).copied() != Some(b'\\') {
+                                return None;
+                            }
+                            self.pos += 1;
+                            if self.bytes.get(self.pos).copied() != Some(b'u') {
+                                return None;
+                            }
+                            self.pos += 1;
+                            let low = self.read_hex4()?;
+                            if !(0xDC00..=0xDFFF).contains(&low) {
+                                return None;
+                            }
+                            0x10000 + ((code - 0xD800) << 10) + (low - 0xDC00)
+                        } else if (0xDC00..=0xDFFF).contains(&code) {
+                            return None; // lone low surrogate
+                        } else {
+                            code
+                        };
+                        char::from_u32(code)?
+                    }
                     _ => return None,
-                });
+                };
+                let mut buf = [0u8; 4];
+                bytes.extend_from_slice(decoded.encode_utf8(&mut buf).as_bytes());
                 continue;
             }
-            out.push(c as char);
+            // A raw C0 control byte inside a string is invalid JSON — JSON
+            // requires every U+0000–U+001F character to be escaped. The bytes
+            // here are never produced by our serializer (json_string escapes
+            // them), so rejecting them enforces wire-contract validity on
+            // externally authored events. Escaped forms (`\n`, `\b`, `\u0001`)
+            // are decoded above and are unaffected.
+            if c < 0x20 {
+                return None;
+            }
+            bytes.push(c);
             self.pos += 1;
         }
         None
+    }
+
+    /// Read exactly four hex digits as a `u32` (used by `\u` escapes). Advances
+    /// `pos` past them; returns `None` on any malformed/truncated input.
+    fn read_hex4(&mut self) -> Option<u32> {
+        let end = self.pos + 4;
+        if end > self.bytes.len() {
+            return None;
+        }
+        let hex = std::str::from_utf8(&self.bytes[self.pos..end]).ok()?;
+        let code = u32::from_str_radix(hex, 16).ok()?;
+        self.pos = end;
+        Some(code)
     }
 
     fn parse_number(&mut self) -> Option<JsonValue> {
@@ -603,240 +681,6 @@ fn parse_json_value(input: &str) -> Option<JsonValue> {
     }
     Some(value)
 }
-
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::collections::HashMap;
-
-    fn body_with(kv: Vec<(&str, JsonValue)>) -> HashMap<String, JsonValue> {
-        kv.into_iter().map(|(k, v)| (k.to_string(), v)).collect()
-    }
-
-    /// v1 schema serialization is self-consistent: to_json -> from_json is the
-    /// identity on every field, including control characters that must be
-    /// escaped in the wire encoding (wire contract § Event JSON schema v1).
-    #[test]
-    fn json_roundtrip_escapes_control_chars_in_actor_and_body() {
-        let ev = Event::new(
-            EventKind::IssueComment,
-            "issue",
-            7,
-            "dev@example.com",
-            body_with(vec![
-                ("title", JsonValue::String("a\"b\\c\nd\te\rf".into())),
-                ("n", JsonValue::Number(-42)),
-                ("ok", JsonValue::Bool(true)),
-                ("none", JsonValue::Null),
-            ]),
-        );
-        let json = ev.to_json();
-        assert!(json.contains("\\\"") && json.contains("\\\\") && json.contains("\\n"));
-        let round = Event::from_json(&json).expect("roundtrip must parse");
-        assert_eq!(round, ev);
-    }
-
-    /// Nested arrays/objects survive serialization and parsing verbatim.
-    #[test]
-    fn json_roundtrip_nested_structures() {
-        let nested = JsonValue::Array(vec![
-            JsonValue::Object(body_with(vec![(
-                "deep",
-                JsonValue::Array(vec![JsonValue::Number(1), JsonValue::String("x".into())]),
-            )])),
-            JsonValue::Number(0),
-        ]);
-        let ev = Event::new(
-            EventKind::PrReview,
-            "pr",
-            3,
-            "a@b.c",
-            body_with(vec![("review", nested)]),
-        );
-        let round = Event::from_json(&ev.to_json()).expect("nested roundtrip must parse");
-        assert_eq!(round, ev);
-    }
-
-    /// from_json is strict: malformed shape, wrong schema version, non-UUID id,
-    /// unknown kind, or a non-object body must all be rejected, never coerced.
-    #[test]
-    fn from_json_rejects_malformed_shapes() {
-        let good =
-            Event::new(EventKind::IssueCreated, "issue", 1, "x@y.z", HashMap::new()).to_json();
-        // Truncate the JSON to a malformed but parseable-then-absent tail.
-        assert!(Event::from_json("not json").is_none());
-        // strip the closing brace -> trailing garbage, parse must reject.
-        assert!(Event::from_json(&good[..good.len() - 1]).is_none());
-        // wrong schema version
-        let wrong_v = good.replace("\"v\":1", "\"v\":2");
-        assert!(Event::from_json(&wrong_v).is_none());
-        // non-object body
-        let bad_body = good.replace("\"body\":{", "\"body\":[");
-        assert!(Event::from_json(&bad_body).is_none());
-    }
-
-    /// EventKind as_str/from_str roundtrip for every wire kind; unknown rejects.
-    #[test]
-    fn event_kind_string_roundtrip_all_kinds() {
-        for kind in [
-            EventKind::IssueCreated,
-            EventKind::IssueComment,
-            EventKind::IssueClose,
-            EventKind::IssueReopen,
-            EventKind::PrCreated,
-            EventKind::PrComment,
-            EventKind::PrReview,
-            EventKind::PrMerge,
-        ] {
-            assert_eq!(kind.as_str().parse::<EventKind>().unwrap(), kind);
-        }
-        assert!("pr.merge".parse::<EventKind>().is_ok());
-        assert!("issue.bogus".parse::<EventKind>().is_err());
-        assert!("".parse::<EventKind>().is_err());
-    }
-
-    /// UUID-v4 shape validation: exact length/hyphen positions, version nibble,
-    /// variant nibble, and hex-only rejection.
-    #[test]
-    fn uuid_v4_shape_boundaries() {
-        assert!(is_uuid_v4("550e8400-e29b-41d4-a716-446655440000"));
-        assert!(is_uuid_v4("00000000-0000-4000-8000-000000000000"));
-        // wrong length
-        assert!(!is_uuid_v4("550e8400-e29b-41d4-a716-44665544000"));
-        // wrong hyphen position
-        assert!(!is_uuid_v4("550e8400-e29b-41d4-a716446655440000"));
-        // wrong version nibble (not 4)
-        assert!(!is_uuid_v4("550e8400-e29b-51d4-a716-446655440000"));
-        // wrong variant nibble (not 8/9/a/b)
-        assert!(!is_uuid_v4("550e8400-e29b-41d4-1716-446655440000"));
-        // non-hex char
-        assert!(!is_uuid_v4("550e8400-e29b-41d4-a716-44665544000g"));
-    }
-
-    /// Full escape set (\b \f \/), negative numbers, empty containers, and
-    /// whitespace-tolerant parsing — branches not hit by the roundtrip tests.
-    #[test]
-    fn json_parser_accepts_full_escape_set_and_negative_numbers() {
-        let v = parse_json_value(r#""\b\f\/""#).unwrap();
-        assert_eq!(v.as_str().unwrap(), "\u{0008}\u{000C}/");
-        assert_eq!(parse_json_value("-17").unwrap(), JsonValue::Number(-17));
-        assert_eq!(parse_json_value("42").unwrap(), JsonValue::Number(42));
-        // nested empty containers parse
-        assert!(parse_json_value("{}").is_some());
-        assert!(parse_json_value("[]").is_some());
-        // whitespace around structure is tolerated
-        assert!(parse_json_value(r#"  { "a" : [ 1 , 2 ] }  "#).is_some());
-        // nested object/array round value
-        let v = parse_json_value(r#"{"a":{"b":[true,null]}}"#).unwrap();
-        assert!(v.as_object().is_some());
-    }
-
-    /// JsonValue accessor fallbacks are covered in tests/t0_core.rs.
-    #[test]
-    fn uuid_v4_rejects_wrong_char_at_hyphen_slot() {
-        assert!(!is_uuid_v4("550e8400xe29b-41d4-a716-446655440000"));
-        assert!(!is_uuid_v4("550e8400-e29b041d4-a716-446655440000"));
-    }
-
-    /// Parser edges: empty input (EOF peek), a `false` literal, a non-quoted
-    /// object key, and an integer that overflows i64 must all be handled.
-    #[test]
-    fn json_parser_empty_and_false_and_overflows() {
-        assert!(parse_json_value("").is_none());
-        assert!(parse_json_value("  \t\n ").is_none());
-        assert_eq!(parse_json_value("false"), Some(JsonValue::Bool(false)));
-        assert!(parse_json_value(r#"{"k": false}"#).is_some());
-        // non-string object key
-        assert!(parse_json_value("{123:1}").is_none());
-        // overflow of i64 (well-formed digits, not parseable as i64)
-        assert!(parse_json_value("9223372036854775808").is_none());
-        assert!(parse_json_value("-9223372036854775809").is_none());
-    }
-
-    /// Strict rejection: unknown escape, unterminated string, unknown leading
-    /// token, trailing garbage, missing object separators, array/object
-    /// syntax errors, empty number, and literal typos must all return None.
-    #[test]
-    fn json_parser_rejects_malformed_tokens() {
-        assert!(parse_json_value(r#""\q""#).is_none()); // unknown escape
-        assert!(parse_json_value(r#""abc"#).is_none()); // unterminated string
-        assert!(parse_json_value("z").is_none()); // unknown leading token
-        assert!(parse_json_value("1 2").is_none()); // trailing garbage after value
-        assert!(parse_json_value("{} trailing").is_none());
-        assert!(parse_json_value(r#"{"a" 1}"#).is_none()); // missing colon
-        assert!(parse_json_value(r#"{"a":1 "b":2}"#).is_none()); // missing comma
-        assert!(parse_json_value("[1 2]").is_none()); // array missing comma
-        assert!(parse_json_value("-").is_none()); // number without digits
-        assert!(parse_json_value("tru").is_none()); // literal typo
-        assert!(parse_json_value("nu").is_none()); // null literal typo
-        assert!(parse_json_value("fa").is_none()); // false literal typo
-        assert!(parse_json_value(r#"{"a":}"#).is_none()); // value missing
-    }
-
-    /// labels_from: keeps only string items, tolerates missing/non-array
-    /// payloads (forward-compat), and never panics on malformed labels.
-    #[test]
-    fn labels_from_string_items_only_and_lenient() {
-        let mut body = HashMap::new();
-        body.insert(
-            "labels".into(),
-            JsonValue::Array(vec![
-                JsonValue::String("a".into()),
-                JsonValue::Number(1),
-                JsonValue::String("b".into()),
-            ]),
-        );
-        assert_eq!(labels_from(&body), vec!["a".to_string(), "b".to_string()]);
-        // missing labels -> empty
-        assert!(labels_from(&HashMap::new()).is_empty());
-        // non-array labels -> empty (never a panic)
-        let mut m = HashMap::new();
-        m.insert("labels".into(), JsonValue::String("not-array".into()));
-        assert!(labels_from(&m).is_empty());
-        // empty array
-        let mut e = HashMap::new();
-        e.insert("labels".into(), JsonValue::Array(vec![]));
-        assert!(labels_from(&e).is_empty());
-    }
-
-    /// fold derives labels for both issue.created and pr.created events.
-    #[test]
-    fn fold_sets_labels_from_created_events() {
-        let mk = |kind: EventKind, entity: &str, id: u64, body: HashMap<String, JsonValue>| {
-            Event::new_with_id(
-                &format!("22222222-2222-4222-8222-{:012x}", id),
-                kind,
-                entity,
-                id,
-                "a@x",
-                body,
-            )
-            .unwrap()
-        };
-        let mut ib = HashMap::new();
-        ib.insert("title".into(), JsonValue::String("T".into()));
-        ib.insert(
-            "labels".into(),
-            JsonValue::Array(vec![
-                JsonValue::String("bug".into()),
-                JsonValue::String("urgent".into()),
-            ]),
-        );
-        let mut pb = HashMap::new();
-        pb.insert("description".into(), JsonValue::String("body".into()));
-        pb.insert(
-            "labels".into(),
-            JsonValue::Array(vec![JsonValue::String("enhancement".into())]),
-        );
-        let st = fold(&[
-            mk(EventKind::IssueCreated, "issue", 1, ib),
-            mk(EventKind::PrCreated, "pr", 2, pb),
-        ]);
-        assert_eq!(
-            st.issue.labels,
-            vec!["bug".to_string(), "urgent".to_string()]
-        );
-        assert_eq!(st.pr.labels, vec!["enhancement".to_string()]);
-        assert_eq!(st.pr.description.as_deref(), Some("body"));
-    }
-}
+#[path = "event_tests.rs"]
+mod tests;

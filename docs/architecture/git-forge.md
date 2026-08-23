@@ -6,7 +6,7 @@ A local, git-native forge: issues, pull requests, review, and merge inside an or
 
 Must-haves (L1): issue event chains; PR event chains with review (approve/reject, whole-PR and commit-anchored inline comments); merge with merge-commit/squash/rebase strategies; command-level merge gate; sequential-id allocation via counter CAS. Code push remains native git; forge refs sync (`git forge clone/init` refspec wiring, `git forge push/pull`, remote-tracking, DAG convergence) is L2.
 
-Must-not-haves (L1): CI execution, web UI, single-file export, GitHub bridge, accounts/permissions, labels/milestones/assignees, pre-receive enforcement, forge refs sync (push/pull/refspecs/convergence).
+Must-not-haves (L1): CI execution, web UI, single-file export, GitHub bridge, accounts/permissions, milestones/assignees, pre-receive enforcement, forge refs sync (push/pull/refspecs/convergence). Labels are **in** L1 scope: `issue created`/`pr created` events carry an optional `labels` array (see Event JSON Schema v1), and the CLI accepts repeatable `--label` on `issue new`/`pr create`.
 
 ## Constraints
 

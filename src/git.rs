@@ -394,6 +394,25 @@ fn config_get_string(worktree: &Path, key: &str) -> Result<Option<String>, Strin
     classify_config_get(out.status.code(), &out.stdout, &out.stderr, key)
 }
 
+/// Strip terminal control characters from a git config diagnostic before it
+/// is embedded in a CLI error and printed, because git's stderr can echo a
+/// repo config value (possibly attacker-controlled) that contains an ansi
+/// escape; escaping C0, DEL, and the C1 block keeps the error text but
+/// prevents a terminal action (U+009B is CSI on a UTF-8 virtual console).
+fn sanitize_config_diag(bytes: &[u8]) -> String {
+    let s = String::from_utf8_lossy(bytes);
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let cp = c as u32;
+        if cp < 0x20 || (0x7F..=0x9F).contains(&cp) {
+            out.push_str(&format!("\\x{:02x}", cp));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Classify the raw `git config --null --get <key>` subprocess outcome into
 /// the identity value. Pure: takes the exit status, raw stdout/stderr bytes
 /// and key, and returns the parsed value or a Stage-A error. Split out of
@@ -417,7 +436,7 @@ fn classify_config_get(
     match status {
         Some(128) | None => Err(format!(
             "repo config is unreadable (git config --get {key} failed): {}",
-            String::from_utf8_lossy(stderr).trim()
+            sanitize_config_diag(stderr).trim()
         )),
         Some(0) => {
             // stdout must be exactly `value\0`: one trailing NUL, no interior
@@ -446,7 +465,7 @@ fn classify_config_get(
             }
             Err(format!(
                 "git config --get {key} exited {other}: {}",
-                String::from_utf8_lossy(stderr).trim()
+                sanitize_config_diag(stderr).trim()
             ))
         }
     }

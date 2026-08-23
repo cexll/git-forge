@@ -519,9 +519,11 @@ impl BoundEventStore {
 
     /// Atomically create a PR. Parameter order is fixed and documented:
     /// `(title, source_ref, base_ref, source_oid, base_oid, merge_base,
-    /// actor)` — title first (primary user input), then the two branch names,
-    /// then the three OIDs (distinct `Oid` type; cannot swap with the `&str`s),
-    /// then the event actor (`user.email`). The `pr.created` event commit
+    /// actor, description, labels)` — title first (primary user input), then
+    /// the two branch names, then the three OIDs (distinct `Oid` type; cannot
+    /// swap with the `&str`s), then the event actor (`user.email`), then the
+    /// optional PR description and the label list (both None/empty when
+    /// absent). The `pr.created` event commit
     /// (parent = genesis) is written first, then ONE `git update-ref --stdin`
     /// transaction CASes the counter and creates `/head` → event commit,
     /// `/meta` → same event commit (convenience pointer), `/source` →
@@ -585,15 +587,7 @@ impl BoundEventStore {
                 body.insert("description".into(), JsonValue::String(d.to_string()));
             }
             if !labels.is_empty() {
-                body.insert(
-                    "labels".into(),
-                    JsonValue::Array(
-                        labels
-                            .iter()
-                            .map(|l| JsonValue::String(l.clone()))
-                            .collect(),
-                    ),
-                );
+                body.insert("labels".into(), crate::event::json_string_array(labels));
             }
             let event = Event::new(EventKind::PrCreated, "pr", next, actor, body);
             let message = format!("forge:{}:{}", event.kind.as_str(), event.entity_id);

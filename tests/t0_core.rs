@@ -213,3 +213,60 @@ fn fold_ignores_unknown_entities_and_mismatched_kinds() {
     assert_eq!(state.pr.title, None);
     assert_eq!(state.pr.effective_decision, None);
 }
+
+/// Non-ASCII (multi-byte UTF-8) strings must round-trip byte-identical.
+/// Previously parse_string read each byte as a Latin-1 char (`c as char`),
+/// so `café` serialized as valid UTF-8 came back as `cafÃ©`.
+#[test]
+fn utf8_strings_roundtrip_without_mojibake() {
+    let e = event(
+        EventKind::PrCreated,
+        "pr",
+        1,
+        "dev@example.com",
+        &[
+            ("title", JsonValue::String("café 中文 🚀".into())),
+            ("description", JsonValue::String("naïve — 東京".into())),
+            (
+                "labels",
+                JsonValue::Array(vec![
+                    JsonValue::String("标签 émoji 🚀".into()),
+                    JsonValue::String("bug".into()),
+                ]),
+            ),
+        ],
+    );
+    let json = e.to_json();
+    // The wire form must carry the UTF-8 bytes unescaped-and-writable.
+    let back = Event::from_json(&json).expect("roundtrip must parse non-ASCII");
+    assert_eq!(back.body, e.body);
+}
+
+/// Raw C0 control characters (other than the JSON short forms) must be
+/// written back-escaped (`\b`, `\f`, `\u00XX`), never as bare bytes — the
+/// stored event must remain standards-compliant JSON.
+#[test]
+fn control_chars_are_escaped_in_wire_json() {
+    let e = event(
+        EventKind::IssueCreated,
+        "issue",
+        1,
+        "a@x",
+        &[(
+            "title",
+            JsonValue::String("a\u{0008}b\u{0001}c\u{000C}d".into()),
+        )],
+    );
+    let json = e.to_json();
+    // No unescaped control byte may appear (structural JSON whitespace is the
+    // only legit <0x20 and is produced by the serializer's own formatting).
+    let bare_control = json
+        .bytes()
+        .any(|b| b < 0x20 && !matches!(b, b'\n' | b't' | b'\t' | b'\r'));
+    assert!(
+        !bare_control,
+        "wire JSON contains a bare control byte: {json:?}"
+    );
+    let back = Event::from_json(&json).expect("control chars must round-trip");
+    assert_eq!(back.body, e.body);
+}

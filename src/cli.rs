@@ -35,6 +35,32 @@ fn body_obj(pairs: &[(&str, JsonValue)]) -> HashMap<String, JsonValue> {
         .collect()
 }
 
+/// Neutralize terminal control characters in a string about to be rendered to
+/// the user's terminal.
+///
+/// Stored event content (titles, descriptions, labels, comments) is
+/// attacker-influenceable and is printed verbatim by `show`/`list`; an
+/// embedded ANSI escape (OSC-8/OSC-52, CSI, cursor control) might otherwise
+/// execute on display. Every control byte is escaped to its `\xNN` literal —
+/// including newline/tab/carriage-return (so a crafted title cannot forge an
+/// extra list row or field) and the C1 block U+0080–U+009F (U+009B is CSI on a
+/// UTF-8 virtual console).
+///
+/// Visible text is preserved; nothing can move the cursor, clear the screen, or
+/// emit a terminal action.
+fn sanitize_terminal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        let cp = c as u32;
+        if cp < 0x20 || (0x7F..=0x9F).contains(&cp) {
+            out.push_str(&format!("\\x{:02x}", cp));
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
 /// Build an `issue.*` event for `store`.
 fn issue_event(kind: EventKind, id: u64, actor: &str, body: HashMap<String, JsonValue>) -> Event {
     Event::new(
@@ -57,6 +83,13 @@ fn cmd_new(args: &[String]) -> Result<String, String> {
     let mut positional: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
+        if args[i] == "--" {
+            // End-of-options: everything after `--` is positional, so a title
+            // that exactly equals a reserved flag name (`-l`, `--label`) is
+            // representable.
+            positional.extend_from_slice(&args[i + 1..]);
+            break;
+        }
         match args[i].as_str() {
             "--label" | "-l" => {
                 i += 1;
@@ -79,6 +112,15 @@ fn cmd_new(args: &[String]) -> Result<String, String> {
                 .into(),
         );
     }
+    if positional.len() > 2 {
+        // Documented grammar is `<title> [description]`; a third value after
+        // `--` (or an over-long positional list) would otherwise be silently
+        // discarded.
+        return Err(
+            "usage: git forge issue new <title> [description] [--label <x>]... — too many positional arguments"
+                .into(),
+        );
+    }
     let title = positional[0].trim().to_string();
     let description = positional
         .get(1)
@@ -93,23 +135,13 @@ fn cmd_new(args: &[String]) -> Result<String, String> {
         body.insert("description".into(), json_str(&d));
     }
     if !labels.is_empty() {
-        body.insert("labels".into(), json_labels(&labels));
+        body.insert("labels".into(), crate::event::json_string_array(&labels));
     }
     let ev = issue_event(EventKind::IssueCreated, id, &actor, body);
     store
         .append_event(&crate::store::issue_ref(id), &ev)
         .map_err(|e| e.to_string())?;
     Ok(format!("issue #{id} created: {title}"))
-}
-
-/// Build a `JsonValue::Array` of string labels for an event body.
-fn json_labels(labels: &[String]) -> JsonValue {
-    JsonValue::Array(
-        labels
-            .iter()
-            .map(|l| JsonValue::String(l.clone()))
-            .collect(),
-    )
 }
 
 /// `git forge issue list`
@@ -134,7 +166,7 @@ fn cmd_list(store: &EventStore) -> Result<String, String> {
         out.push_str(&format!(
             "#{} {} ({})\n",
             state.id,
-            state.title.as_deref().unwrap_or("(untitled)"),
+            sanitize_terminal(state.title.as_deref().unwrap_or("(untitled)")),
             if state.open { "open" } else { "closed" }
         ));
         found += 1;
@@ -160,20 +192,23 @@ fn cmd_show(store: &EventStore, args: &[String]) -> Result<String, String> {
     let mut out = format!(
         "#{} {} — {}\n",
         state.id,
-        state.title.as_deref().unwrap_or("(untitled)"),
+        sanitize_terminal(state.title.as_deref().unwrap_or("(untitled)")),
         if state.open { "open" } else { "closed" }
     );
     if let Some(d) = &state.description {
-        out.push_str(&format!("description: {d}\n"));
+        out.push_str(&format!("description: {}\n", sanitize_terminal(d)));
     }
     if !state.labels.is_empty() {
-        out.push_str(&format!("labels: {}\n", state.labels.join(", ")));
+        out.push_str(&format!(
+            "labels: {}\n",
+            sanitize_terminal(&state.labels.join(", "))
+        ));
     }
     out.push('\n');
     if !state.comments.is_empty() {
         out.push_str("comments:\n");
         for c in &state.comments {
-            out.push_str(&format!("  - {c}\n"));
+            out.push_str(&format!("  - {}\n", sanitize_terminal(c)));
         }
     }
     Ok(out.trim_end().to_string())
@@ -319,6 +354,17 @@ fn cmd_pr_create(args: &[String]) -> Result<String, String> {
     let mut labels: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
+        if args[i] == "--" {
+            // End-of-options: remaining tokens are the single title positional.
+            for t in &args[i + 1..] {
+                if title.is_none() {
+                    title = Some(t.to_string());
+                } else {
+                    return Err("too many positional arguments; usage: git forge pr create --source <branch> --base <branch> <title>".into());
+                }
+            }
+            break;
+        }
         match args[i].as_str() {
             "--source" => {
                 i += 1;
@@ -339,14 +385,18 @@ fn cmd_pr_create(args: &[String]) -> Result<String, String> {
                 if i >= args.len() {
                     return Err("--body requires a description".into());
                 }
-                body = Some(args[i].clone());
+                body = Some(args[i].trim().to_string());
             }
             "--label" | "-l" => {
                 i += 1;
                 if i >= args.len() {
                     return Err("--label requires a value".into());
                 }
-                labels.push(args[i].clone());
+                let v = args[i].trim().to_string();
+                if v.is_empty() {
+                    return Err("--label requires a non-empty value".into());
+                }
+                labels.push(v);
             }
             a if a.starts_with("--") || a.starts_with('-') => {
                 return Err(format!("unknown option '{a}'"));
@@ -389,7 +439,7 @@ fn cmd_pr_create(args: &[String]) -> Result<String, String> {
             base_oid,
             merge_base,
             &actor,
-            body.as_deref().filter(|b| !b.trim().is_empty()),
+            body.as_deref().filter(|b| !b.is_empty()),
             &labels,
         )
         .map_err(|e| e.to_string())?;
@@ -411,33 +461,40 @@ fn cmd_pr_show(store: &EventStore, args: &[String]) -> Result<String, String> {
     let mut out = format!(
         "PR #{} {} — {}\n",
         state.id,
-        state.title.as_deref().unwrap_or("(untitled)"),
+        sanitize_terminal(state.title.as_deref().unwrap_or("(untitled)")),
         state
             .effective_decision
             .as_deref()
-            .map(|d| format!("decision: {d}"))
+            .map(|d| format!("decision: {}", sanitize_terminal(d)))
             .unwrap_or_else(|| "no review yet".into())
     );
     if let Some(r) = &state.merge_result {
-        out.push_str(&format!("merged: {r}\n"));
+        out.push_str(&format!("merged: {}\n", sanitize_terminal(r)));
     }
     if let Some(r) = &state.base_ref {
-        out.push_str(&format!("base: {r}\n"));
+        out.push_str(&format!("base: {}\n", sanitize_terminal(r)));
     }
     if let Some(r) = &state.source_ref {
-        out.push_str(&format!("source: {r}\n"));
+        out.push_str(&format!("source: {}\n", sanitize_terminal(r)));
     }
     if let (Some(b), Some(s)) = (&state.base_head, &state.source_head) {
-        out.push_str(&format!("diff: {b}...{s}\n"));
+        out.push_str(&format!(
+            "diff: {}...{}\n",
+            sanitize_terminal(b),
+            sanitize_terminal(s)
+        ));
     }
     if let Some(d) = &state.description {
-        out.push_str(&format!("description: {d}\n"));
+        out.push_str(&format!("description: {}\n", sanitize_terminal(d)));
     }
     if !state.labels.is_empty() {
-        out.push_str(&format!("labels: {}\n", state.labels.join(", ")));
+        out.push_str(&format!(
+            "labels: {}\n",
+            sanitize_terminal(&state.labels.join(", "))
+        ));
     }
     for c in &state.comments {
-        out.push_str(&format!("comment: {c}\n"));
+        out.push_str(&format!("comment: {}\n", sanitize_terminal(c)));
     }
     Ok(out.trim_end().to_string())
 }
@@ -460,8 +517,8 @@ fn cmd_pr_list(store: &EventStore) -> Result<String, String> {
         out.push_str(&format!(
             "PR #{} {} ({})\n",
             st.id,
-            st.title.as_deref().unwrap_or("(untitled)"),
-            st.effective_decision.as_deref().unwrap_or("no review")
+            sanitize_terminal(st.title.as_deref().unwrap_or("(untitled)")),
+            sanitize_terminal(st.effective_decision.as_deref().unwrap_or("no review"))
         ));
         found += 1;
     }
@@ -664,4 +721,35 @@ fn pr_help() -> String {
      \x20 diff <n>\n\
      \x20 merge [<n>] [--squash|--rebase]"
         .to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_terminal;
+
+    /// Terminal control sequences are neutralized to their `\xNN` literal while
+    /// visible text (including non-ASCII letters) survives.
+    #[test]
+    fn sanitize_terminal_neutralizes_control_sequences() {
+        // OSC-8 hyperlink / ESC cursor sequence must not survive verbatim.
+        let malicious = "\u{001b}]8;;http://evil.example\u{0007}click\u{001b}]8;;\u{0007}";
+        let out = sanitize_terminal(malicious);
+        assert!(!out.contains('\u{001b}'), "ESC must be escaped: {out:?}");
+        assert!(!out.contains('\u{0007}'), "BEL must be escaped: {out:?}");
+        assert!(out.contains("\\x1b"), "ESC rendered as \\x1b: {out:?}");
+        assert!(out.contains("click"), "visible text preserved: {out:?}");
+        // Structural whitespace (newline/tab/carriage-return) is escaped so a
+        // stored title cannot forge an extra list row or field.
+        assert_eq!(sanitize_terminal("a\rb"), "a\\x0db");
+        assert_eq!(
+            sanitize_terminal("line1\nline2\tend"),
+            "line1\\x0aline2\\x09end"
+        );
+        // DEL and C1 controls (U+0080-U+009F; U+009B is CSI) are escaped.
+        assert_eq!(sanitize_terminal("caf\u{7f}"), "caf\\x7f");
+        assert_eq!(sanitize_terminal("x\u{009b}2J"), "x\\x9b2J");
+        // Plain printable and non-ASCII visible text survive.
+        assert_eq!(sanitize_terminal("plain text"), "plain text");
+        assert_eq!(sanitize_terminal("café 中文 🚀"), "café 中文 🚀");
+    }
 }

@@ -197,6 +197,144 @@ fn pr_create_requires_flags_and_title() {
     assert!(ref_oid(&dir, "refs/forge/prs/1/head").is_none());
 }
 
+/// `pr create --label` must match issue semantics: whitespace-only labels are
+/// rejected, and surrounding whitespace is trimmed before persistence. `--body`
+/// is likewise trimmed (matching the trimmed issue description).
+#[test]
+fn pr_create_label_trimmed_and_body_trimmed() {
+    let dir = tmpdir("labeltrim");
+    init_repo(&dir);
+    make_feature(&dir, "feature", "feat\n");
+
+    // whitespace-only label must be rejected (no PR created).
+    let (c1, _, e1) = forge(
+        &dir,
+        &[
+            "forge", "pr", "create", "--source", "feature", "--base", "main", "T", "--label", "   ",
+        ],
+    );
+    assert_ne!(c1, 0, "whitespace-only label must error; stdout={e1}");
+    assert!(e1.contains("label"), "stderr: {e1}");
+    assert!(ref_oid(&dir, "refs/forge/prs/1/head").is_none());
+
+    // a padded label is trimmed; a padded body is trimmed.
+    let (c2, _, e2) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "create",
+            "--source",
+            "feature",
+            "--base",
+            "main",
+            "T",
+            "--label",
+            "  bug  ",
+            "--body",
+            "  hello world  ",
+        ],
+    );
+    assert_eq!(c2, 0, "padded label/body must create: {e2}");
+    let show2 = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert_eq!(show2.0, 0, "pr show failed: {}", show2.2);
+    assert!(
+        show2.1.contains("labels: bug"),
+        "label must be trimmed: {}",
+        show2.1
+    );
+    assert!(
+        show2.1.contains("hello world"),
+        "body must be trimmed: {}",
+        show2.1
+    );
+}
+
+/// `--` marks end-of-options, so a title that exactly equals a reserved flag
+/// name is representable on both surfaces.
+#[test]
+fn end_of_options_lets_flag_names_be_titles() {
+    // issue surface (fresh repo, issue always #1)
+    let dir = tmpdir("endo-issue");
+    init_repo(&dir);
+    let (ci, _, ei) = forge(&dir, &["forge", "issue", "new", "--", "--label"]);
+    assert_eq!(ci, 0, "issue create failed: {ei}");
+    let s1 = forge(&dir, &["forge", "issue", "show", "1"]);
+    assert_eq!(s1.0, 0, "issue show failed: {}", s1.2);
+    assert!(
+        s1.1.contains("--label"),
+        "title should be --label: {}",
+        s1.1
+    );
+
+    // pr surface (fresh repo, PR always #1)
+    let dir2 = tmpdir("endo-pr");
+    init_repo(&dir2);
+    make_feature(&dir2, "feature", "feat\n");
+    let (cp, _, ep) = forge(
+        &dir2,
+        &[
+            "forge", "pr", "create", "--source", "feature", "--base", "main", "--", "--label",
+        ],
+    );
+    assert_eq!(cp, 0, "pr create failed: {ep}");
+    let s2 = forge(&dir2, &["forge", "pr", "show", "1"]);
+    assert_eq!(s2.0, 0, "pr show failed: {}", s2.2);
+    assert!(
+        s2.1.contains("--label"),
+        "PR title should be --label: {}",
+        s2.1
+    );
+}
+
+/// A third positional (`<title> [description] extra`) is rejected, not silently
+/// discarded.
+#[test]
+fn issue_new_rejects_excess_positionals() {
+    let dir = tmpdir("excess");
+    init_repo(&dir);
+    let (c, o, e) = forge(&dir, &["forge", "issue", "new", "T", "desc", "extra"]);
+    assert_ne!(c, 0, "excess positional must error; stdout={o}");
+    assert!(e.contains("too many positional"), "stderr: {e}");
+    // No issue ref is created by the rejection.
+    assert!(ref_oid(&dir, "refs/forge/issues/1").is_none());
+}
+
+/// Stored control characters (e.g. a label containing newline/ESC) are escaped
+/// on render, so `show` cannot forge output or emit a terminal action.
+#[test]
+fn issue_show_escapes_control_chars_in_label() {
+    let dir = tmpdir("ctrllabel");
+    init_repo(&dir);
+    // A label containing a backspace and an ESC sequence is stored (issue label
+    // validation only rejects empty) but must render escaped.
+    let (c, _, e) = forge(
+        &dir,
+        &[
+            "forge",
+            "issue",
+            "new",
+            "T",
+            "--label",
+            "a\u{8}b\u{1b}[31mred",
+        ],
+    );
+    assert_eq!(c, 0, "issue create failed: {e}");
+    let s = forge(&dir, &["forge", "issue", "show", "1"]);
+    assert_eq!(s.0, 0, "issue show failed: {}", s.2);
+    assert!(
+        !s.1.contains('\u{8}'),
+        "bare backspace must be escaped: {}",
+        s.1
+    );
+    assert!(!s.1.contains('\u{1b}'), "bare ESC must be escaped: {}", s.1);
+    assert!(
+        s.1.contains("\\x08") && s.1.contains("\\x1b"),
+        "escaped forms present: {}",
+        s.1
+    );
+}
+
 #[test]
 fn pr_create_rejects_non_local_refs() {
     let dir = tmpdir("nonlocal");
