@@ -2261,6 +2261,168 @@ fn merge_retry_after_green_append_keeps_event_uuid() {
     );
 }
 
+/// F-010 (multi-retry race): a green/approved PR #1 merge parked at the
+/// pending-window barrier has a LEGITIMATE green append move its head H→A so
+/// the first final transaction loses its CAS and the loop validates/adopts A.
+/// Before the retry transaction, the head is force-rewritten A→B to a DIFFERENT
+/// green/approved sibling under H (a non-append rewrite: B descends from H,
+/// never from A). The old retry loop validated the moved candidate against the
+/// IMMUTABLE initial `gate_head` (H), so it accepted B — because B reaches H —
+/// advanced PR #1's base, deleted its pending ref, and parented `pr.merge` on
+/// B. The fix validates each moved candidate against the CURRENT validated tip
+/// (`head_expected`, = A after the first adoption); B does not extend A, so it
+/// is a genuine transaction failure → base unchanged, pending result ref left
+/// in place, exit nonzero.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn merge_refuses_sibling_rewrite_after_green_append_during_finalize() {
+    let dir = tmpdir("merge-sibling-rewrite");
+    init_repo(&dir);
+    config_identity(&dir);
+    make_feature_with_ci(&dir, "feature", "feat\n", 0);
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+    assert_eq!(forge(&dir, &["forge", "ci", "run", "1"]).0, 0);
+    assert_eq!(
+        forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
+        0
+    );
+    // Uncheckout the base so the merge reaches the CI gate and parks.
+    git(&dir, &["checkout", "-q", "feature"]);
+
+    let barrier = tmpdir("merge-sibling-rewrite-window");
+    let retry_barrier = tmpdir("merge-sibling-rewrite-retry");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let gate_head = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let mut child = std::process::Command::new(bin)
+        .args(["forge", "pr", "merge", "1"])
+        .current_dir(&dir)
+        .env("GIT_FORGE_TEST_MERGE_BARRIER", &barrier)
+        .env("GIT_FORGE_TEST_MERGE_RETRY_BARRIER", &retry_barrier)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !barrier.join("ready").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "merge never reached the barrier window"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_some(),
+        "pending result ref must exist in the barrier window"
+    );
+
+    // First loss: a LEGITIMATE green append (a passing `ci run` appends a
+    // ci.check success commit) moves the head H→A.
+    let (c, o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_eq!(c, 0, "green ci run must pass: {e} {o}");
+    let head_a = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+    assert_ne!(
+        head_a, gate_head,
+        "the green append must move the head to A"
+    );
+
+    // Release the first barrier; the merge loses its CAS against H, validates
+    // and adopts A, then parks at the retry barrier.
+    let release_path = barrier.join("release");
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&release_path)
+            .expect("release sentinel must be created atomically");
+        let _ = f.write_all(b"go\n");
+    }
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !retry_barrier.join("ready").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "merge never reached the retry window (did not adopt A)"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        head_a,
+        "the head must still be A when the merge is parked at the retry window"
+    );
+
+    // Second loss: force-rewrite A→B to a DIFFERENT green/approved sibling
+    // under H. B descends from H (via a raw ci.check success + an approving
+    // pr.review) and is anchored to PR #1, but it never descends from A.
+    let b_ci = append_event_commit(&dir, &gate_head, &forged_ci_success_json(1));
+    let b = append_event_commit(&dir, &b_ci, &forged_review_approve_json(1));
+    let (c, _, e) = git(&dir, &["update-ref", "refs/forge/prs/1/head", &b]);
+    assert_eq!(c, 0, "rewrite PR #1 head A->B: {e}");
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        b,
+        "PR #1 head must point at the sibling rewrite B"
+    );
+
+    // Release the retry barrier; the merge retries against A, loses again to B,
+    // and must refuse the non-append rewrite.
+    let release_path = retry_barrier.join("release");
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&release_path)
+            .expect("release sentinel must be created atomically");
+        let _ = f.write_all(b"go\n");
+    }
+    let status = child.wait().unwrap();
+    let mut stderr = String::new();
+    {
+        use std::io::Read as _;
+        if let Some(mut e) = child.stderr.take() {
+            let _ = e.read_to_string(&mut stderr);
+        }
+    }
+    assert!(
+        !status.success(),
+        "merge must refuse the A->B sibling rewrite (stderr: {stderr})"
+    );
+    assert!(
+        stderr.contains("final transaction failed"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("refs unchanged"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("pending result ref refs/forge/prs/1/result left in place"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base ref must not advance"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        b,
+        "PR #1 head must stay at B, not receive a pr.merge"
+    );
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_some(),
+        "pending result ref must be left in place on a non-append rewrite refusal"
+    );
+}
+
 /// Run a `git` subprocess whose stdin is piped with `stdin` (may be None),
 /// returning (code, stdout, stderr). Used to craft raw event commits for the
 /// F-008 masquerade regressions (plumbing needs stdin for `hash-object --stdin`

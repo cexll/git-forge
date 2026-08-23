@@ -338,13 +338,15 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
     // `head_expected`, never re-read and accepted: if a concurrent `ci run`
     // moved the head during the pending window, the head CAS fails and
     // nothing moves. We then re-read/refold and retry ONLY when the new tip
-    // is a valid first-parent extension of the gate-validated head on PR #id's
-    // chain (F-008) AND the effective Review is still approve AND the latest
-    // CI Check is still success — the revalidated tip becomes the new expected
-    // head. Otherwise (a rewrite / cross-PR / cross-entity tip, a tip whose
-    // gate no longer holds, or the head did not move and the failure is
-    // genuine) we refuse without advancing the base, preserving the pending
-    // result ref for genuine/sabotage failures (F-007, F-008).
+    // is a valid first-parent extension of the CURRENT validated head on PR
+    // #id's chain (F-008; `head_expected` as it advances through each adopted
+    // candidate — NOT the immutable initial `gate_head`, F-010) AND the
+    // effective Review is still approve AND the latest CI Check is still
+    // success — the revalidated tip becomes the new expected head. Otherwise
+    // (a rewrite / non-append sibling move / cross-PR / cross-entity tip, a
+    // tip whose gate no longer holds, or the head did not move and the
+    // failure is genuine) we refuse without advancing the base, preserving the
+    // pending result ref for genuine/sabotage failures (F-007, F-008, F-010).
     let mut head_expected = gate_head;
     let mut attempts = 0u32;
     const MAX_FINALIZE_RETRIES: u32 = 3;
@@ -389,12 +391,18 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
                     ));
                 }
                 // Canonical chain validator: the moved tip must be a valid
-                // first-parent extension of the GATE-VALIDATED tip on PR #id's
-                // chain (F-008). A rewrite, a mixed/foreign chain, a cross-PR
-                // tip, or a disappeared ref cannot reach the gate-validated tip
-                // here, so those refuse with refs unchanged and the pending ref
-                // left in place.
-                if !store.store().head_extends_pr_chain(id, gate_head, tip) {
+                // first-parent extension of the CURRENT validated tip on PR
+                // #id's chain (F-008, F-010) — `head_expected`, not the
+                // immutable initial `gate_head`. The initial `gate_head` is
+                // only correct on the FIRST retry; once the loop has validated
+                // and adopted a newer tip (e.g. a legitimate green append
+                // H→A), a subsequent candidate must extend THAT tip. A sibling
+                // rewrite A→B that descends from H but never from A is a
+                // non-append move and must be refused (F-010). Rewrites,
+                // mixed/foreign chains, cross-PR tips, or disappeared refs
+                // also cannot reach `head_expected`, so all refuse with refs
+                // unchanged and the pending ref left in place.
+                if !store.store().head_extends_pr_chain(id, head_expected, tip) {
                     return Err(format!(
                         "merge execution finished but final transaction failed \
                          ({e}); refs unchanged, pending result ref \
@@ -415,6 +423,24 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
                 }
                 head_expected = tip;
                 attempts += 1;
+                // Test-only retry-window barrier (F-010): pause between the
+                // adoption of a revalidated head tip and the retry transaction,
+                // so a regression can force-rewrite the head (A→B) at exactly
+                // that point. Fires only on the FIRST adoption; debug builds
+                // only, inert in release.
+                #[cfg(debug_assertions)]
+                if attempts == 1 {
+                    if let Err(b) = maybe_run_test_retry_barrier() {
+                        let pending = cleanup_pending_result(
+                            &store,
+                            id,
+                            result_commit,
+                            &mut lock_handle,
+                            &tmp,
+                        );
+                        return Err(format!("{b}{pending}"));
+                    }
+                }
                 if attempts > MAX_FINALIZE_RETRIES {
                     let pending =
                         cleanup_pending_result(&store, id, result_commit, &mut lock_handle, &tmp);
@@ -546,19 +572,18 @@ fn cleanup_pending_result(
 }
 
 /// Test-only pending-window barrier (wire contract § Test-only pending-window
-/// barrier). Debug builds only; inert in release. When
-/// `GIT_FORGE_TEST_MERGE_BARRIER=<dir>` is set, the merge pauses after the
-/// pending `/result` ref exists (and the temp worktree is gone) but before the
-/// final transaction:
+/// barrier). Debug builds only; inert in release. When `env_key=<dir>` is set,
+/// the merge pauses (between the two named merge phases) until a `release`
+/// sentinel appears:
 ///   1. atomically create `<dir>/ready` (O_CREAT|O_EXCL);
 ///   2. poll for `<dir>/release` (bounded 30s deadline);
 ///   3. on success, delete `<dir>/release` and continue;
 ///   4. on deadline, remove both sentinels best-effort and fail the merge with
 ///      no ref updates.
 #[cfg(debug_assertions)]
-fn maybe_run_test_barrier() -> Result<(), String> {
+fn run_test_barrier(env_key: &str) -> Result<(), String> {
     use std::io::Write;
-    let Ok(dir) = std::env::var("GIT_FORGE_TEST_MERGE_BARRIER") else {
+    let Ok(dir) = std::env::var(env_key) else {
         return Ok(());
     };
     let dir = std::path::PathBuf::from(dir);
@@ -584,6 +609,23 @@ fn maybe_run_test_barrier() -> Result<(), String> {
     let _ = std::fs::remove_file(&release);
     let _ = std::fs::remove_file(&ready);
     Ok(())
+}
+
+/// Pre-final-transaction barrier: pauses after the pending `/result` ref exists
+/// (and the temp worktree is gone) but before the first completion transaction.
+#[cfg(debug_assertions)]
+fn maybe_run_test_barrier() -> Result<(), String> {
+    run_test_barrier("GIT_FORGE_TEST_MERGE_BARRIER")
+}
+
+/// Retry-window barrier (F-010): pauses right after the merge has adopted a
+/// revalidated head tip (the first CAS retry) and before the retry transaction.
+/// Lets a deterministic regression force-rewrite the head between the adoption
+/// and the retry. Debug builds only; inert in release and when the env var is
+/// unset.
+#[cfg(debug_assertions)]
+fn maybe_run_test_retry_barrier() -> Result<(), String> {
+    run_test_barrier("GIT_FORGE_TEST_MERGE_RETRY_BARRIER")
 }
 
 fn pr_merge_help() -> String {
