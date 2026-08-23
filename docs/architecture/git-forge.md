@@ -155,7 +155,7 @@ Kinds and body fields:
 | `pr.comment` | pr | `{body}` |
 | `pr.review` | pr | `{decision: "approve"|"reject", body?, file?, line?, commit?}` |
 | `pr.merge` | pr | `{strategy: "merge"|"squash"|"rebase", result_commit}` |
-| `ci.check` | pr | `{status: "pending"|"success"|"failed", plan}` |
+| `ci.check` | pr | `{status: "pending"|"success"|"failed", plan?}` |
 
 `pr.review` is anchored to optional `commit` + permission to include `file`/`line` for inline comment. Inline comments are immutable references to a snapshot commit; they never follow later diff changes.
 
