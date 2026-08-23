@@ -4,7 +4,7 @@ Status: active
 
 ## Problem
 
-L1's Merge Gate blocks `git forge pr merge` only on an approved Review event
+(Before CI) L1's Merge Gate blocked `git forge pr merge` only on an approved Review event
 (`src/pr_merge.rs`). The project needs a git-native CI whose outcome gates merge
 — the git-native analogue of GitLab's "merge when pipeline succeeds" — while
 honouring the **zero resident processes / git-protocol-only** constraint: no
@@ -18,16 +18,19 @@ Implement a git-native CI run (all on-demand, no daemon), now shipped in L1:
   run` falls back to `just check`. This keeps any repo able to provide a plan,
   while git-forge itself is zero-config. A `.forge/ci.sh` that is a symlink or
   otherwise not a regular file is **refused up front** (F-001) — the plan is
-  resolved before any temporary worktree is created or any Check is recorded, so
-  CI never follows a tracked link to mutable bytes outside the snapshot.
+  resolved before any temporary worktree is created or any run-result Check is
+  appended (the create-time `pending` marker is preserved), so CI never follows
+  a tracked link to mutable bytes outside the snapshot.
 - **Trigger**: on-demand only. `git forge pr create` publishes a `pending`
   `ci.check` marker (no plan executes at creation); `git forge ci run <pr>`
   explicitly executes the plan against the PR's immutable source snapshot. No
   git hook auto-runs CI.
-- **Result**: a **CI Check** Forge Event (`status`: pending/success/failed, plus
-  `plan`, timestamp, actor). A failing plan still records a `failed` Check
-  before the command exits nonzero. The Merge Gate reads only the latest status;
-  a re-run appends a new CI Check and fold keeps the latest.
+- **Result**: a **CI Check** Forge Event (`status`: pending/success/failed,
+  timestamp, actor; `plan` is present only on executed success/failed results —
+  the create-time `pending` marker carries status only). A failing plan still
+  records a `failed` Check before the command exits nonzero. The Merge Gate
+  reads only the latest status; a re-run appends a new CI Check and the fold
+  keeps the latest.
 - **Gate**: the Merge Gate (in L1) requires an approved Review **and** the latest
   CI Check == success. Direct `git merge` remains documented as bypassable, as in
   L1.

@@ -15,10 +15,11 @@ repository. Forge-state sync/refspec wiring across clones is L2.
 - **Merge gate**: `pr merge` refuses until the last reachable review is an
   `approve` AND the latest CI Check is green; approve → reject transitions are
   honored.
-- **CI**: `git forge ci run <pr>` executes the repo CI plan (`.forge/ci.sh` as a
-  regular file, else the `just check` fallback) against the PR's immutable
-  snapshot and records the outcome as a `ci.check` Forge Event.
-- **Merge strategies**: `--merge` (default, merge commit), `--squash`
+- **CI**: `git forge ci run <pr>` executes the repo CI plan against the PR's
+  immutable snapshot and records the outcome as a `ci.check` Forge Event. A
+  regular `.forge/ci.sh` runs; the `just check` fallback runs only when
+  `.forge/ci.sh` is absent; a present symlink or other non-regular entry is
+  refused up front without appending a Check result.- **Merge strategies**: `--merge` (default, merge commit), `--squash`
   (single commit), `--rebase` (linear replay onto the base tip).
 - All state in git refs (`refs/forge/*`); no daemon, no second protocol.
 
