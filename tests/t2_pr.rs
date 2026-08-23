@@ -2260,3 +2260,301 @@ fn merge_retry_after_green_append_keeps_event_uuid() {
         "the retried pr.merge must re-parent the same event (retained UUID)"
     );
 }
+
+/// Run a `git` subprocess whose stdin is piped with `stdin` (may be None),
+/// returning (code, stdout, stderr). Used to craft raw event commits for the
+/// F-008 masquerade regressions (plumbing needs stdin for `hash-object --stdin`
+/// and `mktree`).
+fn run_git_in(dir: &PathBuf, args: &[&str], stdin: Option<&str>) -> (i32, String, String) {
+    use std::io::Write as _;
+    let mut cmd = Command::new("git");
+    cmd.args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    match stdin {
+        Some(input) => {
+            let mut sink = child.stdin.take().unwrap();
+            sink.write_all(input.as_bytes()).unwrap();
+            // Drop `sink` to close stdin so the child sees EOF.
+        }
+        None => drop(child.stdin.take()),
+    }
+    let out = child.wait_with_output().unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    )
+}
+
+/// Append a raw `.forge/event.json` commit as a first-parent child of `parent`,
+/// returning its OID. The event JSON is caller-supplied so a regression can
+/// build a mixed/foreign masquerade chain (e.g. a PR #2 chain topped with an
+/// event carrying `entity_id = 1`).
+fn append_event_commit(dir: &PathBuf, parent: &str, json: &str) -> String {
+    let (c, blob, e) = run_git_in(dir, &["hash-object", "-w", "--stdin"], Some(json));
+    assert_eq!(c, 0, "hash-object failed: {e}");
+    // `git mktree` builds one tree level; the `.forge/event.json` path needs a
+    // nested tree: first the `.forge` subtree, then the root tree containing it.
+    let forge_input = format!("100644 blob {blob}\tevent.json\n");
+    let (c, forge_tree, e) = run_git_in(dir, &["mktree"], Some(&forge_input));
+    assert_eq!(c, 0, "mktree (.forge) failed: {e}");
+    let root_input = format!("040000 tree {forge_tree}\t.forge\n");
+    let (c, tree, e) = run_git_in(dir, &["mktree"], Some(&root_input));
+    assert_eq!(c, 0, "mktree (root) failed: {e}");
+    let (c, commit, e) = run_git_in(
+        dir,
+        &["commit-tree", &tree, "-p", parent],
+        Some("forge:event:masquerade"),
+    );
+    assert_eq!(c, 0, "commit-tree failed: {e}");
+    commit
+}
+
+/// A valid UUID-v4-shaped id for a hand-built masquerade event.
+const MASQUERADE_UUID: &str = "11111111-1111-4111-8111-111111111111";
+
+/// Build the JSON for a synthetic `pr.comment` event on entity `pr` / id 1,
+/// used to top a foreign chain so it folds to PR #1's id while retaining a PR
+/// #2 snapshot / approval / CI state (the F-008 mixed-chain masquerade).
+fn masquerade_event_json() -> String {
+    format!(
+        "{{\"v\":1,\"id\":\"{MASQUERADE_UUID}\",\"kind\":\"pr.comment\",\
+         \"entity\":\"pr\",\"entity_id\":1,\"ts\":\"2026-01-01T00:00:00Z\",\
+         \"actor\":\"attacker@example.com\",\"body\":{{\"body\":\"masquerade\"}}}}"
+    )
+}
+
+/// F-008 (mixed/foreign masquerade at the gate): PR #1's `/head` is rewritten
+/// to a tip that folds to PR #1's id (a PR #2 chain topped with an event
+/// carrying `entity_id = 1`) but is actually a foreign, independently
+/// green/approved chain. The old `fold(...).pr.id == id` anchor accepted it
+/// (fold overwrites `pr.id` per event), so the merge would adopt the foreign
+/// snapshot and advance PR #1's base. The strengthened chain anchor must refuse
+/// at the gate: base unchanged, no pending result ref, exit nonzero.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn merge_refuses_masquerading_foreign_chain_at_entry() {
+    let dir = tmpdir("merge-masquerade-entry");
+    init_repo(&dir);
+    config_identity(&dir);
+
+    // PR #1: independently green + approved.
+    make_feature_with_ci(&dir, "feature", "feat\n", 0);
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+    assert_eq!(forge(&dir, &["forge", "ci", "run", "1"]).0, 0);
+    assert_eq!(
+        forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
+        0
+    );
+
+    // PR #2: independently green + approved (the foreign snapshot source).
+    make_feature_with_ci(&dir, "feature2", "feat2\n", 0);
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature2", "--base", "main", "PR2"]
+        )
+        .0,
+        0
+    );
+    assert_eq!(forge(&dir, &["forge", "ci", "run", "2"]).0, 0);
+    assert_eq!(
+        forge(&dir, &["forge", "pr", "review", "2", "--approve"]).0,
+        0
+    );
+
+    // Masquerade: top PR #2's green/approved chain with an event carrying
+    // entity_id = 1 so the fold reports pr.id == 1 (the old anchor passes)
+    // while the snapshot / approval / CI underneath stay PR #2's.
+    let head2 = ref_oid(&dir, "refs/forge/prs/2/head").unwrap();
+    let masq = append_event_commit(&dir, &head2, &masquerade_event_json());
+    let (c, _, e) = git(&dir, &["update-ref", "refs/forge/prs/1/head", &masq]);
+    assert_eq!(c, 0, "rewrite PR #1 head to masquerade: {e}");
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        masq,
+        "PR #1 head must point at the masquerade tip"
+    );
+
+    // Uncheckout the base so the merge would reach the gate and merge.
+    git(&dir, &["checkout", "-q", "feature"]);
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+
+    let (c, _o, e) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_ne!(
+        c, 0,
+        "merge must refuse a masquerading foreign chain (stderr: {e})"
+    );
+    assert!(
+        e.contains("not anchored to PR #1"),
+        "error must name the chain-anchor refusal: {e}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base ref must not advance"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        masq,
+        "PR #1 head must stay at the masquerade tip"
+    );
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_none(),
+        "no pending result ref may be created before the gate"
+    );
+}
+
+/// F-008 (rewrite between the finalize read and CAS): a green/approved PR #1
+/// merge parked at the pending-window barrier has its `/head` ref REWRITTEN to
+/// a masquerading foreign tip (a PR #2 chain topped with an event carrying
+/// `entity_id = 1`) that folds to PR #1's id. The retry must prove the moved
+/// tip is a valid first-parent extension of the GATE-VALIDATED tip on PR #1's
+/// chain before retrying (F-008); a rewrite is a genuine transaction failure →
+/// base unchanged, pending result ref left in place, exit nonzero.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn merge_refuses_rewrite_to_unproven_tip_between_read_and_cas() {
+    let dir = tmpdir("merge-masquerade-retry");
+    init_repo(&dir);
+    config_identity(&dir);
+
+    // PR #1: independently green + approved (the merge's gate-validated head).
+    make_feature_with_ci(&dir, "feature", "feat\n", 0);
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+    assert_eq!(forge(&dir, &["forge", "ci", "run", "1"]).0, 0);
+    assert_eq!(
+        forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
+        0
+    );
+
+    // PR #2: independently green + approved (the foreign masquerade source).
+    make_feature_with_ci(&dir, "feature2", "feat2\n", 0);
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature2", "--base", "main", "PR2"]
+        )
+        .0,
+        0
+    );
+    assert_eq!(forge(&dir, &["forge", "ci", "run", "2"]).0, 0);
+    assert_eq!(
+        forge(&dir, &["forge", "pr", "review", "2", "--approve"]).0,
+        0
+    );
+
+    // Uncheckout the base so the merge reaches the CI gate and parks.
+    git(&dir, &["checkout", "-q", "feature"]);
+
+    let barrier = tmpdir("merge-masquerade-retry-window");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let head2 = ref_oid(&dir, "refs/forge/prs/2/head").unwrap();
+    let masq = append_event_commit(&dir, &head2, &masquerade_event_json());
+
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let mut child = std::process::Command::new(bin)
+        .args(["forge", "pr", "merge", "1"])
+        .current_dir(&dir)
+        .env("GIT_FORGE_TEST_MERGE_BARRIER", &barrier)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !barrier.join("ready").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "merge never reached the barrier window"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_some(),
+        "pending result ref must exist in the barrier window"
+    );
+
+    // Rewrite PR #1's head to the masquerading foreign tip — an unproven tip,
+    // not an append of the gate-validated PR #1 head.
+    let (c, _, e) = git(&dir, &["update-ref", "refs/forge/prs/1/head", &masq]);
+    assert_eq!(c, 0, "rewrite PR #1 head to masquerade: {e}");
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        masq,
+        "PR #1 head must point at the masquerade tip"
+    );
+
+    let release_path = barrier.join("release");
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&release_path)
+            .expect("release sentinel must be created atomically");
+        let _ = f.write_all(b"go\n");
+    }
+    let status = child.wait().unwrap();
+    let mut stderr = String::new();
+    {
+        use std::io::Read as _;
+        if let Some(mut e) = child.stderr.take() {
+            let _ = e.read_to_string(&mut stderr);
+        }
+    }
+    assert!(
+        !status.success(),
+        "merge must refuse a rewrite to an unproven tip (stderr: {stderr})"
+    );
+    assert!(
+        stderr.contains("final transaction failed"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("refs unchanged"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("pending result ref refs/forge/prs/1/result left in place"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base ref must not advance"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        masq,
+        "PR #1 head must stay at the masquerade tip, not receive a pr.merge"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/2/head").unwrap(),
+        head2,
+        "PR #2 chain must be untouched"
+    );
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_some(),
+        "pending result ref must be left in place on a rewrite refusal"
+    );
+}

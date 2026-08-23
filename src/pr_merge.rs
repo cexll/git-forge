@@ -349,22 +349,6 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
     let mut attempts = 0u32;
     const MAX_FINALIZE_RETRIES: u32 = 3;
     loop {
-        // After the first attempt the head moved: read the new tip and
-        // re-evaluate the gate against it before touching the transaction.
-        if attempts > 0 {
-            let (_, tip) = match read_merge_gate(store.store(), id, &head) {
-                Ok(v) => v,
-                Err(gate_err) => {
-                    let pending =
-                        cleanup_pending_result(&store, id, result_commit, &mut lock_handle, &tmp);
-                    return Err(format!(
-                        "{gate_err} (merge aborted: the PR head changed during \
-                         finalization; refs unchanged{pending})"
-                    ));
-                }
-            };
-            head_expected = tip;
-        }
         match store.finalize_pr_merge(
             id,
             &base_ref,
@@ -375,35 +359,61 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
         ) {
             Ok(()) => break,
             Err(e) => {
-                // Classify the failure. The head must be exactly where the
-                // gate validated it for a genuine (base / pending-ref / git
-                // error) failure, so that case is refused outright. If it
-                // moved, it is retryable ONLY when the new tip is a valid
-                // first-parent extension of the gate-validated head on PR #id's
-                // chain — a legitimate concurrent append. A rewrite, a
-                // cross-PR / cross-entity tip, a disappeared head ref, or any
-                // other non-append move is also a genuine transaction failure:
-                // refuse with refs unchanged and the pending result ref left in
-                // place (F-008).
+                // F-008: read the EXACT current head tip ONCE. The candidate we
+                // validate, fold, and CAS is the SAME OID — never a re-read tip
+                // adopted without proof (the old loop re-read the ref at the top
+                // of the next iteration, which could swap `head_expected` for an
+                // unproven tip).
                 let head_now = store
                     .repo()
                     .find_reference(&head)
                     .ok()
                     .and_then(|r| r.target());
-                let retryable = match head_now {
-                    Some(tip) => {
-                        tip != head_expected
-                            && store.store().head_extends_pr_chain(id, head_expected, tip)
-                    }
-                    None => false,
+                // Disappeared head ref: a genuine transaction failure. Refuse
+                // with refs unchanged and the pending result ref left in place.
+                let Some(tip) = head_now else {
+                    return Err(format!(
+                        "merge execution finished but final transaction failed \
+                         ({e}); refs unchanged, pending result ref \
+                         refs/forge/prs/{id}/result left in place"
+                    ));
                 };
-                if !retryable {
+                // Head did not move: the failure is genuine (base / pending-ref
+                // / git error). Refuse with refs unchanged and the pending ref
+                // left in place.
+                if tip == head_expected {
                     return Err(format!(
                         "merge execution finished but final transaction failed \
                          ({e}); refs unchanged, pending result ref \
                          refs/forge/prs/{id}/result left in place"
                     ));
                 }
+                // Canonical chain validator: the moved tip must be a valid
+                // first-parent extension of the GATE-VALIDATED tip on PR #id's
+                // chain (F-008). A rewrite, a mixed/foreign chain, a cross-PR
+                // tip, or a disappeared ref cannot reach the gate-validated tip
+                // here, so those refuse with refs unchanged and the pending ref
+                // left in place.
+                if !store.store().head_extends_pr_chain(id, gate_head, tip) {
+                    return Err(format!(
+                        "merge execution finished but final transaction failed \
+                         ({e}); refs unchanged, pending result ref \
+                         refs/forge/prs/{id}/result left in place"
+                    ));
+                }
+                // The candidate is a valid extension; re-evaluate the merge
+                // gates against THIS EXACT tip (F-007): a legitimate concurrent
+                // append that carries a failed CI Check refuses and names the
+                // gate; a legitimate green append is retried.
+                if let Err(gate_err) = validate_merge_gate_at(store.store(), id, tip) {
+                    let pending =
+                        cleanup_pending_result(&store, id, result_commit, &mut lock_handle, &tmp);
+                    return Err(format!(
+                        "{gate_err} (merge aborted: the PR head changed during \
+                         finalization; refs unchanged{pending})"
+                    ));
+                }
+                head_expected = tip;
                 attempts += 1;
                 if attempts > MAX_FINALIZE_RETRIES {
                     let pending =
@@ -419,12 +429,11 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
     Ok(format!("merged PR #{id} into {base_ref} ({result_commit})"))
 }
 
-/// Read the PR head ref tip, fold its event chain, and evaluate the L1+L2
-/// merge gates (effective Review == approve AND latest CI Check == success,
-/// plus the already-merged refusal). Returns the folded [`crate::event::PrState`]
-/// together with the EXACT head OID the gates were evaluated against, so the
-/// completion transaction can CAS from that OID (F-007) — never re-read and
-/// accept a tip that moved after the gate.
+/// Read the PR head ref tip and validate the merge gate against that EXACT tip
+/// (F-007, F-008): the folded [`crate::event::PrState`] is returned together
+/// with the head OID the gates were evaluated against, so the completion
+/// transaction can CAS from that OID — never re-read and accept a tip that
+/// moved after the gate.
 fn read_merge_gate(
     store: &EventStore,
     id: u64,
@@ -435,13 +444,37 @@ fn read_merge_gate(
         .find_reference(head_ref)
         .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
         .map_err(|_| format!("PR #{id} does not exist"))?;
+    let state = validate_merge_gate_at(store, id, tip)?;
+    Ok((state, tip))
+}
+
+/// Validate PR #id's merge gate against a SPECIFIC head tip (F-007, F-008):
+/// the whole chain folded at `tip` must be anchored to PR #id, the effective
+/// Review must be approve, the PR must not already be merged, and the latest
+/// CI Check must be success. Returns the folded [`crate::event::PrState`].
+/// The exact tip validated is the tip the caller folds and CASes from.
+fn validate_merge_gate_at(
+    store: &EventStore,
+    id: u64,
+    tip: git2::Oid,
+) -> Result<crate::event::PrState, String> {
+    // Chain-anchor / identity validation (F-008): the WHOLE chain folded at
+    // `tip` must be anchored by PR #id's authoritative `pr.created` event and
+    // every event-bearing commit must belong to entity `pr` / `entity_id` id.
+    // The previous `fold(...).pr.id == id` check was unsound because `fold`
+    // overwrites `pr.id` for every PR event, so a mixed/foreign chain carrying
+    // the target id on a later event could pass the anchor while retaining a
+    // foreign snapshot, approval, and CI state.
+    if !store.pr_chain_anchored_to(id, tip) {
+        return Err(format!(
+            "refs/forge/prs/{id}/head points at a tip whose chain is not anchored \
+             to PR #{id}"
+        ));
+    }
     let chain = store.read_chain_at(tip).map_err(|e| e.to_string())?;
     let state = crate::event::fold(&chain).pr;
-
-    // Chain-anchor / identity validation (F-008): the tip must fold to a PR
-    // chain anchored on PR #id. A cross-PR / cross-entity tip (e.g. the head
-    // ref moved onto another PR's green tip) must never be gated as if it
-    // belonged to this PR, even if it is independently approved and green.
+    // Belt-and-suspenders: now that `pr_chain_anchored_to` guarantees identity,
+    // this is only a cross-check against a malformed fold.
     if state.id != id {
         return Err(format!(
             "refs/forge/prs/{id}/head points at a tip whose chain is anchored to \
@@ -479,7 +512,7 @@ fn read_merge_gate(
             ));
         }
     }
-    Ok((state, tip))
+    Ok(state)
 }
 
 /// Shared best-effort pending-result cleanup, used by all six early-return

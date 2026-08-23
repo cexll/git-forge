@@ -286,13 +286,41 @@ impl EventStore {
         self.chain_from_tip(tip)
     }
 
+    /// True iff the WHOLE chain folded at `tip` is anchored to PR `id` (F-008):
+    /// every event-bearing commit along the first-parent chain carries
+    /// `entity == "pr"` with `entity_id == id`, and the chain contains PR
+    /// `id`'s authoritative `pr.created` event. The previous
+    /// `fold(...).pr.id == id` check was unsound because `fold` overwrites
+    /// `pr.id` for every PR event, so a later event carrying the target id
+    /// could mask a foreign snapshot / approval / CI state underneath — a
+    /// mixed/foreign masquerade. Returns false for a cross-entity / mixed /
+    /// rewritten / missing-anchor chain.
+    pub(crate) fn pr_chain_anchored_to(&self, id: u64, tip: Oid) -> bool {
+        let Ok(chain) = self.read_chain_at(tip) else {
+            return false;
+        };
+        if chain.is_empty() {
+            return false;
+        }
+        let mut saw_created = false;
+        for ev in &chain {
+            if ev.entity != "pr" || ev.entity_id != id {
+                return false;
+            }
+            if ev.kind == EventKind::PrCreated {
+                saw_created = true;
+            }
+        }
+        saw_created
+    }
+
     /// True when `tip` is a valid first-parent extension of `ancestor` on PR
     /// `id`'s chain (F-008). A legitimate concurrent append moves the PR head
     /// past the gate-validated tip; a rewrite, a cross-PR / cross-entity tip,
     /// or any other non-append move does not. Walking the first-parent chain
-    /// from `tip` must reach `ancestor` exactly, every event-bearing commit in
-    /// that segment must carry `entity == "pr"` with `entity_id == id`, and the
-    /// chain folded at `tip` must be anchored to PR `id`. Returns false for a
+    /// from `tip` must reach `ancestor` exactly, and the whole chain folded at
+    /// `tip` must be anchored to PR `id` (via [`Self::pr_chain_anchored_to`],
+    /// which also rejects a mixed/foreign masquerade). Returns false for a
     /// non-append move, so the merge finalizer refuses with refs unchanged and
     /// the pending result ref left in place rather than silently retrying into
     /// a foreign chain.
@@ -300,6 +328,8 @@ impl EventStore {
         if tip == ancestor {
             return false;
         }
+        // First-parent reach: `tip` must descend from `ancestor` (a legitimate
+        // concurrent append), never a rewrite or a cross-PR tip.
         let mut cur = tip;
         loop {
             let commit = match self.repo.find_commit(cur) {
@@ -309,22 +339,15 @@ impl EventStore {
             if cur == ancestor {
                 break;
             }
-            // An event-bearing commit in the new segment must belong to PR id.
-            match self.read_event_blob(&commit) {
-                Ok(Some(ev)) if ev.entity != "pr" || ev.entity_id != id => return false,
-                Ok(_) => {}
-                Err(_) => return false,
-            }
             match commit.parent_ids().next() {
                 Some(p) => cur = p,
                 None => return false,
             }
         }
-        // Chain-anchor validation: the chain folded at `tip` is PR `id`'s.
-        match self.read_chain_at(tip) {
-            Ok(chain) => crate::event::fold(&chain).pr.id == id,
-            Err(_) => false,
-        }
+        // Chain-anchor validation: the whole chain at `tip` is PR `id`'s —
+        // anchored by PR #id's authoritative `pr.created` event and every
+        // event-bearing commit belongs to entity pr / entity_id id.
+        self.pr_chain_anchored_to(id, tip)
     }
 
     fn read_event_blob(&self, commit: &Commit) -> Result<Option<Event>, StoreError> {
