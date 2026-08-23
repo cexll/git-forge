@@ -733,20 +733,26 @@ fn pr_help() -> String {
 /// `.forge/ci.sh` is executed with `bash` (respects the script's own shell
 /// semantics); the `just check` fallback runs the `just` recipe directly.
 /// Both run with the worktree as the working directory, so they validate
-/// exactly the PR tree.
+/// exactly the PR tree. The plan's stdout/stderr are redirected to the null
+/// device (never buffered in memory — only the exit status is retained), so a
+/// high-volume or nonterminating plan cannot grow git-forge's heap before the
+/// result is recorded and the temp worktree is cleaned up (F-002).
 fn run_ci_plan(worktree: &std::path::Path, plan: &str) -> Option<i32> {
-    use std::process::Command;
+    use std::process::{Command, Stdio};
     let (prog, args): (&str, &[&str]) = if plan == "just check" {
         ("just", &["check"])
     } else {
         ("bash", &[".forge/ci.sh"])
     };
-    let out = Command::new(prog)
+    Command::new(prog)
         .args(args)
         .current_dir(worktree)
-        .output()
-        .ok()?;
-    out.status.code()
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .ok()?
+        .code()
 }
 
 /// Determine the immutable-snapshot CI plan (F-001): `.forge/ci.sh` when it is

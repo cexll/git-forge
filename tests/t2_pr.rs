@@ -1336,6 +1336,70 @@ fn ci_run_failure_records_failure_and_exits_nonzero() {
     assert_eq!(status.trim(), "", "working tree must be clean: {status}");
 }
 
+/// F-002 regression: a CI plan that emits a high-volume output stream must not
+/// be buffered into git-forge's memory without bound. `run_ci_plan` discards
+/// the plan's stdout/stderr (only the exit status matters), so a noisy plan
+/// cannot OOM git-forge before it records the failed Check and cleans the temp
+/// worktree. The stream here is large (well past the 64 KiB OS pipe buffer on
+/// both stdout and stderr) but terminating, so a run that accumulated it would
+/// grow the process buffer; the run must still record a `failure` Check, clean
+/// the temp worktree, and leave the developer's working tree untouched.
+#[test]
+fn ci_run_high_volume_plan_records_failure_and_cleans_worktree() {
+    let dir = tmpdir("ci-high-volume");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    // 32 MiB to stdout and 32 MiB to stderr (64 MiB total), then fail. Under the
+    // offending `Command::output()` the entire stream would be accumulated in
+    // git-forge's heap; the fix redirects it to the null device and keeps only
+    // the exit status, so memory stays bounded.
+    std::fs::write(
+        dir.join(".forge").join("ci.sh"),
+        "#!/bin/bash\n\
+         yes \"{0000000000000000000000000000000000000000000000000000000000000000}\" | head -c 33554432\n\
+         yes \"{1111111111111111111111111111111111111111111111111111111111111111}\" | head -c 33554432 >&2\n\
+         exit 1\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(
+        &dir,
+        &["commit", "-q", "-m", "feature + noisy failing ci plan"],
+    );
+    git(&dir, &["checkout", "-q", "main"]);
+
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+
+    let (c, _o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_ne!(c, 0, "noisy failing plan must exit nonzero: {e}");
+    assert!(
+        e.contains("exited with status 1"),
+        "the retained exit status must be reported: {e}"
+    );
+
+    let event = head_event(&dir, 1);
+    assert!(event.contains("\"ci.check\""), "event kind: {event}");
+    assert!(event.contains("\"status\":\"failed\""), "status: {event}");
+    assert!(event.contains("\"plan\":\".forge/ci.sh\""), "plan: {event}");
+
+    // The temp CI worktree must be removed (no leftover), and the developer's
+    // working tree / current branch are unchanged.
+    assert_no_ci_worktree(&dir);
+    let (_, status, _) = git(&dir, &["status", "--porcelain"]);
+    assert_eq!(status.trim(), "", "working tree must be clean: {status}");
+    assert_eq!(git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).1, "main");
+}
+
 /// VAL-003: a repo with no `.forge/ci.sh` runs the `just check` fallback and
 /// succeeds (exit 0), recording a `success` CI Check with plan `just check`.
 #[test]
