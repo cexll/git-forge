@@ -40,10 +40,13 @@ fn run_forge(argv: &[String]) -> Result<String, String> {
         Some("issue") => git_forge::cli::run_issue(&argv[1..]),
         // `git forge pr ...` → argv = ["pr", ...]
         Some("pr") => git_forge::cli::run_pr(&argv[1..]),
+        // `git forge ci ...` → argv = ["ci", ...]
+        Some("ci") => git_forge::cli::run_ci(&argv[1..]),
         // Direct binary form `git-forge forge issue ...` (used in tests).
         Some("forge") => match argv.get(1).map(|s| s.as_str()) {
             Some("issue") => git_forge::cli::run_issue(&argv[2..]),
             Some("pr") => git_forge::cli::run_pr(&argv[2..]),
+            Some("ci") => git_forge::cli::run_ci(&argv[2..]),
             Some("help") | Some("-h") | Some("--help") => Ok(top_help()),
             Some(other) => Err(format!("unknown forge subcommand '{other}'")),
             None => Ok(top_help()),
@@ -56,11 +59,12 @@ fn run_forge(argv: &[String]) -> Result<String, String> {
 }
 
 fn top_help() -> String {
-    "usage: git forge <issue|pr> ...\n\
+    "usage: git forge <issue|pr|ci> ...\n\
      \nsubcommands:\n\
      \x20 issue  new|list|show|comment|close|reopen\n\
      \x20 pr     create|list|show|comment|review|diff|merge\n\
-     \x20 run `git forge issue --help` / `git forge pr --help` for per-subcommand usage"
+     \x20 ci     run <n>\n\
+     \x20 run `git forge issue --help` / `git forge pr --help` / `git forge ci --help` for per-subcommand usage"
         .to_string()
 }
 

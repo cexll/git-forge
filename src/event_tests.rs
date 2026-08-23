@@ -78,9 +78,11 @@ fn event_kind_string_roundtrip_all_kinds() {
         EventKind::PrComment,
         EventKind::PrReview,
         EventKind::PrMerge,
+        EventKind::CiCheck,
     ] {
         assert_eq!(kind.as_str().parse::<EventKind>().unwrap(), kind);
     }
+    assert!("ci.check".parse::<EventKind>().is_ok());
     assert!("pr.merge".parse::<EventKind>().is_ok());
     assert!("issue.bogus".parse::<EventKind>().is_err());
     assert!("".parse::<EventKind>().is_err());
@@ -269,4 +271,69 @@ fn json_parser_rejects_raw_c0_in_strings_but_accepts_escapes() {
         parse_json_value(r#""a\nb""#).and_then(|v| v.as_str().map(String::from)),
         Some("a\nb".to_string())
     );
+}
+
+/// The CI Check event kind round-trips through the JSON codec: status and plan
+/// (body) and the actor (top-level) survive to_json -> from_json verbatim.
+#[test]
+fn ci_check_event_roundtrips_status_plan_actor() {
+    let ev = Event::new_with_id(
+        "33333333-3333-4333-8333-000000000001",
+        EventKind::CiCheck,
+        "pr",
+        7,
+        "ci@example.com",
+        body_with(vec![
+            ("status", JsonValue::String("success".into())),
+            ("plan", JsonValue::String(".forge/ci.sh".into())),
+        ]),
+    )
+    .unwrap();
+    let json = ev.to_json();
+    assert!(json.contains("\"kind\":\"ci.check\""), "kind wire: {json}");
+    assert!(
+        json.contains("\"status\":\"success\""),
+        "status wire: {json}"
+    );
+    assert!(
+        json.contains("\"plan\":\".forge/ci.sh\""),
+        "plan wire: {json}"
+    );
+    let round = Event::from_json(&json).expect("ci.check roundtrip must parse");
+    assert_eq!(round, ev);
+    // The folded PR state surfaces the latest fields.
+    let state = fold(&[ev]);
+    assert_eq!(state.pr.ci_status.as_deref(), Some("success"));
+    assert_eq!(state.pr.ci_plan.as_deref(), Some(".forge/ci.sh"));
+    assert_eq!(state.pr.ci_actor.as_deref(), Some("ci@example.com"));
+}
+
+/// fold keeps only the LATEST CI Check: a later `ci.check` overwrites the
+/// prior status/plan/actor/ts when folded into PR state.
+#[test]
+fn fold_keeps_latest_ci_check_status() {
+    let mk = |id: u64, status: &str| {
+        Event::new_with_id(
+            &format!("44444444-4444-4444-8444-{:012x}", id),
+            EventKind::CiCheck,
+            "pr",
+            2,
+            "ci@example.com",
+            body_with(vec![
+                ("status", JsonValue::String(status.into())),
+                ("plan", JsonValue::String("just check".into())),
+            ]),
+        )
+        .unwrap()
+    };
+    // success first, then failure — the fold must expose the LATEST (failure).
+    let st = fold(&[mk(1, "success"), mk(2, "failed")]);
+    assert_eq!(st.pr.ci_status.as_deref(), Some("failed"));
+    assert_eq!(st.pr.ci_plan.as_deref(), Some("just check"));
+    assert_eq!(st.pr.ci_actor.as_deref(), Some("ci@example.com"));
+
+    // The pending status from `pr create` (t1) is also folded; a later
+    // successful run overwrites it.
+    let st2 = fold(&[mk(3, "pending"), mk(4, "success")]);
+    assert_eq!(st2.pr.ci_status.as_deref(), Some("success"));
 }

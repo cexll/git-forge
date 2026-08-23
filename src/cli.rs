@@ -471,6 +471,17 @@ fn cmd_pr_show(store: &EventStore, args: &[String]) -> Result<String, String> {
     if let Some(r) = &state.merge_result {
         out.push_str(&format!("merged: {}\n", sanitize_terminal(r)));
     }
+    // The latest CI Check (fold) is surfaced so the run's outcome is readable.
+    if let Some(s) = &state.ci_status {
+        match &state.ci_plan {
+            Some(p) => out.push_str(&format!(
+                "ci: {} ({})\n",
+                sanitize_terminal(s),
+                sanitize_terminal(p)
+            )),
+            None => out.push_str(&format!("ci: {}\n", sanitize_terminal(s))),
+        }
+    }
     if let Some(r) = &state.base_ref {
         out.push_str(&format!("base: {}\n", sanitize_terminal(r)));
     }
@@ -720,6 +731,185 @@ fn pr_help() -> String {
      \x20 review <n> --approve|--reject [--file <f> --line <l> --commit <c>]\n\
      \x20 diff <n>\n\
      \x20 merge [<n>] [--squash|--rebase]"
+        .to_string()
+}
+
+// ─────────────────────────── CI commands (t0) ───────────────────────────
+
+/// Run the repo CI plan inside the temp worktree (the PR's own commits) and
+/// return its exit status (`None` when the process could not be spawned).
+/// `.forge/ci.sh` is executed with `bash` (respects the script's own shell
+/// semantics); the `just check` fallback runs the `just` recipe directly.
+/// Both run with the worktree as the working directory, so they validate
+/// exactly the PR tree.
+fn run_ci_plan(worktree: &std::path::Path, plan: &str) -> Option<i32> {
+    use std::process::Command;
+    let (prog, args): (&str, &[&str]) = if plan == "just check" {
+        ("just", &["check"])
+    } else {
+        ("bash", &[".forge/ci.sh"])
+    };
+    let out = Command::new(prog)
+        .args(args)
+        .current_dir(worktree)
+        .output()
+        .ok()?;
+    out.status.code()
+}
+
+/// `git forge ci run <pr>` — execute the repo CI plan against the PR's own
+/// commits in a temporary worktree, append a CI Check event recording the
+/// outcome, and leave the developer's working tree and current branch
+/// untouched. The plan is `.forge/ci.sh` when present in the PR tree,
+/// otherwise the `just check` fallback.
+fn cmd_ci_run(args: &[String]) -> Result<String, String> {
+    let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
+    let (store, actor) = open_mutation_store()?;
+    let head = crate::store::pr_head_ref(id);
+    if !store_has_ref(store.store(), &head) {
+        return Err(format!("PR #{id} does not exist"));
+    }
+    // The plan runs against the PR's immutable source snapshot (its own
+    // commits), never the developer's working tree.
+    let source_oid = store
+        .repo()
+        .find_reference(&crate::store::pr_source_ref(id))
+        .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
+        .map_err(|_| format!("PR #{id} snapshot source ref missing"))?;
+    let repo_dir = store
+        .repo()
+        .workdir()
+        .map(|p| p.to_path_buf())
+        .ok_or_else(|| "cannot resolve repository working directory".to_string())?;
+
+    // Reserve a unique temp worktree path (sibling lock) so concurrent CI runs
+    // on the same repo never collide on the global temp dir.
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    repo_dir.to_string_lossy().as_bytes().hash(&mut hasher);
+    let nonce = hasher.finish();
+    let mk = |attempt: u32| {
+        std::env::temp_dir().join(format!(
+            "git-forge-pr{id}-ci-{nonce:x}-{}-{attempt}",
+            std::process::id()
+        ))
+    };
+    let mut tmp = mk(0);
+    let mut attempt = 0u32;
+    let mut lock_handle: Option<std::fs::File> = None;
+    let (ok_wt, err_wt) = loop {
+        let lock = tmp.with_extension("lock");
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&lock)
+        {
+            Ok(h) => {
+                lock_handle = Some(h);
+                match crate::git::worktree_add(&repo_dir, &tmp, &source_oid) {
+                    Ok(()) => break (true, String::new()),
+                    Err(err) => break (false, err),
+                }
+            }
+            Err(_) if attempt < 16 => {
+                attempt += 1;
+                tmp = mk(attempt);
+            }
+            Err(_) => {
+                break (
+                    false,
+                    format!(
+                        "could not reserve a unique temp worktree path after {attempt} attempts"
+                    ),
+                );
+            }
+        }
+    };
+    if !ok_wt {
+        drop(lock_handle.take());
+        let _ = std::fs::remove_file(tmp.with_extension("lock"));
+        return Err(format!(
+            "failed to create temporary worktree for CI run: {err_wt}"
+        ));
+    }
+    // Release the path lock now that the worktree is registered; every early
+    // return after this point must drop it too.
+    let release_lock = |lock_handle: &mut Option<std::fs::File>, path: &std::path::Path| {
+        *lock_handle = None;
+        let _ = std::fs::remove_file(path.with_extension("lock"));
+    };
+
+    // Determine the plan from the PR tree itself: `.forge/ci.sh` when present,
+    // otherwise the `just check` fallback.
+    let plan = if tmp.join(".forge").join("ci.sh").exists() {
+        ".forge/ci.sh".to_string()
+    } else {
+        "just check".to_string()
+    };
+
+    // Run the plan. The exit status is captured; the plan's stderr/stdout stay
+    // in the worktree (not surfaced), only the recorded status matters here.
+    let script_status = run_ci_plan(&tmp, &plan);
+
+    // Always append the CI Check outcome — a failing plan must still record a
+    // `failure` CI Check (VAL-002) before the command exits nonzero.
+    let status = if script_status == Some(0) {
+        "success"
+    } else {
+        "failed"
+    };
+    let mut body = HashMap::new();
+    body.insert("status".into(), json_str(status));
+    body.insert("plan".into(), json_str(&plan));
+    let ev = Event::new(EventKind::CiCheck, "pr", id, &actor, body);
+    if let Err(e) = store.append_event(&head, &ev) {
+        release_lock(&mut lock_handle, &tmp);
+        let _ = crate::git::worktree_remove(&repo_dir, &tmp);
+        return Err(format!(
+            "CI run completed but recording the CI Check failed: {e}"
+        ));
+    }
+
+    // Clean up the temp worktree regardless of the plan outcome.
+    let remove_err = crate::git::worktree_remove(&repo_dir, &tmp).err();
+    release_lock(&mut lock_handle, &tmp);
+
+    if let Some(err_rm) = remove_err {
+        return Err(format!(
+            "CI run recorded {status} but temp worktree removal failed: {err_rm} \
+             (worktree left at {})",
+            tmp.display()
+        ));
+    }
+
+    if script_status == Some(0) {
+        Ok(format!("CI run for PR #{id} passed ({plan})"))
+    } else {
+        Err(format!(
+            "CI run for PR #{id} failed ({plan}){}",
+            script_status
+                .map(|c| format!(": exited with status {c}"))
+                .unwrap_or_default()
+        ))
+    }
+}
+
+/// Dispatch a `git forge ci` subcommand. `argv` excludes the `ci` token.
+pub fn run_ci(argv: &[String]) -> Result<String, String> {
+    let sub = argv.first().map(|s| s.as_str()).unwrap_or("");
+    match sub {
+        "run" => cmd_ci_run(&argv[1..]),
+        "help" | "-h" | "--help" => Ok(ci_help()),
+        "" => Ok(ci_help()),
+        other => Err(format!("unknown ci subcommand '{other}'")),
+    }
+}
+
+fn ci_help() -> String {
+    "usage: git forge ci <run> ...\n\
+     \nsubcommands:\n\
+     \x20 run <n>\n\
+     \x20 run `git forge ci run <pr>` to execute the repo CI plan and record a CI Check"
         .to_string()
 }
 

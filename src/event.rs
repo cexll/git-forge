@@ -42,6 +42,7 @@ pub enum EventKind {
     PrComment,
     PrReview,
     PrMerge,
+    CiCheck,
 }
 
 impl EventKind {
@@ -55,6 +56,7 @@ impl EventKind {
             EventKind::PrComment => "pr.comment",
             EventKind::PrReview => "pr.review",
             EventKind::PrMerge => "pr.merge",
+            EventKind::CiCheck => "ci.check",
         }
     }
 }
@@ -72,6 +74,7 @@ impl std::str::FromStr for EventKind {
             "pr.comment" => Self::PrComment,
             "pr.review" => Self::PrReview,
             "pr.merge" => Self::PrMerge,
+            "ci.check" => Self::CiCheck,
             _ => return Err(()),
         })
     }
@@ -258,6 +261,17 @@ pub struct PrState {
     pub comments: Vec<String>,
     pub effective_decision: Option<String>,
     pub merge_result: Option<String>,
+    /// Latest CI Check status (success/failed/pending) — the fold keeps the
+    /// most recently appended `ci.check` event, so the merge gate can read a
+    /// single latest status. `None` when no CI Check has been recorded yet.
+    pub ci_status: Option<String>,
+    /// The plan (`.forge/ci.sh` or `just check`) that produced the latest
+    /// CI Check.
+    pub ci_plan: Option<String>,
+    /// Actor of the latest CI Check.
+    pub ci_actor: Option<String>,
+    /// Timestamp of the latest CI Check.
+    pub ci_ts: Option<String>,
 }
 
 impl PrState {
@@ -288,6 +302,15 @@ impl PrState {
             }
             EventKind::PrMerge => {
                 self.merge_result = str_field(&event.body, "result_commit");
+            }
+            EventKind::CiCheck => {
+                // The fold keeps the LATEST CI Check: each event overwrites the
+                // prior status/plan/actor/ts, so the PR state always exposes
+                // the most recent CI outcome (the merge-gate read).
+                self.ci_status = str_field(&event.body, "status");
+                self.ci_plan = str_field(&event.body, "plan");
+                self.ci_actor = Some(event.actor.clone());
+                self.ci_ts = Some(event.ts.clone());
             }
             _ => {}
         }

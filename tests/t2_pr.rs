@@ -1065,3 +1065,180 @@ fn cli_arg_validation_errors_are_user_facing() {
         );
     }
 }
+
+// ─────────────────────────── CI run (t0) ───────────────────────────
+
+/// Read the `.forge/event.json` payload of the given commit (PR head chain tip).
+fn head_event(dir: &PathBuf, pr: u64) -> String {
+    let head = git(dir, &["rev-parse", &format!("refs/forge/prs/{pr}/head")]).1;
+    let (c, event, e) = git(dir, &["show", &format!("{head}:.forge/event.json")]);
+    assert_eq!(c, 0, "read {head}:.forge/event.json failed: {e}");
+    event
+}
+
+/// VAL-001: a passing plan records a CI Check `success`, the command exits 0,
+/// and the developer's working tree + current branch are unchanged.
+#[test]
+fn ci_run_success_records_success_and_leaves_worktree_unchanged() {
+    let dir = tmpdir("ci-success");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    // The CI plan is committed in the PR's OWN commits (the source branch), so
+    // running it from a detached temp worktree validates exactly the PR.
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    std::fs::write(dir.join(".forge").join("ci.sh"), "#!/bin/bash\nexit 0\n").unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "feature + passing ci plan"]);
+    git(&dir, &["checkout", "-q", "main"]);
+
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+    let before_branch = git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).1;
+    let before_main = git(&dir, &["rev-parse", "refs/heads/main"]).1;
+
+    let (c, o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_eq!(c, 0, "ci run must exit 0 on a passing plan: {e}");
+    assert!(o.contains("passed"), "ci run output: {o}");
+
+    let event = head_event(&dir, 1);
+    assert!(event.contains("\"ci.check\""), "event kind: {event}");
+    assert!(event.contains("\"status\":\"success\""), "status: {event}");
+    assert!(event.contains("\"plan\":\".forge/ci.sh\""), "plan: {event}");
+    assert!(
+        event.contains("\"actor\":\"ci@example.com\""),
+        "actor: {event}"
+    );
+
+    // The fold exposes the latest CI status on the PR chain (readable via show).
+    let (cs, os, es) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert_eq!(cs, 0, "pr show after ci run failed: {es}");
+    assert!(os.contains("ci: success"), "show ci status: {os}");
+
+    // Developer's working tree and current branch are unchanged.
+    assert_eq!(
+        git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).1,
+        before_branch,
+        "current branch must be unchanged"
+    );
+    assert_eq!(
+        git(&dir, &["rev-parse", "refs/heads/main"]).1,
+        before_main,
+        "branch tip must be unchanged"
+    );
+    let (_, status, _) = git(&dir, &["status", "--porcelain"]);
+    assert_eq!(status.trim(), "", "working tree must be clean: {status}");
+}
+
+/// VAL-002: a failing plan records a CI Check `failure`, the command exits
+/// nonzero, and the working tree stays clean.
+#[test]
+fn ci_run_failure_records_failure_and_exits_nonzero() {
+    let dir = tmpdir("ci-failure");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    std::fs::write(dir.join(".forge").join("ci.sh"), "#!/bin/bash\nexit 1\n").unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "feature + failing ci plan"]);
+    git(&dir, &["checkout", "-q", "main"]);
+
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+
+    let (c, _o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_ne!(c, 0, "ci run must exit nonzero on a failing plan: {e}");
+
+    let event = head_event(&dir, 1);
+    assert!(event.contains("\"ci.check\""), "event kind: {event}");
+    assert!(event.contains("\"status\":\"failed\""), "status: {event}");
+    assert!(event.contains("\"plan\":\".forge/ci.sh\""), "plan: {event}");
+
+    let (_, status, _) = git(&dir, &["status", "--porcelain"]);
+    assert_eq!(status.trim(), "", "working tree must be clean: {status}");
+}
+
+/// VAL-003: a repo with no `.forge/ci.sh` runs the `just check` fallback and
+/// succeeds (exit 0), recording a `success` CI Check with plan `just check`.
+#[test]
+fn ci_run_fallback_just_check_succeeds_without_ci_sh() {
+    let dir = tmpdir("ci-fallback");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    // No `.forge/ci.sh`; a justfile with a `check` recipe is the fallback.
+    std::fs::write(
+        dir.join("justfile"),
+        "check:\n    echo \"just check passed\"\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(
+        &dir,
+        &["commit", "-q", "-m", "feature + justfile, no .forge/ci.sh"],
+    );
+    git(&dir, &["checkout", "-q", "main"]);
+
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+    // Confirm the source tree really has no `.forge/ci.sh`.
+    assert!(
+        !dir.join(".forge").join("ci.sh").exists(),
+        "test setup must have no .forge/ci.sh"
+    );
+
+    let (c, o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_eq!(c, 0, "fallback just check must succeed: {e}");
+    assert!(o.contains("passed"), "ci run output: {o}");
+
+    let event = head_event(&dir, 1);
+    assert!(event.contains("\"status\":\"success\""), "status: {event}");
+    assert!(event.contains("\"plan\":\"just check\""), "plan: {event}");
+
+    // Current branch and working tree unchanged.
+    assert_eq!(git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).1, "main");
+    let (_, status, _) = git(&dir, &["status", "--porcelain"]);
+    assert_eq!(status.trim(), "", "working tree must be clean: {status}");
+}
+
+/// `ci run` on a nonexistent PR is a clean error (no worktree side effects).
+#[test]
+fn ci_run_nonexistent_pr_is_clean_error() {
+    let dir = tmpdir("ci-nopr");
+    init_repo(&dir);
+    let (c, _o, e) = forge(&dir, &["forge", "ci", "run", "99"]);
+    assert_ne!(c, 0, "ci run on a missing PR must fail");
+    assert!(e.contains("PR #99 does not exist"), "stderr: {e}");
+}
+
+/// `git forge ci` dispatch surface: help lists the `run` subcommand.
+#[test]
+fn ci_help_lists_run_subcommand() {
+    let dir = tmpdir("ci-help");
+    let (c, o, e) = forge(&dir, &["forge", "ci", "--help"]);
+    assert_eq!(c, 0, "ci --help failed: {e}");
+    assert!(o.contains("usage: git forge ci"), "help head: {o}");
+    assert!(o.contains("run"), "help missing 'run': {o}");
+}
