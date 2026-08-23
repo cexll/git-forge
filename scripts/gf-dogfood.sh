@@ -125,7 +125,8 @@ ck "issue comment on missing" nonzero git forge issue comment 99 x
 # ── FR-002 / AC-002 / AC-002a..e / AC-002i / VAL-021/028: PR create guards ──
 git checkout -B feat/dogfood "$BASE_BRANCH"
 printf '\n# dogfood change\n' >> PLAN.md
-git add PLAN.md && git commit -qm "feat(dogfood): test change"
+mkdir -p .forge && printf '#!/bin/sh\necho ok\n' > .forge/ci.sh   # green CI plan (t3)
+git add PLAN.md .forge/ci.sh && git commit -qm "feat(dogfood): test change"
 git checkout -q "$BASE_BRANCH"
 git tag v1.0 "$BASE_BRANCH"   # deterministic local tag
 ck "pr create snapshot" 0 git forge pr create --source feat/dogfood --base "$BASE_BRANCH" "dogfood PR"
@@ -156,6 +157,7 @@ ck "approve then reject blocks" 0 git forge pr review 2 --reject
 git checkout -q "$BASE_BRANCH" && git checkout -q feat/dogfood   # ensure non-base
 ck "merge blocked after reject" nonzero git forge pr merge 2
 ck "reject then approve allows" 0 git forge pr review 2 --approve
+git forge ci run 2 >/dev/null   # green latest CI Check so the gate lets #2 merge (t3)
 git checkout -q feat/dogfood
 ck "approved merge succeeds" 0 git forge pr merge 2
 ck "pr show merged" 0 git forge pr show 2
@@ -165,20 +167,24 @@ ck "already merged blocked" nonzero git forge pr merge 2
 # ── AC-005e / VAL-022: base checked out → refuse (from base itself) ──
 git checkout -B feat2 "$BASE_BRANCH"
 printf '\n# change 2\n' >> PLAN.md
-git add PLAN.md && git commit -qm "feat(dogfood): change 2"
+mkdir -p .forge && printf '#!/bin/sh\necho ok\n' > .forge/ci.sh   # green CI plan (t3)
+git add PLAN.md .forge/ci.sh && git commit -qm "feat(dogfood): change 2"
 git checkout -q "$BASE_BRANCH"
 git forge pr create --source feat2 --base "$BASE_BRANCH" "PR base-checked-out" >/dev/null
 git forge pr review 3 --approve >/dev/null
+git forge ci run 3 >/dev/null   # green latest CI Check so the gate lets #3 reach the base-guard (t3)
 ck "merge refused with base checked out" nonzero git forge pr merge 3
 at "checked-out-base error names worktree" 0 "git forge pr merge 3 2>&1 | grep -q 'checked out'"
 
 # ── AC-005b / VAL-017: stale base rejected (from non-base checkout) ──
 git checkout -B feat3 "$BASE_BRANCH"
 printf '\n# change 3\n' >> PLAN.md
-git add PLAN.md && git commit -qm "feat(dogfood): change 3"
+mkdir -p .forge && printf '#!/bin/sh\necho ok\n' > .forge/ci.sh   # green CI plan (t3)
+git add PLAN.md .forge/ci.sh && git commit -qm "feat(dogfood): change 3"
 git checkout -q "$BASE_BRANCH"
 git forge pr create --source feat3 --base "$BASE_BRANCH" "PR stale" >/dev/null
 git forge pr review 4 --approve >/dev/null
+git forge ci run 4 >/dev/null   # green latest CI Check so the gate lets #4 reach the stale-base guard (t3)
 printf '\n# base advance\n' >> PLAN.md
 git add PLAN.md && git commit -qm "base advance after PR"
 git checkout -q feat3
@@ -188,19 +194,25 @@ at "stale error names base_head" 0 "git forge pr merge 4 2>&1 | grep -q 'has mov
 # ── FR-004 / AC-005 / VAL-005: strategies (fresh PRs, from non-base) ──
 git checkout -B feat4 "$BASE_BRANCH"
 printf 'a\n' > f4.txt && git add f4.txt && git commit -qm "f4 c1"
-printf 'b\n' >> f4.txt && git add f4.txt && git commit -qm "f4 c2"
+printf 'b\n' >> f4.txt
+mkdir -p .forge && printf '#!/bin/sh\necho ok\n' > .forge/ci.sh   # green CI plan (t3)
+git add f4.txt .forge/ci.sh && git commit -qm "f4 c2"
 git checkout -q "$BASE_BRANCH"
 git forge pr create --source feat4 --base "$BASE_BRANCH" "squash PR" >/dev/null
 git forge pr review 5 --approve >/dev/null
+git forge ci run 5 >/dev/null   # green latest CI Check so the gate lets #5 merge (t3)
 git checkout -q feat4
 ck "squash merge ok" 0 git forge pr merge 5 --squash
 at "squash = single commit" 0 "[ \$(git rev-list --parents -n 1 \"\$BASE_BRANCH\" | awk '{print NF}') -eq 2 ] && ! git merge-base --is-ancestor \$(git rev-parse feat4) \"\$BASE_BRANCH\""
 git checkout -B feat5 "$BASE_BRANCH"
 printf 'x\n' > f5.txt && git add f5.txt && git commit -qm "f5 c1"
-printf 'y\n' >> f5.txt && git add f5.txt && git commit -qm "f5 c2"
+printf 'y\n' >> f5.txt
+mkdir -p .forge && printf '#!/bin/sh\necho ok\n' > .forge/ci.sh   # green CI plan (t3)
+git add f5.txt .forge/ci.sh && git commit -qm "f5 c2"
 git checkout -q "$BASE_BRANCH"
 git forge pr create --source feat5 --base "$BASE_BRANCH" "rebase PR" >/dev/null
 git forge pr review 6 --approve >/dev/null
+git forge ci run 6 >/dev/null   # green latest CI Check so the gate lets #6 merge (t3)
 git checkout -q feat5
 ck "rebase merge ok" 0 git forge pr merge 6 --rebase
 at "rebase = linear history" 0 "[ \$(git rev-list --count --merges \"\$BASE_BRANCH~1..\$BASE_BRANCH\") -eq 0 ]"
