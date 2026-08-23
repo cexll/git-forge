@@ -251,13 +251,10 @@ impl EventStore {
         }
     }
 
-    /// Read a single entity event chain oldest→tip. Skips commits whose tree
+    /// Walk a chain oldest→tip from a known tip OID. Skips commits whose tree
     /// has no `.forge/event.json` (genesis roots and L2 merge nodes).
-    pub fn read_chain(&self, entity_ref: &str) -> Result<Vec<Event>, StoreError> {
+    fn chain_from_tip(&self, tip: Oid) -> Result<Vec<Event>, StoreError> {
         let mut out: Vec<Event> = Vec::new();
-        let Some(tip) = self.current_tip(entity_ref)? else {
-            return Ok(out);
-        };
         let mut oid = tip;
         loop {
             let commit = self.repo.find_commit(oid)?;
@@ -271,6 +268,22 @@ impl EventStore {
         }
         out.reverse();
         Ok(out)
+    }
+
+    /// Read a single entity event chain oldest→tip. Skips commits whose tree
+    /// has no `.forge/event.json` (genesis roots and L2 merge nodes).
+    pub fn read_chain(&self, entity_ref: &str) -> Result<Vec<Event>, StoreError> {
+        let Some(tip) = self.current_tip(entity_ref)? else {
+            return Ok(Vec::new());
+        };
+        self.chain_from_tip(tip)
+    }
+
+    /// Read a chain from a known tip OID. Used to bind a gate decision to the
+    /// exact tip the completion transaction will CAS from, so the fold and the
+    /// transaction's expected head can never disagree.
+    pub fn read_chain_at(&self, tip: Oid) -> Result<Vec<Event>, StoreError> {
+        self.chain_from_tip(tip)
     }
 
     fn read_event_blob(&self, commit: &Commit) -> Result<Option<Event>, StoreError> {
@@ -349,6 +362,11 @@ impl BoundEventStore {
     /// Read a single entity event chain (delegation to the read surface).
     pub fn read_chain(&self, entity_ref: &str) -> Result<Vec<Event>, StoreError> {
         self.inner.read_chain(entity_ref)
+    }
+
+    /// Read a chain from a known tip OID (delegation to the read surface).
+    pub fn read_chain_at(&self, tip: Oid) -> Result<Vec<Event>, StoreError> {
+        self.inner.read_chain_at(tip)
     }
 
     /// Read the counter next value (delegation to the read surface).
@@ -714,16 +732,20 @@ impl BoundEventStore {
     }
 
     /// Atomic merge completion (wire contract § Merge completion): write the
-    /// `pr.merge` event commit (dangling), then ONE `git update-ref --stdin`
-    /// transaction that (1) deletes the pending `/result` ref, (2) CAS-updates
-    /// `refs/heads/<base_ref>` from the PR's snapshot `base_head` to
-    /// `result_commit`, and (3) CAS-moves the PR `/head` chain to the
-    /// `pr.merge` event commit. The head chain tip is read here, and the
-    /// `pr.merge` event commit parented to it, both inside the same function
-    /// as the transaction — so head, base, and the pending-ref deletion move
-    /// as one atomic unit. On failure nothing moved; the caller reports the
-    /// leftover pending ref. `actor` is the invoking repo's `user.email`
-    /// (wire contract `"actor": "<user.email>"`).
+    /// `pr.merge` event commit (dangling, parented to `head_expected`), then
+    /// ONE `git update-ref --stdin` transaction that (1) deletes the pending
+    /// `/result` ref, (2) CAS-updates `refs/heads/<base_ref>` from the PR's
+    /// snapshot `base_head` to `result_commit`, and (3) CAS-moves the PR
+    /// `/head` chain to the `pr.merge` event commit.
+    ///
+    /// `head_expected` is the PR-head OID the caller's gate validated — the
+    /// CAS refuses to advance the head from a tip that is no longer current.
+    /// F-007: the caller must NOT re-read and accept an arbitrary current tip
+    /// here, because a concurrent append (e.g. a `ci run` recording a failed
+    /// Check) could move the head to a tip whose gate no longer holds. On
+    /// failure nothing moved; the caller reports the leftover pending ref.
+    /// `actor` is the invoking repo's `user.email` (wire contract
+    /// `"actor": "<user.email>"`).
     pub fn finalize_pr_merge(
         &self,
         pr_id: u64,
@@ -731,14 +753,11 @@ impl BoundEventStore {
         base_expected: Oid,
         result_commit: Oid,
         actor: &str,
+        head_expected: Oid,
     ) -> Result<(), StoreError> {
         let head_ref = pr_head_ref(pr_id);
-        let head_tip = self
-            .inner
-            .current_tip(&head_ref)?
-            .ok_or(StoreError::MissingRef)?;
         let head_new =
-            self.write_unappended_pr_merge_commit(pr_id, head_tip, result_commit, actor)?;
+            self.write_unappended_pr_merge_commit(pr_id, head_expected, result_commit, actor)?;
         let result = pr_result_ref(pr_id);
         let base_branch_ref = format!("refs/heads/{base_ref}");
         let lines = vec![
@@ -746,8 +765,8 @@ impl BoundEventStore {
             format!("update {result} {ZERO_OID} {result_commit}"),
             // CAS base branch from snapshot base_head to result_commit.
             format!("update {base_branch_ref} {result_commit} {base_expected}"),
-            // CAS PR head chain from old tip to pr.merge commit.
-            format!("update {head_ref} {head_new} {head_tip}"),
+            // CAS PR head chain from the gate-validated tip to pr.merge commit.
+            format!("update {head_ref} {head_new} {head_expected}"),
         ];
         self.inner.run_update_ref_stdin(&lines)
     }

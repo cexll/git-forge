@@ -60,41 +60,12 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
     let strategy = strategy.unwrap_or("merge");
     let id = crate::cli::parse_entity_id(id_arg.as_deref().unwrap_or(""))?;
     let head = crate::store::pr_head_ref(id);
-    if store.repo().find_reference(&head).is_err() {
-        return Err(format!("PR #{id} does not exist"));
-    }
-    let chain = store.read_chain(&head).map_err(|e| e.to_string())?;
-    let state = crate::event::fold(&chain).pr;
-
-    // Gate: effective approve required (last reachable pr.review).
-    if state.effective_decision.as_deref() != Some("approve") {
-        return Err(format!(
-            "PR #{id} is not approved (effective decision: {})",
-            state.effective_decision.as_deref().unwrap_or("none")
-        ));
-    }
-    // Already merged: a pr.merge event exists → no double merge.
-    if state.merge_result.is_some() {
-        return Err(format!("PR #{id} is already merged"));
-    }
-    // Gate (L2): the latest CI Check must be success (the fold keeps the most
-    // recently appended ci.check). A pending/absent/failed Check refuses the
-    // merge BEFORE any worktree/ref side effect, and names the `ci run` step
-    // as the remedy. This is purely additive to the L1 approval gate.
-    match state.ci_status.as_deref() {
-        Some("success") => {}
-        Some(status) => {
-            return Err(format!(
-                "PR #{id} is not mergeable: latest CI Check is `{status}` \
-                 (expected `success`); run `git forge ci run {id}`"
-            ));
-        }
-        None => {
-            return Err(format!(
-                "PR #{id} is not mergeable: no CI Check recorded; run `git forge ci run {id}`"
-            ));
-        }
-    }
+    // Bind the gate decision to the EXACT PR-head OID it validated (F-007):
+    // the completion transaction CASes the head chain from OID `gate_head`,
+    // never from a freshly reread tip, so a concurrent `ci run` that appends a
+    // failed Check during merge execution can neither slip past the gate nor
+    // be silently accepted at finalize.
+    let (state, gate_head) = read_merge_gate(&store, id, &head)?;
     let base_ref = state
         .base_ref
         .clone()
@@ -348,18 +319,127 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
         return Err(b);
     }
 
-    // Single atomic completion transaction: delete pending ref + CAS base + CAS head.
-    // finalize_pr_merge reads the head tip itself so all three move atomically.
-    store
-        .finalize_pr_merge(id, &base_ref, base_oid, result_commit, &actor)
-        .map_err(|e| {
-            // Nothing moved; report the leftover pending ref.
-            format!(
-                "merge execution finished but final transaction failed \
-                 ({e}); refs unchanged, pending result ref refs/forge/prs/{id}/result left in place"
-            )
-        })?;
+    // Single atomic completion transaction: delete pending ref + CAS base +
+    // CAS PR head from the GATE-VALIDATED OID. The head ref is CAS'd from
+    // `head_expected`, never re-read and accepted: if a concurrent `ci run`
+    // moved the head during the pending window, the head CAS fails and
+    // nothing moves. We then re-read/refold and retry ONLY when the effective
+    // Review is still approve AND the latest CI Check is still success — the
+    // revalidated tip becomes the new expected head. Otherwise (head moved to
+    // a tip whose gate no longer holds, or the head did not move and the
+    // failure is genuine) we clean the pending ref and refuse without
+    // advancing the base (F-007).
+    let mut head_expected = gate_head;
+    let mut attempts = 0u32;
+    const MAX_FINALIZE_RETRIES: u32 = 3;
+    loop {
+        // After the first attempt the head moved: read the new tip and
+        // re-evaluate the gate against it before touching the transaction.
+        if attempts > 0 {
+            let (_, tip) = match read_merge_gate(store.store(), id, &head) {
+                Ok(v) => v,
+                Err(gate_err) => {
+                    let pending =
+                        cleanup_pending_result(&store, id, result_commit, &mut lock_handle, &tmp);
+                    return Err(format!(
+                        "{gate_err} (merge aborted: the PR head changed during \
+                         finalization; refs unchanged{pending})"
+                    ));
+                }
+            };
+            head_expected = tip;
+        }
+        match store.finalize_pr_merge(
+            id,
+            &base_ref,
+            base_oid,
+            result_commit,
+            &actor,
+            head_expected,
+        ) {
+            Ok(()) => break,
+            Err(e) => {
+                // Classify: if the head moved away from the expected tip, a
+                // concurrent append won the race → retry (bounded). Otherwise
+                // the failure is genuine (base moved / pending ref sabotaged /
+                // git error), nothing moved, so report the leftover pending
+                // ref and refuse without touching the base.
+                let head_now = store
+                    .repo()
+                    .find_reference(&head)
+                    .ok()
+                    .and_then(|r| r.target());
+                if head_now == Some(head_expected) {
+                    return Err(format!(
+                        "merge execution finished but final transaction failed \
+                         ({e}); refs unchanged, pending result ref \
+                         refs/forge/prs/{id}/result left in place"
+                    ));
+                }
+                attempts += 1;
+                if attempts > MAX_FINALIZE_RETRIES {
+                    let pending =
+                        cleanup_pending_result(&store, id, result_commit, &mut lock_handle, &tmp);
+                    return Err(format!(
+                        "merge execution finished but the PR head kept moving \
+                         during finalization ({e}); refs unchanged{pending}"
+                    ));
+                }
+            }
+        }
+    }
     Ok(format!("merged PR #{id} into {base_ref} ({result_commit})"))
+}
+
+/// Read the PR head ref tip, fold its event chain, and evaluate the L1+L2
+/// merge gates (effective Review == approve AND latest CI Check == success,
+/// plus the already-merged refusal). Returns the folded [`crate::event::PrState`]
+/// together with the EXACT head OID the gates were evaluated against, so the
+/// completion transaction can CAS from that OID (F-007) — never re-read and
+/// accept a tip that moved after the gate.
+fn read_merge_gate(
+    store: &EventStore,
+    id: u64,
+    head_ref: &str,
+) -> Result<(crate::event::PrState, git2::Oid), String> {
+    let tip = store
+        .repo()
+        .find_reference(head_ref)
+        .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
+        .map_err(|_| format!("PR #{id} does not exist"))?;
+    let chain = store.read_chain_at(tip).map_err(|e| e.to_string())?;
+    let state = crate::event::fold(&chain).pr;
+
+    // Gate: effective approve required (last reachable pr.review).
+    if state.effective_decision.as_deref() != Some("approve") {
+        return Err(format!(
+            "PR #{id} is not approved (effective decision: {})",
+            state.effective_decision.as_deref().unwrap_or("none")
+        ));
+    }
+    // Already merged: a pr.merge event exists → no double merge.
+    if state.merge_result.is_some() {
+        return Err(format!("PR #{id} is already merged"));
+    }
+    // Gate (L2): the latest CI Check must be success (the fold keeps the most
+    // recently appended ci.check). A pending/absent/failed Check refuses the
+    // merge BEFORE any worktree/ref side effect, and names the `ci run` step
+    // as the remedy. This is purely additive to the L1 approval gate.
+    match state.ci_status.as_deref() {
+        Some("success") => {}
+        Some(status) => {
+            return Err(format!(
+                "PR #{id} is not mergeable: latest CI Check is `{status}` \
+                 (expected `success`); run `git forge ci run {id}`"
+            ));
+        }
+        None => {
+            return Err(format!(
+                "PR #{id} is not mergeable: no CI Check recorded; run `git forge ci run {id}`"
+            ));
+        }
+    }
+    Ok((state, tip))
 }
 
 /// Shared best-effort pending-result cleanup, used by all six early-return

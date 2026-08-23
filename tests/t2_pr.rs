@@ -1821,3 +1821,136 @@ fn merge_refused_when_not_approved() {
         "base ref must be unchanged on a refused merge"
     );
 }
+
+/// F-007 regression: the CI gate is checked against the PR head at command
+/// start, but merge finalization used to re-read and accept whatever head was
+/// current — so a concurrent `ci run` that appends a FAILED Check during the
+/// pending-window barrier moved the head, and the merge would parent the
+/// `pr.merge` commit to that failed-Check tip and advance the base. This holds
+/// the merge in the barrier window, appends a failed Check, releases, and
+/// asserts the base/head do NOT receive a merge and the CI gate is named.
+#[test]
+fn merge_refused_when_head_moves_to_failed_ci_during_finalize() {
+    let dir = tmpdir("merge-ci-race");
+    init_repo(&dir);
+    config_identity(&dir);
+
+    // A plan whose outcome is controlled by an env var: the FIRST `ci run`
+    // (no env) succeeds; the CONCURRENT second `ci run` (env set) fails. The
+    // plan lives in the PR's immutable source snapshot so `ci run` validates
+    // exactly the PR tree.
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    std::fs::write(
+        dir.join(".forge").join("ci.sh"),
+        "#!/bin/bash\nif [ \"${GIT_FORGE_TEST_CI_FAIL:=0}\" = \"1\" ]; then exit 1; fi\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "feature commit"]);
+    git(&dir, &["checkout", "-q", "main"]);
+
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR race"]
+        )
+        .0,
+        0
+    );
+    let (c, o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_eq!(c, 0, "first ci run must pass: {e} {o}");
+    assert_eq!(
+        forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
+        0
+    );
+    // Uncheckout the base (main) so the merge reaches the CI gate.
+    git(&dir, &["checkout", "-q", "feature"]);
+
+    let barrier = tmpdir("merge-ci-race-window");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+
+    // Spawn the merge parked in the pending-window barrier (debug only).
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let mut child: std::process::Child = std::process::Command::new(bin)
+        .args(["forge", "pr", "merge", "1"])
+        .current_dir(&dir)
+        .env("GIT_FORGE_TEST_MERGE_BARRIER", &barrier)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Wait for the ready sentinel (bounded).
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !barrier.join("ready").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "merge never reached the barrier window"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_some(),
+        "pending result ref must exist in the barrier window"
+    );
+
+    // Concurrently append a FAILED CI Check by re-running `ci run 1` with the
+    // failure env var set. This moves the PR head chain past the gate-validated
+    // tip to a tip whose latest CI Check is failed.
+    let out = std::process::Command::new(bin)
+        .args(["forge", "ci", "run", "1"])
+        .current_dir(&dir)
+        .env("GIT_FORGE_TEST_CI_FAIL", "1")
+        .output()
+        .unwrap();
+    assert_ne!(
+        out.status.code().unwrap_or(-1),
+        0,
+        "failing ci run must exit nonzero"
+    );
+    let head_after = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+
+    // Release the barrier; the merge resumes into finalization.
+    let release_path = barrier.join("release");
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&release_path)
+            .expect("release sentinel must be created atomically");
+        let _ = f.write_all(b"go\n");
+    }
+    let status = child.wait().unwrap();
+    let mut stderr = String::new();
+    {
+        use std::io::Read as _;
+        if let Some(mut e) = child.stderr.take() {
+            let _ = e.read_to_string(&mut stderr);
+        }
+    }
+    assert!(
+        !status.success(),
+        "merge must refuse when the head moved to a failed CI Check (stderr: {stderr})"
+    );
+    assert!(
+        stderr.contains("git forge ci run 1"),
+        "merge must name the CI gate: {stderr}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base ref must not receive a merge"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        head_after,
+        "head ref must not receive a pr.merge commit"
+    );
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_none(),
+        "pending result ref must be cleaned on a refused merge"
+    );
+}
