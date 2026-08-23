@@ -286,6 +286,47 @@ impl EventStore {
         self.chain_from_tip(tip)
     }
 
+    /// True when `tip` is a valid first-parent extension of `ancestor` on PR
+    /// `id`'s chain (F-008). A legitimate concurrent append moves the PR head
+    /// past the gate-validated tip; a rewrite, a cross-PR / cross-entity tip,
+    /// or any other non-append move does not. Walking the first-parent chain
+    /// from `tip` must reach `ancestor` exactly, every event-bearing commit in
+    /// that segment must carry `entity == "pr"` with `entity_id == id`, and the
+    /// chain folded at `tip` must be anchored to PR `id`. Returns false for a
+    /// non-append move, so the merge finalizer refuses with refs unchanged and
+    /// the pending result ref left in place rather than silently retrying into
+    /// a foreign chain.
+    pub fn head_extends_pr_chain(&self, id: u64, ancestor: Oid, tip: Oid) -> bool {
+        if tip == ancestor {
+            return false;
+        }
+        let mut cur = tip;
+        loop {
+            let commit = match self.repo.find_commit(cur) {
+                Ok(c) => c,
+                Err(_) => return false,
+            };
+            if cur == ancestor {
+                break;
+            }
+            // An event-bearing commit in the new segment must belong to PR id.
+            match self.read_event_blob(&commit) {
+                Ok(Some(ev)) if ev.entity != "pr" || ev.entity_id != id => return false,
+                Ok(_) => {}
+                Err(_) => return false,
+            }
+            match commit.parent_ids().next() {
+                Some(p) => cur = p,
+                None => return false,
+            }
+        }
+        // Chain-anchor validation: the chain folded at `tip` is PR `id`'s.
+        match self.read_chain_at(tip) {
+            Ok(chain) => crate::event::fold(&chain).pr.id == id,
+            Err(_) => false,
+        }
+    }
+
     fn read_event_blob(&self, commit: &Commit) -> Result<Option<Event>, StoreError> {
         let tree = self.repo.find_tree(commit.tree_id())?;
         match tree.get_path(std::path::Path::new(".forge/event.json")) {
@@ -712,23 +753,19 @@ impl BoundEventStore {
     }
 
     /// Write an unappended `pr.merge` event commit (dangling object, parent =
-    /// current head tip) so the PR chain can be CAS-moved to it in the same
-    /// transaction as the base branch and the pending-ref deletion.
+    /// `head_tip`) so the PR chain can be CAS-moved to it in the same
+    /// transaction as the base branch and the pending-ref deletion. The event
+    /// is constructed ONCE by the caller and reused across CAS retries, so a
+    /// retry after a legitimate green append reparents the SAME `pr.merge`
+    /// event (retained UUID + timestamp) instead of regenerating its identity
+    /// (F-009).
     fn write_unappended_pr_merge_commit(
         &self,
-        pr_id: u64,
+        event: &Event,
         head_tip: Oid,
-        result_commit: Oid,
-        actor: &str,
     ) -> Result<Oid, StoreError> {
-        let mut body = HashMap::new();
-        body.insert(
-            "result_commit".into(),
-            JsonValue::String(result_commit.to_string()),
-        );
-        let event = Event::new(EventKind::PrMerge, "pr", pr_id, actor, body);
         let message = format!("forge:{}:{}", event.kind.as_str(), event.entity_id);
-        self.write_event_commit(&event, &[head_tip], &message)
+        self.write_event_commit(event, &[head_tip], &message)
     }
 
     /// Atomic merge completion (wire contract § Merge completion): write the
@@ -744,20 +781,21 @@ impl BoundEventStore {
     /// here, because a concurrent append (e.g. a `ci run` recording a failed
     /// Check) could move the head to a tip whose gate no longer holds. On
     /// failure nothing moved; the caller reports the leftover pending ref.
-    /// `actor` is the invoking repo's `user.email` (wire contract
-    /// `"actor": "<user.email>"`).
+    /// `merge_event` is the single `pr.merge` event built once by the caller
+    /// (F-009); it is re-parented to `head_expected` on each retry. `actor`
+    /// and `result_commit` are carried inside it, per the wire contract
+    /// `"actor": "<user.email>"` and the `result_commit` body field.
     pub fn finalize_pr_merge(
         &self,
         pr_id: u64,
         base_ref: &str,
         base_expected: Oid,
         result_commit: Oid,
-        actor: &str,
+        merge_event: &Event,
         head_expected: Oid,
     ) -> Result<(), StoreError> {
         let head_ref = pr_head_ref(pr_id);
-        let head_new =
-            self.write_unappended_pr_merge_commit(pr_id, head_expected, result_commit, actor)?;
+        let head_new = self.write_unappended_pr_merge_commit(merge_event, head_expected)?;
         let result = pr_result_ref(pr_id);
         let base_branch_ref = format!("refs/heads/{base_ref}");
         let lines = vec![

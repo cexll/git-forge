@@ -1954,3 +1954,309 @@ fn merge_refused_when_head_moves_to_failed_ci_during_finalize() {
         "pending result ref must be cleaned on a refused merge"
     );
 }
+
+/// Extract the `"id"` field value from a serialized event JSON string.
+fn event_uuid(json: &str) -> Option<String> {
+    let key = "\"id\":\"";
+    let start = json.find(key)? + key.len();
+    let rest = &json[start..];
+    let end = rest.find('"')?;
+    Some(rest[..end].to_string())
+}
+
+/// OIDs of every unreachable/dangling commit reported by `git fsck`, with the
+/// locale forced to C so the diagnostic lines are stable to parse.
+fn unreachable_commits(dir: &PathBuf) -> Vec<String> {
+    let out = Command::new("git")
+        .args(["fsck", "--unreachable", "--no-reflogs"])
+        .current_dir(dir)
+        .env("LC_ALL", "C")
+        .env("LANG", "C")
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git fsck --unreachable failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|l| {
+            l.strip_prefix("unreachable commit ")
+                .or_else(|| l.strip_prefix("dangling commit "))
+        })
+        .map(|s| s.trim().to_string())
+        .collect()
+}
+
+/// The UUID of the single unreachable `pr.merge` event commit for PR `pr`.
+/// Returns None when no such dangling commit exists (the finalize retry did not
+/// write an unreachable first-attempt commit).
+fn dangling_pr_merge_uuid(dir: &PathBuf, pr: u64) -> Option<String> {
+    for oid in unreachable_commits(dir) {
+        let (c, ev, _) = git(dir, &["show", &format!("{oid}:.forge/event.json")]);
+        if c != 0 {
+            continue;
+        }
+        if ev.contains("\"kind\":\"pr.merge\"") && ev.contains(&format!("\"entity_id\":{pr}")) {
+            return event_uuid(&ev);
+        }
+    }
+    None
+}
+
+/// F-008 regression: a green/approved PR #1 merge parked at the pending-window
+/// barrier has its `/head` ref moved onto an INDEPENDENTLY green/approved PR #2
+/// tip. The old retry loop treated ANY head move as a retryable concurrent
+/// append: it re-folded PR #2's chain (approved + CI success), adopted it as
+/// PR #1's new expected head, and parented PR #1's `pr.merge` onto PR #2's
+/// chain while advancing PR #1's base and deleting its pending ref. The fix
+/// proves the new tip is a valid first-parent extension of the gate head on PR
+/// #1's chain before retrying; a cross-PR tip is a genuine transaction failure
+/// → refs unchanged, pending result ref left in place.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn merge_refuses_when_head_moved_to_foreign_green_pr_during_finalize() {
+    let dir = tmpdir("merge-cross-pr-sabotage");
+    init_repo(&dir);
+    config_identity(&dir);
+
+    // PR #1: independently green + approved.
+    make_feature_with_ci(&dir, "feature", "feat\n", 0);
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+    assert_eq!(forge(&dir, &["forge", "ci", "run", "1"]).0, 0);
+    assert_eq!(
+        forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
+        0
+    );
+
+    // PR #2: independently green + approved (the foreign tip).
+    make_feature_with_ci(&dir, "feature2", "feat2\n", 0);
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature2", "--base", "main", "PR2"]
+        )
+        .0,
+        0
+    );
+    assert_eq!(forge(&dir, &["forge", "ci", "run", "2"]).0, 0);
+    assert_eq!(
+        forge(&dir, &["forge", "pr", "review", "2", "--approve"]).0,
+        0
+    );
+
+    // Uncheckout the base (main) so the merge reaches the CI gate.
+    git(&dir, &["checkout", "-q", "feature"]);
+
+    let barrier = tmpdir("merge-cross-pr-window");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let head2 = ref_oid(&dir, "refs/forge/prs/2/head").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let mut child = std::process::Command::new(bin)
+        .args(["forge", "pr", "merge", "1"])
+        .current_dir(&dir)
+        .env("GIT_FORGE_TEST_MERGE_BARRIER", &barrier)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !barrier.join("ready").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "merge never reached the barrier window"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_some(),
+        "pending result ref must exist in the barrier window"
+    );
+
+    // Sabotage: move PR #1's head to PR #2's green/approved tip.
+    let (c, _, e) = git(&dir, &["update-ref", "refs/forge/prs/1/head", &head2]);
+    assert_eq!(c, 0, "move PR #1 head to PR #2 tip: {e}");
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        head2,
+        "PR #1 head must point at the foreign PR #2 tip"
+    );
+
+    // Release the barrier; the merge resumes into finalization.
+    let release_path = barrier.join("release");
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&release_path)
+            .expect("release sentinel must be created atomically");
+        let _ = f.write_all(b"go\n");
+    }
+    let status = child.wait().unwrap();
+    let mut stderr = String::new();
+    {
+        use std::io::Read as _;
+        if let Some(mut e) = child.stderr.take() {
+            let _ = e.read_to_string(&mut stderr);
+        }
+    }
+    assert!(
+        !status.success(),
+        "merge must refuse a cross-PR head move (stderr: {stderr})"
+    );
+    assert!(
+        stderr.contains("merge execution finished but final transaction failed"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("refs unchanged"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("pending result ref refs/forge/prs/1/result left in place"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base ref must not be advanced"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        head2,
+        "PR #1 head must stay at the foreign tip, not receive a pr.merge"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/2/head").unwrap(),
+        head2,
+        "PR #2 chain must be untouched"
+    );
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_some(),
+        "pending result ref must be left in place on a sabotage refusal"
+    );
+}
+
+/// F-009 regression: a legitimate green append moves the PR head during the
+/// pending window. The first final transaction loses its head CAS; the retry
+/// succeeds against the new green tip. The retry must re-parent the SAME
+/// `pr.merge` event (retained UUID), not publish a freshly generated identity.
+/// We locate the dangling first-attempt `pr.merge` commit (unreachable after
+/// the failed CAS) and the reachable final `pr.merge` commit, and assert their
+/// event UUIDs match.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn merge_retry_after_green_append_keeps_event_uuid() {
+    let dir = tmpdir("merge-retry-uuid");
+    init_repo(&dir);
+    config_identity(&dir);
+    make_feature_with_ci(&dir, "feature", "feat\n", 0);
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR retry"]
+        )
+        .0,
+        0
+    );
+    assert_eq!(forge(&dir, &["forge", "ci", "run", "1"]).0, 0);
+    assert_eq!(
+        forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
+        0
+    );
+    git(&dir, &["checkout", "-q", "feature"]);
+
+    let barrier = tmpdir("merge-retry-uuid-window");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let mut child = std::process::Command::new(bin)
+        .args(["forge", "pr", "merge", "1"])
+        .current_dir(&dir)
+        .env("GIT_FORGE_TEST_MERGE_BARRIER", &barrier)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !barrier.join("ready").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "merge never reached the barrier window"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_some(),
+        "pending result ref must exist in the barrier window"
+    );
+
+    // Legitimate green append: re-run `ci run 1` (the plan passes), which
+    // appends a `ci.check` success event and moves the head past the
+    // gate-validated tip as a valid first-parent extension.
+    let (c, o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_eq!(c, 0, "green ci run must pass: {e} {o}");
+    let head_after = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+
+    // Release the barrier; the merge resumes into finalization and retries.
+    let release_path = barrier.join("release");
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&release_path)
+            .expect("release sentinel must be created atomically");
+        let _ = f.write_all(b"go\n");
+    }
+    let status = child.wait().unwrap();
+    let mut stderr = String::new();
+    {
+        use std::io::Read as _;
+        if let Some(mut e) = child.stderr.take() {
+            let _ = e.read_to_string(&mut stderr);
+        }
+    }
+    assert!(
+        status.success(),
+        "merge must succeed after a green append (stderr: {stderr})"
+    );
+    assert_ne!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base ref must advance on the retried green merge"
+    );
+    // The successful merge advances the PR head to the `pr.merge` commit,
+    // parented on the appended green tip — not left at `head_after`.
+    let head_now = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+    assert_ne!(
+        head_now, head_after,
+        "head must advance to the pr.merge commit, not sit at the appended tip"
+    );
+    assert!(
+        head_event(&dir, 1).contains("\"kind\":\"pr.merge\""),
+        "head must carry a pr.merge event after the retried merge"
+    );
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_none(),
+        "pending result ref must be cleaned on a successful merge"
+    );
+
+    let final_uuid =
+        event_uuid(&head_event(&dir, 1)).expect("final PR #1 head must carry a pr.merge event");
+    let dangling_uuid = dangling_pr_merge_uuid(&dir, 1)
+        .expect("a dangling first-attempt pr.merge commit must exist");
+    assert_eq!(
+        dangling_uuid, final_uuid,
+        "the retried pr.merge must re-parent the same event (retained UUID)"
+    );
+}
