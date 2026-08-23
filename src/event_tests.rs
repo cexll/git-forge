@@ -465,6 +465,40 @@ fn worktree_registered_path_exact_not_substring() {
     ));
 }
 
+/// F-005: `worktree_registered_path` canonicalizes both sides before
+/// comparing, so a macOS `temp_dir()` spelling (`/var/...`, a symlink to the
+/// real `/private/var/...`) still matches the path git actually registered —
+/// even after the worktree directory was deleted, when the raw spelling no
+/// longer exists and only the nearest existing ancestor can be resolved.
+/// Without the canonicalization this stale registration would be missed and
+/// the cleanup would report a false success.
+#[test]
+fn worktree_registered_path_canonicalizes_macos_temp_dir() {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let dir =
+        std::env::temp_dir().join(format!("gf-wt-canonical-{}-{}", std::process::id(), nonce));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    // git registers the REAL (symlink-resolved) path; the caller holds the
+    // raw `temp_dir()` spelling.
+    let real = std::fs::canonicalize(&dir).unwrap();
+    // Simulate the directory-deleting removal; the raw path no longer exists.
+    std::fs::remove_dir_all(&dir).unwrap();
+
+    let porcelain = format!(
+        "worktree {}\nHEAD a\nbranch refs/heads/main\n\ndetached\n",
+        real.display()
+    );
+    assert!(
+        worktree_registered_path(&porcelain, &dir),
+        "raw temp_dir() spelling must match the real registered path after removal"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 /// F-001 regression: a CI Check event must carry the actual run timestamp in
 /// RFC3339 UTC — the fold's `ci_ts` must expose that same run time, never the
 /// hard-coded 1970 epoch placeholder.

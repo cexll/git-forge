@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -149,6 +149,11 @@ fn rfc3339_utc_now() -> String {
 /// Format an arbitrary `SystemTime` as RFC3339 UTC seconds. A clock BEFORE the
 /// Unix epoch (reset/misconfigured wall clock) must format a real pre-1970
 /// time, never the fabricated `1970-01-01T00:00:00Z` (F-001).
+// F-001 (USER-ACCEPTED KNOWN LIMITATION): a wall clock in the subsecond
+// window just before the Unix epoch (a pre-1970 clock, itself already a
+// fault) truncates to 0 whole seconds and formats to `1970-01-01T00:00:00Z`
+// here. That is accepted: this formatter is seconds-granularity and ordering
+// semantics come from parent-chain position, not from `ts`. No logic change.
 fn format_rfc3339_system_time(t: SystemTime) -> String {
     match t.duration_since(UNIX_EPOCH) {
         Ok(d) => format_rfc3339_utc(d.as_secs() as i64),
@@ -187,16 +192,52 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+/// Normalize `p` to a canonical absolute form for worktree-path comparison.
+/// When `p` exists the whole path is symlink-resolved; when it does not (a
+/// worktree whose directory was just removed) the nearest existing ancestor
+/// is resolved and the remaining components re-appended, so a stale
+/// registration still compares equal. This makes the raw macOS `temp_dir()`
+/// spelling `/var/...` compare equal to git's real `/private/var/...` path
+/// (F-005). Relative paths (no existing ancestor) fall back to the raw form.
+fn canonicalize_for_compare(p: &Path) -> PathBuf {
+    let mut existing = p.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(canon) = std::fs::canonicalize(&existing) {
+            let mut canon = canon;
+            for comp in tail.iter().rev() {
+                canon.push(comp);
+            }
+            return canon;
+        }
+        match existing.file_name() {
+            Some(name) => {
+                tail.push(name.to_os_string());
+                match existing.parent() {
+                    Some(parent) => existing = parent.to_path_buf(),
+                    None => return p.to_path_buf(),
+                }
+            }
+            None => return p.to_path_buf(),
+        }
+    }
+}
+
 /// True if `git worktree list --porcelain` output (`porcelain`) registers a
-/// worktree whose path EXACTLY equals `target`. Each `worktree <path>` record's
-/// path is compared exactly, not by substring, so a distinct registered path
-/// that merely shares the target's prefix (e.g. `<target>-other`) is never
-/// mistaken for the owned path (F-004 — post-removal CI worktree verification).
+/// worktree whose path EQUALS `target` after canonicalization. Each
+/// `worktree <path>` record's path is compared against a normalized target,
+/// not by substring, so a distinct registered path that merely shares the
+/// target's prefix (e.g. `<target>-other`) is never mistaken for the owned
+/// path (F-004 — post-removal CI worktree verification). Both sides are
+/// symlink-resolved (walking up to the nearest existing ancestor when the
+/// directory was removed), so the macOS `/var` vs `/private/var` spelling
+/// difference cannot hide a stale registration (F-005).
 pub(crate) fn worktree_registered_path(porcelain: &str, target: &Path) -> bool {
+    let target_canonical = canonicalize_for_compare(target);
     porcelain
         .lines()
         .filter_map(|l| l.strip_prefix("worktree "))
-        .any(|p| p == target.to_string_lossy().as_ref())
+        .any(|p| canonicalize_for_compare(Path::new(p)) == target_canonical)
 }
 
 impl Event {
