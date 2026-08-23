@@ -251,15 +251,16 @@ impl EventStore {
         }
     }
 
-    /// Walk a chain oldest→tip from a known tip OID. Skips commits whose tree
-    /// has no `.forge/event.json` (genesis roots and L2 merge nodes).
-    fn chain_from_tip(&self, tip: Oid) -> Result<Vec<Event>, StoreError> {
-        let mut out: Vec<Event> = Vec::new();
+    /// Walk a chain oldest→tip from a known tip OID, returning each
+    /// event-bearing commit's OID paired with its event. Skips commits whose
+    /// tree has no `.forge/event.json` (genesis roots and L2 merge nodes).
+    fn chain_from_tip(&self, tip: Oid) -> Result<Vec<(Oid, Event)>, StoreError> {
+        let mut out: Vec<(Oid, Event)> = Vec::new();
         let mut oid = tip;
         loop {
             let commit = self.repo.find_commit(oid)?;
             if let Some(event) = self.read_event_blob(&commit)? {
-                out.push(event);
+                out.push((oid, event));
             }
             match commit.parent_ids().next() {
                 Some(p) => oid = p,
@@ -276,42 +277,71 @@ impl EventStore {
         let Some(tip) = self.current_tip(entity_ref)? else {
             return Ok(Vec::new());
         };
-        self.chain_from_tip(tip)
+        Ok(self
+            .chain_from_tip(tip)?
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect())
     }
 
     /// Read a chain from a known tip OID. Used to bind a gate decision to the
     /// exact tip the completion transaction will CAS from, so the fold and the
     /// transaction's expected head can never disagree.
     pub fn read_chain_at(&self, tip: Oid) -> Result<Vec<Event>, StoreError> {
-        self.chain_from_tip(tip)
+        Ok(self
+            .chain_from_tip(tip)?
+            .into_iter()
+            .map(|(_, event)| event)
+            .collect())
     }
 
     /// True iff the WHOLE chain folded at `tip` is anchored to PR `id` (F-008):
     /// every event-bearing commit along the first-parent chain carries
     /// `entity == "pr"` with `entity_id == id`, and the chain contains PR
-    /// `id`'s authoritative `pr.created` event. The previous
+    /// `id`'s authoritative `pr.created` event — the exact commit pinned by the
+    /// immutable `/meta` ref — at the chain's anchor position. The previous
     /// `fold(...).pr.id == id` check was unsound because `fold` overwrites
-    /// `pr.id` for every PR event, so a later event carrying the target id
-    /// could mask a foreign snapshot / approval / CI state underneath — a
-    /// mixed/foreign masquerade. Returns false for a cross-entity / mixed /
-    /// rewritten / missing-anchor chain.
+    /// `pr.id` for every PR event, and the earlier `saw_created` check accepted
+    /// ANY `pr.created` event with matching entity/id, so a synthetic same-id
+    /// chain carrying a forged (non-`/meta`) `pr.created` could fold a forged
+    /// approval + green CI Check. A missing `/meta` ref, a missing /
+    /// replacement / duplicate `pr.created`, or a cross-entity / mixed chain all
+    /// refuse.
     pub(crate) fn pr_chain_anchored_to(&self, id: u64, tip: Oid) -> bool {
-        let Ok(chain) = self.read_chain_at(tip) else {
+        // The authoritative creation commit: `/meta` is pinned at PR allocation
+        // to the exact `pr.created` snapshot commit and never moves (F-006,
+        // F-008). If it is absent the chain cannot be verified as PR `id`'s.
+        let Ok(meta) = self.current_tip(&pr_meta_ref(id)) else {
+            return false;
+        };
+        let Some(meta_oid) = meta else {
+            return false;
+        };
+        let Ok(chain) = self.chain_from_tip(tip) else {
             return false;
         };
         if chain.is_empty() {
             return false;
         }
-        let mut saw_created = false;
-        for ev in &chain {
+        // Every event-bearing commit must belong to entity `pr` / `entity_id`
+        // id, exactly one `pr.created` must be present, and it must be AT the
+        // authoritative `/meta` commit. Because `/meta`'s parent is the genesis
+        // root (no event payload), the anchored `pr.created` is necessarily the
+        // first event-bearing commit in the chain — the invariant a forged
+        // same-id chain cannot reproduce without the real creation commit.
+        let mut created = 0usize;
+        for (oid, ev) in &chain {
             if ev.entity != "pr" || ev.entity_id != id {
                 return false;
             }
             if ev.kind == EventKind::PrCreated {
-                saw_created = true;
+                if *oid != meta_oid {
+                    return false;
+                }
+                created += 1;
             }
         }
-        saw_created
+        created == 1
     }
 
     /// True when `tip` is a valid first-parent extension of `ancestor` on PR

@@ -2332,6 +2332,43 @@ fn masquerade_event_json() -> String {
     )
 }
 
+/// JSON for a forged `ci.check` success event on entity `pr` / id `pr`, used
+/// to top a forged same-id chain so it folds to a green latest CI Check.
+fn forged_ci_success_json(pr: u64) -> String {
+    format!(
+        "{{\"v\":1,\"id\":\"22222222-2222-4222-8222-222222222222\",\
+         \"kind\":\"ci.check\",\"entity\":\"pr\",\"entity_id\":{pr},\
+         \"ts\":\"2026-01-01T00:00:01Z\",\"actor\":\"attacker@example.com\",\
+         \"body\":{{\"status\":\"success\",\"plan\":\".forge/ci.sh\"}}}}"
+    )
+}
+
+/// JSON for a forged approving `pr.review` event on entity `pr` / id `pr`.
+fn forged_review_approve_json(pr: u64) -> String {
+    format!(
+        "{{\"v\":1,\"id\":\"33333333-3333-4333-8333-333333333333\",\
+         \"kind\":\"pr.review\",\"entity\":\"pr\",\"entity_id\":{pr},\
+         \"ts\":\"2026-01-01T00:00:02Z\",\"actor\":\"attacker@example.com\",\
+         \"body\":{{\"decision\":\"approve\"}}}}"
+    )
+}
+
+/// Build a synthetic all-PR-`pr` chain rooted at `parent` whose `pr.created`
+/// is a FORGED re-commit — a verbatim copy of PR `pr`'s genuine creation event
+/// published at a NEW commit, NOT the immutable `/meta` anchor. The chain is
+/// topped with a status=success `ci.check` and an approving `pr.review`, so it
+/// folds to a fully mergeable PR `pr` (approve + latest CI success) under the
+/// old `saw_created` anchor. Returns the chain tip OID. The commit-aware anchor
+/// must refuse it because its `pr.created` is not at the `/meta` commit.
+fn build_forged_same_id_chain(dir: &PathBuf, parent: &str, pr: u64) -> String {
+    let meta = ref_oid(dir, &format!("refs/forge/prs/{pr}/meta")).expect("PR meta ref must exist");
+    let (c, genuine_created, e) = git(dir, &["show", &format!("{meta}:.forge/event.json")]);
+    assert_eq!(c, 0, "read genuine pr.created event failed: {e}");
+    let forged_created = append_event_commit(dir, parent, &genuine_created);
+    let forged_ci = append_event_commit(dir, &forged_created, &forged_ci_success_json(pr));
+    append_event_commit(dir, &forged_ci, &forged_review_approve_json(pr))
+}
+
 /// F-008 (mixed/foreign masquerade at the gate): PR #1's `/head` is rewritten
 /// to a tip that folds to PR #1's id (a PR #2 chain topped with an event
 /// carrying `entity_id = 1`) but is actually a foreign, independently
@@ -2556,5 +2593,206 @@ fn merge_refuses_rewrite_to_unproven_tip_between_read_and_cas() {
     assert!(
         ref_oid(&dir, "refs/forge/prs/1/result").is_some(),
         "pending result ref must be left in place on a rewrite refusal"
+    );
+}
+
+/// F-008 (forged same-id creation chain at the gate): PR #1's `/head` is
+/// rewritten to a synthetic all-PR-#1 chain containing a FORGED `pr.created`
+/// (a re-commit, not the `/meta` anchor), a `ci.check` success, and an
+/// approving `pr.review`, while the genuine immutable `/source` and `/base`
+/// refs remain. The old anchor accepted ANY `pr.created` with matching
+/// entity/id (`saw_created`), so the gate folded the forged approval + green
+/// Check and executed the genuine snapshot merge. The commit-aware anchor must
+/// refuse: base unchanged, no pending result ref, exit nonzero.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn merge_refuses_forged_same_id_creation_chain_at_entry() {
+    let dir = tmpdir("merge-forged-sameid-entry");
+    init_repo(&dir);
+    config_identity(&dir);
+
+    // PR #1: an independently green + approved PR (the genuine snapshot /meta /
+    // source / base refs).
+    make_feature_with_ci(&dir, "feature", "feat\n", 0);
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+    assert_eq!(forge(&dir, &["forge", "ci", "run", "1"]).0, 0);
+    assert_eq!(
+        forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
+        0
+    );
+
+    // Forge an all-PR-#1 chain rooted at PR #1's genesis (a sibling of the real
+    // pr.created): re-commit the genuine creation event at a NEW commit and top
+    // it with a green ci.check + approving pr.review. The genuine /source and
+    // /base refs stay untouched.
+    let meta = ref_oid(&dir, "refs/forge/prs/1/meta").unwrap();
+    let genesis = git(&dir, &["rev-parse", &format!("{meta}^")]).1;
+    let forged_tip = build_forged_same_id_chain(&dir, &genesis, 1);
+    let (c, _, e) = git(&dir, &["update-ref", "refs/forge/prs/1/head", &forged_tip]);
+    assert_eq!(c, 0, "rewrite PR #1 head to forged same-id chain: {e}");
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        forged_tip,
+        "PR #1 head must point at the forged same-id tip"
+    );
+
+    // Uncheckout the base so the forged chain would (under the old anchor)
+    // reach the merge execution and advance the base.
+    git(&dir, &["checkout", "-q", "feature"]);
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+
+    let (c, _o, e) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_ne!(
+        c, 0,
+        "merge must refuse a forged same-id creation chain (stderr: {e})"
+    );
+    assert!(
+        e.contains("not anchored to PR #1"),
+        "error must name the chain-anchor refusal: {e}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base ref must not advance"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        forged_tip,
+        "PR #1 head must stay at the forged tip"
+    );
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_none(),
+        "no pending result ref may be created before the gate"
+    );
+}
+
+/// F-008 (forged same-id creation chain rewritten during finalization): a
+/// green/approved PR #1 merge parked at the pending-window barrier has its
+/// `/head` ref REWRITTEN to a forged same-id chain appended ONTO the
+/// gate-validated head (a forged `pr.created` re-commit plus a green
+/// `ci.check` and approving `pr.review`) — a valid first-parent extension that
+/// the old anchor accepted. The retry must prove the moved tip is anchored by
+/// PR #1's authoritative `pr.created` before retrying (F-008); a forged /
+/// replacement `pr.created` is a genuine transaction failure → base unchanged,
+/// pending result ref left in place, exit nonzero.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn merge_refuses_forged_same_id_creation_chain_during_finalize() {
+    let dir = tmpdir("merge-forged-sameid-retry");
+    init_repo(&dir);
+    config_identity(&dir);
+
+    // PR #1: an independently green + approved PR (the merge's gate-validated
+    // head).
+    make_feature_with_ci(&dir, "feature", "feat\n", 0);
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+    assert_eq!(forge(&dir, &["forge", "ci", "run", "1"]).0, 0);
+    assert_eq!(
+        forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
+        0
+    );
+
+    // Uncheckout the base so the merge reaches the CI gate and parks.
+    git(&dir, &["checkout", "-q", "feature"]);
+
+    let barrier = tmpdir("merge-forged-sameid-retry-window");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let gate_head = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let mut child = std::process::Command::new(bin)
+        .args(["forge", "pr", "merge", "1"])
+        .current_dir(&dir)
+        .env("GIT_FORGE_TEST_MERGE_BARRIER", &barrier)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !barrier.join("ready").exists() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "merge never reached the barrier window"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_some(),
+        "pending result ref must exist in the barrier window"
+    );
+
+    // Rewrite PR #1's head to a forged same-id chain appended ONTO the
+    // gate-validated head: the forged pr.created descends from gate_head (a
+    // valid first-parent extension) but is a re-commit of the genuine creation
+    // event at a NON-authoritative commit.
+    let forged_tip = build_forged_same_id_chain(&dir, &gate_head, 1);
+    let (c, _, e) = git(&dir, &["update-ref", "refs/forge/prs/1/head", &forged_tip]);
+    assert_eq!(c, 0, "rewrite PR #1 head to forged same-id chain: {e}");
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        forged_tip,
+        "PR #1 head must point at the forged same-id tip"
+    );
+
+    let release_path = barrier.join("release");
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&release_path)
+            .expect("release sentinel must be created atomically");
+        let _ = f.write_all(b"go\n");
+    }
+    let status = child.wait().unwrap();
+    let mut stderr = String::new();
+    {
+        use std::io::Read as _;
+        if let Some(mut e) = child.stderr.take() {
+            let _ = e.read_to_string(&mut stderr);
+        }
+    }
+    assert!(
+        !status.success(),
+        "merge must refuse a forged same-id creation chain during finalization \
+         (stderr: {stderr})"
+    );
+    assert!(
+        stderr.contains("final transaction failed"),
+        "stderr: {stderr}"
+    );
+    assert!(stderr.contains("refs unchanged"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("pending result ref refs/forge/prs/1/result left in place"),
+        "stderr: {stderr}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base ref must not advance"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        forged_tip,
+        "PR #1 head must stay at the forged tip, not receive a pr.merge"
+    );
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_some(),
+        "pending result ref must be left in place on a forged-chain refusal"
     );
 }
