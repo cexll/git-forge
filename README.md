@@ -13,7 +13,11 @@ repository. Forge-state sync/refspec wiring across clones is L2.
   `base_head`/`merge_base`), list/show/three-dot diff, whole-PR and
   commit-anchored inline reviews (`--approve`/`--reject`).
 - **Merge gate**: `pr merge` refuses until the last reachable review is an
-  `approve`; approve → reject transitions are honored.
+  `approve` AND the latest CI Check is green; approve → reject transitions are
+  honored.
+- **CI**: `git forge ci run <pr>` executes the repo CI plan (`.forge/ci.sh` as a
+  regular file, else the `just check` fallback) against the PR's immutable
+  snapshot and records the outcome as a `ci.check` Forge Event.
 - **Merge strategies**: `--merge` (default, merge commit), `--squash`
   (single commit), `--rebase` (linear replay onto the base tip).
 - All state in git refs (`refs/forge/*`); no daemon, no second protocol.
@@ -55,8 +59,10 @@ git forge pr show 1
 git forge pr diff 1                      # base_head...source_head
 git forge pr review 1 --approve
 git forge pr review 1 --approve --file src/lib.rs --line 42 --commit <hash>   # anchored inline
-# A reject would set the effective decision to reject and block merge; the
-# last review must be an approve before `pr merge` succeeds.
+# A reject would set the effective decision to reject and block merge. To
+# merge, the last review must be an approve AND the latest CI Check must be
+# green — record it by running the CI plan:
+git forge ci run 1                       # execute .forge/ci.sh (or `just check`), record a CI Check
 # Merge strategies are mutually exclusive — a merged PR is terminal:
 git forge pr merge 1                     # merge commit (default)
 # or: git forge pr merge 1 --squash      # single commit
