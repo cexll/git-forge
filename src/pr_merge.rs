@@ -1,5 +1,6 @@
-//! PR merge command: approval gate, stale-base check, temporary-worktree
-//! strategy execution, and the atomic completion transaction.
+//! PR merge command: approval gate, latest-CI-Check gate, stale-base check,
+//! temporary-worktree strategy execution, and the atomic completion
+//! transaction.
 //!
 //! Split from `cli.rs` so the CLI layer stays under the size gate. Identity is
 //! resolved and bound here via [`crate::identity`] before any forge write
@@ -10,10 +11,11 @@ use crate::store::{BoundEventStore, EventStore};
 
 /// `git forge pr merge [<n>] [--squash|--rebase]`
 ///
-/// Fold the PR chain, require effective review decision = approve, then merge
-/// the immutable snapshot (`source_head` → `base_ref` tip) via the git binary
-/// in a temporary worktree, and atomically finalize: delete pending result
-/// ref + CAS base branch + CAS PR head chain in ONE ref transaction.
+/// Fold the PR chain, require effective review decision = approve AND the
+/// latest CI Check = success, then merge the immutable snapshot
+/// (`source_head` → `base_ref` tip) via the git binary in a temporary
+/// worktree, and atomically finalize: delete pending result ref + CAS base
+/// branch + CAS PR head chain in ONE ref transaction.
 //
 // Baseline exemption (removal trigger in constraints.yaml baseline.lint_allow):
 // the sole lib/src function over the 150-line clippy::too_many_lines threshold.
@@ -74,6 +76,24 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
     // Already merged: a pr.merge event exists → no double merge.
     if state.merge_result.is_some() {
         return Err(format!("PR #{id} is already merged"));
+    }
+    // Gate (L2): the latest CI Check must be success (the fold keeps the most
+    // recently appended ci.check). A pending/absent/failed Check refuses the
+    // merge BEFORE any worktree/ref side effect, and names the `ci run` step
+    // as the remedy. This is purely additive to the L1 approval gate.
+    match state.ci_status.as_deref() {
+        Some("success") => {}
+        Some(status) => {
+            return Err(format!(
+                "PR #{id} is not mergeable: latest CI Check is `{status}` \
+                 (expected `success`); run `git forge ci run {id}`"
+            ));
+        }
+        None => {
+            return Err(format!(
+                "PR #{id} is not mergeable: no CI Check recorded; run `git forge ci run {id}`"
+            ));
+        }
     }
     let base_ref = state
         .base_ref

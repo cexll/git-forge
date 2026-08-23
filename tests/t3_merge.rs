@@ -169,8 +169,34 @@ fn ref_oid(dir: &Path, r: &str) -> Option<String> {
     }
 }
 
+/// Add a passing `.forge/ci.sh` (exit 0) to the CURRENT branch and commit it,
+/// so the PR's own commits make `forge ci run` record a green latest CI Check.
+/// Must be called while the feature branch is checked out.
+fn add_passing_ci_plan(dir: &Path) {
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    std::fs::write(dir.join(".forge").join("ci.sh"), "#!/bin/bash\nexit 0\n").unwrap();
+    let (c, _, e) = git(dir, &["add", ".forge/ci.sh"]);
+    assert_eq!(c, 0, "add ci.sh failed: {e}");
+    let (c, _, e) = git(dir, &["commit", "-q", "-m", "ci plan"]);
+    assert_eq!(c, 0, "commit ci.sh failed: {e}");
+}
+
+/// Run `forge ci run 1`, asserting the latest CI Check is recorded as success.
+/// Called after `pr create` so the merge gate (L2) sees a green Check.
+fn ci_green(dir: &Path) {
+    let (c, o, e) = forge(dir, &["forge", "ci", "run", "1"]);
+    assert_eq!(c, 0, "ci run must pass: {e} {o}");
+}
+
 fn create_approved_pr(dir: &Path, branch: &str, title: &str) {
     make_feature(dir, branch, "feat\n");
+    // The L2 merge gate requires the latest CI Check to be success, so give
+    // the PR a passing plan and run it once before approving.
+    let (c, _, e) = git(dir, &["checkout", "-q", branch]);
+    assert_eq!(c, 0, "checkout {branch} failed: {e}");
+    add_passing_ci_plan(dir);
+    let (c, _, e) = git(dir, &["checkout", "-q", "main"]);
+    assert_eq!(c, 0, "checkout main failed: {e}");
     let (c, o, e) = forge(
         dir,
         &[
@@ -178,6 +204,7 @@ fn create_approved_pr(dir: &Path, branch: &str, title: &str) {
         ],
     );
     assert!(c == 0, "pr create failed: {e} {o}");
+    ci_green(dir);
     let (c, o, e) = forge(dir, &["forge", "pr", "review", "1", "--approve"]);
     assert!(c == 0, "pr review failed: {e} {o}");
 }
@@ -285,6 +312,11 @@ fn merge_succeeds_from_non_base_branch_with_dirty_main_worktree() {
     let dir = tmpdir("dirty");
     init_repo(&dir);
     make_feature(&dir, "feature", "feat\n");
+    let (c, _, e) = git(&dir, &["checkout", "-q", "feature"]);
+    assert_eq!(c, 0, "co feature: {e}");
+    add_passing_ci_plan(&dir);
+    let (c, _, e) = git(&dir, &["checkout", "-q", "main"]);
+    assert_eq!(c, 0, "co main: {e}");
     assert_eq!(
         forge(
             &dir,
@@ -293,6 +325,7 @@ fn merge_succeeds_from_non_base_branch_with_dirty_main_worktree() {
         .0,
         0
     );
+    ci_green(&dir);
     assert_eq!(
         forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
         0
@@ -350,6 +383,7 @@ fn rebase_replays_snapshot_onto_base() {
     assert!(c == 0, "add: {e}");
     let (c, _, e) = git(&dir, &["commit", "-q", "-m", "second"]);
     assert!(c == 0, "commit: {e}");
+    add_passing_ci_plan(&dir);
     let (c, _, e) = git(&dir, &["checkout", "-q", "main"]);
     assert!(c == 0, "checkout main: {e}");
     let (c, o, e) = forge(
@@ -366,6 +400,7 @@ fn rebase_replays_snapshot_onto_base() {
         ],
     );
     assert!(c == 0, "create: {e} {o}");
+    ci_green(&dir);
     assert_eq!(
         forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
         0
@@ -450,6 +485,7 @@ fn conflict_aborts_cleans_and_leaves_refs_unchanged() {
     assert!(c == 0, "add: {e}");
     let (c, _, e) = git(&dir, &["commit", "-q", "-m", "conflict"]);
     assert!(c == 0, "commit: {e}");
+    add_passing_ci_plan(&dir);
     let (c, _, e) = git(&dir, &["checkout", "-q", "main"]);
     assert!(c == 0, "co main: {e}");
     // also change base.txt on main
@@ -472,6 +508,7 @@ fn conflict_aborts_cleans_and_leaves_refs_unchanged() {
         ],
     );
     assert!(c == 0, "create: {e} {o}");
+    ci_green(&dir);
     assert_eq!(
         forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
         0
@@ -988,6 +1025,11 @@ fn pr_chain_events_carry_configured_user_email_as_actor() {
     let (c, _, e) = git(&dir, &["config", "user.email", "someone@example.com"]);
     assert_eq!(c, 0, "config user.email failed: {e}");
     make_feature(&dir, "feature", "feat\n");
+    let (c, _, e) = git(&dir, &["checkout", "-q", "feature"]);
+    assert_eq!(c, 0, "co feature: {e}");
+    add_passing_ci_plan(&dir);
+    let (c, _, e) = git(&dir, &["checkout", "-q", "main"]);
+    assert_eq!(c, 0, "co main: {e}");
     let (c, o, e) = forge(
         &dir,
         &[
@@ -995,6 +1037,7 @@ fn pr_chain_events_carry_configured_user_email_as_actor() {
         ],
     );
     assert_eq!(c, 0, "pr create failed: {e} {o}");
+    ci_green(&dir);
     assert_eq!(forge(&dir, &["forge", "pr", "comment", "1", "hello"]).0, 0);
     assert_eq!(
         forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
@@ -1007,8 +1050,8 @@ fn pr_chain_events_carry_configured_user_email_as_actor() {
     let actors = pr_chain_actors(&dir, "refs/forge/prs/1/head");
     assert_eq!(
         actors.len(),
-        5,
-        "five events: pr.created + ci.check + pr.comment + pr.review + pr.merge"
+        6,
+        "six events: pr.created + ci.check + ci.check + pr.comment + pr.review + pr.merge"
     );
     assert!(
         actors.iter().all(|a| a == "someone@example.com"),
@@ -1372,6 +1415,7 @@ fn rebase_conflict_aborts_cleans_and_leaves_refs_unchanged() {
     assert!(c == 0, "add v2: {e}");
     let (c, _, e) = git(&dir, &["commit", "-q", "-m", "feature v2"]);
     assert!(c == 0, "commit v2: {e}");
+    add_passing_ci_plan(&dir);
     let (c, _, e) = git(&dir, &["checkout", "-q", "main"]);
     assert!(c == 0, "co main: {e}");
     std::fs::write(dir.join("shared.txt"), "v3\n").unwrap();
@@ -1393,6 +1437,7 @@ fn rebase_conflict_aborts_cleans_and_leaves_refs_unchanged() {
         ],
     );
     assert!(c == 0, "create: {e} {o}");
+    ci_green(&dir);
     assert_eq!(
         forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
         0
@@ -1428,7 +1473,12 @@ fn rebase_refused_by_pre_rebase_hook_cleans_worktree() {
     let dir = tmpdir("prerebase");
     init_repo(&dir);
     make_feature(&dir, "feature", "feat\n"); // returns to main
-                                             // advance main after the fork point (different file → no rebase conflict)
+    let (c, _, e) = git(&dir, &["checkout", "-q", "feature"]);
+    assert_eq!(c, 0, "co feature: {e}");
+    add_passing_ci_plan(&dir);
+    let (c, _, e) = git(&dir, &["checkout", "-q", "main"]);
+    assert_eq!(c, 0, "co main: {e}");
+    // advance main after the fork point (different file → no rebase conflict)
     std::fs::write(dir.join("later.txt"), "later\n").unwrap();
     let (c, _, e) = git(&dir, &["add", "later.txt"]);
     assert!(c == 0, "add later: {e}");
@@ -1448,6 +1498,7 @@ fn rebase_refused_by_pre_rebase_hook_cleans_worktree() {
         ],
     );
     assert!(c == 0, "create: {e} {o}");
+    ci_green(&dir);
     assert_eq!(
         forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
         0
@@ -1493,6 +1544,7 @@ fn squash_conflict_aborts_cleans_and_leaves_refs_unchanged() {
     assert!(c == 0, "add: {e}");
     let (c, _, e) = git(&dir, &["commit", "-q", "-m", "feature change"]);
     assert!(c == 0, "commit: {e}");
+    add_passing_ci_plan(&dir);
     let (c, _, e) = git(&dir, &["checkout", "-q", "main"]);
     assert!(c == 0, "co main: {e}");
     std::fs::write(dir.join("base.txt"), "main-change\n").unwrap();
@@ -1514,6 +1566,7 @@ fn squash_conflict_aborts_cleans_and_leaves_refs_unchanged() {
         ],
     );
     assert!(c == 0, "create: {e} {o}");
+    ci_green(&dir);
     assert_eq!(
         forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
         0

@@ -406,8 +406,10 @@ fn pr_create_rejects_non_local_refs() {
 fn pr_create_accepts_slashed_local_branch() {
     let dir = tmpdir("slashbranch");
     init_repo(&dir);
-    // Hierarchical local branch name with a slash (refs/heads/feat/thing)
-    make_feature(&dir, "feat/thing", "feat\n");
+    config_identity(&dir);
+    // Hierarchical local branch name with a slash (refs/heads/feat/thing).
+    // The PR is merged later, so it carries a passing CI plan.
+    make_feature_with_ci(&dir, "feat/thing", "feat\n", 0);
     let (c, o, e) = forge(
         &dir,
         &[
@@ -462,6 +464,9 @@ fn pr_create_accepts_slashed_local_branch() {
         ],
     );
     assert_eq!(c3, 0, "full-form refs must be accepted: {e3}");
+    // Green CI Check so the merge gate lets PR #2 proceed.
+    let (cc, oc, ec) = forge(&dir, &["forge", "ci", "run", "2"]);
+    assert_eq!(cc, 0, "ci run 2 must pass: {ec} {oc}");
     let (cs3, os3, _) = forge(&dir, &["forge", "pr", "show", "2"]);
     assert_eq!(cs3, 0);
     assert!(
@@ -1640,4 +1645,179 @@ fn ci_run_passes_when_sibling_worktree_shares_temp_prefix() {
     // Hygiene: remove the sibling the CI plan left registered.
     remove_leftover_ci_worktree(&dir);
     assert_no_ci_worktree(&dir);
+}
+
+/// Set a repo identity in the local config so `pr merge`'s git subprocesses
+/// (worktree add / merge / commit, which do not inherit the test's env) find a
+/// committer — mirroring the t3_merge `init_repo` setup.
+fn config_identity(dir: &PathBuf) {
+    let (c, _, e) = git(dir, &["config", "user.name", "Test"]);
+    assert_eq!(c, 0, "config user.name failed: {e}");
+    let (c, _, e) = git(dir, &["config", "user.email", "test@example.com"]);
+    assert_eq!(c, 0, "config user.email failed: {e}");
+}
+
+/// Make a feature branch off main with one commit carrying a `.forge/ci.sh`
+/// plan that exits `ci_exit` (0 = passing, nonzero = failing) plus `content`,
+/// then return to main. The plan is committed in the PR's OWN commits so a
+/// later `ci run` validates exactly the PR.
+fn make_feature_with_ci(dir: &PathBuf, branch: &str, content: &str, ci_exit: u16) {
+    git(dir, &["checkout", "-q", "-b", branch]);
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    std::fs::write(
+        dir.join(".forge").join("ci.sh"),
+        format!("#!/bin/bash\nexit {ci_exit}\n"),
+    )
+    .unwrap();
+    std::fs::write(dir.join("feature.txt"), content).unwrap();
+    git(dir, &["add", "."]);
+    git(dir, &["commit", "-q", "-m", &format!("{branch} commit")]);
+    git(dir, &["checkout", "-q", "main"]);
+}
+
+/// VAL-005: an approved PR whose latest CI Check is `failed` must refuse the
+/// merge (exit nonzero, no ref change) and the error must name the `ci run`
+/// step.
+#[test]
+fn merge_refused_when_ci_check_failed() {
+    let dir = tmpdir("merge-ci-failed");
+    init_repo(&dir);
+    config_identity(&dir);
+    // A failing CI plan: `ci run` records status=failed.
+    make_feature_with_ci(&dir, "feature", "feat\n", 1);
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+    let (c, _o, _e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_ne!(c, 0, "ci run on a failing plan must exit nonzero");
+    assert_eq!(
+        forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
+        0
+    );
+    // Uncheckout the base (main) so the merge reaches the CI gate.
+    git(&dir, &["checkout", "-q", "feature"]);
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let head_before = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+    let (c, _o, e) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_ne!(c, 0, "approved + failed CI must refuse merge (got {e})");
+    assert!(e.contains("git forge ci run 1"), "error names ci run: {e}");
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base ref must be unchanged on a refused merge"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        head_before,
+        "head ref must be unchanged on a refused merge"
+    );
+}
+
+/// VAL-005: an approved PR whose latest CI Check is `pending` (the marker
+/// `pr create` records, never overwritten by a `ci run`) must refuse the
+/// merge (exit nonzero, no ref change) and the error must name the `ci run`
+/// step.
+#[test]
+fn merge_refused_when_ci_check_pending() {
+    let dir = tmpdir("merge-ci-pending");
+    init_repo(&dir);
+    config_identity(&dir);
+    make_feature(&dir, "feature", "feat\n");
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+    // No `ci run`: the chain carries the pending marker from pr create, which
+    // is not success.
+    assert_eq!(
+        forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
+        0
+    );
+    git(&dir, &["checkout", "-q", "feature"]);
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let head_before = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+    let (c, _o, e) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_ne!(c, 0, "approved + pending CI must refuse merge (got {e})");
+    assert!(e.contains("git forge ci run 1"), "error names ci run: {e}");
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base ref must be unchanged on a refused merge"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        head_before,
+        "head ref must be unchanged on a refused merge"
+    );
+}
+
+/// VAL-005: an approved PR whose latest CI Check is `success` must proceed —
+/// the merge command exits 0 and the base ref advances.
+#[test]
+fn merge_proceeds_when_ci_check_success() {
+    let dir = tmpdir("merge-ci-success");
+    init_repo(&dir);
+    config_identity(&dir);
+    make_feature_with_ci(&dir, "feature", "feat\n", 0);
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+    let (c, o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_eq!(c, 0, "ci run on a passing plan must pass: {e} {o}");
+    assert_eq!(
+        forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
+        0
+    );
+    git(&dir, &["checkout", "-q", "feature"]);
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let (c, o, e) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_eq!(c, 0, "approved + CI success must merge: {e} {o}");
+    assert_ne!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base ref must advance on a green merge"
+    );
+}
+
+/// L1 regression preserved: with no approval, the merge refuses with the
+/// approval-only error even though the PR carries a pending CI Check.
+#[test]
+fn merge_refused_when_not_approved() {
+    let dir = tmpdir("merge-not-approved");
+    init_repo(&dir);
+    config_identity(&dir);
+    make_feature(&dir, "feature", "feat\n");
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+    // No review (no approval) → the existing approval-only gate refuses.
+    git(&dir, &["checkout", "-q", "feature"]);
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let (c, _o, e) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_ne!(c, 0, "unapproved merge must refuse (got {e})");
+    assert!(e.contains("not approved"), "error names approval: {e}");
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base ref must be unchanged on a refused merge"
+    );
 }
