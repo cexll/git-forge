@@ -749,11 +749,32 @@ fn run_ci_plan(worktree: &std::path::Path, plan: &str) -> Option<i32> {
     out.status.code()
 }
 
+/// Determine the immutable-snapshot CI plan (F-001): `.forge/ci.sh` when it is
+/// a regular file in the snapshot, the `just check` fallback when absent, and a
+/// refusal when `.forge/ci.sh` is a symlink or otherwise not a regular file —
+/// so CI never follows a tracked link to mutable bytes outside the snapshot.
+fn snapshot_ci_plan(repo: &git2::Repository, oid: git2::Oid) -> Result<&'static str, String> {
+    let tree = repo
+        .find_commit(oid)
+        .and_then(|c| c.tree())
+        .map_err(|_| "cannot read PR snapshot source tree".to_string())?;
+    match tree.get_path(std::path::Path::new(".forge/ci.sh")) {
+        Err(_) => Ok("just check"),
+        Ok(e) => match e.filemode() {
+            0o100644 | 0o100755 | 0o100664 => Ok(".forge/ci.sh"),
+            0o120000 => Err("refusing .forge/ci.sh: symlink (F-001)".to_string()),
+            _ => Err("refusing .forge/ci.sh: not a regular file (F-001)".to_string()),
+        },
+    }
+}
+
 /// `git forge ci run <pr>` — execute the repo CI plan against the PR's own
 /// commits in a temporary worktree, append a CI Check event recording the
 /// outcome, and leave the developer's working tree and current branch
-/// untouched. The plan is `.forge/ci.sh` when present in the PR tree,
-/// otherwise the `just check` fallback.
+/// untouched. The plan is `.forge/ci.sh` when present in the PR's immutable
+/// source snapshot as a regular file, otherwise the `just check` fallback; a
+/// `.forge/ci.sh` that is a symlink or otherwise not a regular file is refused
+/// up front (F-001), so the plan always comes from immutable PR content.
 fn cmd_ci_run(args: &[String]) -> Result<String, String> {
     let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
     let (store, actor) = open_mutation_store()?;
@@ -773,6 +794,12 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
         .workdir()
         .map(|p| p.to_path_buf())
         .ok_or_else(|| "cannot resolve repository working directory".to_string())?;
+
+    // Determine the plan from the PR's IMMUTABLE source snapshot up front
+    // (F-001): a symlink/non-regular `.forge/ci.sh` is refused before a
+    // worktree is even created, so CI never follows a tracked link to mutable
+    // bytes outside the detached worktree. Absent -> the `just check` fallback.
+    let plan = snapshot_ci_plan(store.repo(), source_oid)?;
 
     // Reserve a unique temp worktree path (sibling lock) so concurrent CI runs
     // on the same repo never collide on the global temp dir.
@@ -831,17 +858,9 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
         let _ = std::fs::remove_file(path.with_extension("lock"));
     };
 
-    // Determine the plan from the PR tree itself: `.forge/ci.sh` when present,
-    // otherwise the `just check` fallback.
-    let plan = if tmp.join(".forge").join("ci.sh").exists() {
-        ".forge/ci.sh".to_string()
-    } else {
-        "just check".to_string()
-    };
-
     // Run the plan. The exit status is captured; the plan's stderr/stdout stay
     // in the worktree (not surfaced), only the recorded status matters here.
-    let script_status = run_ci_plan(&tmp, &plan);
+    let script_status = run_ci_plan(&tmp, plan);
 
     // Always append the CI Check outcome — a failing plan must still record a
     // `failure` CI Check (VAL-002) before the command exits nonzero.
@@ -852,7 +871,7 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
     };
     let mut body = HashMap::new();
     body.insert("status".into(), json_str(status));
-    body.insert("plan".into(), json_str(&plan));
+    body.insert("plan".into(), json_str(plan));
     let ev = Event::new(EventKind::CiCheck, "pr", id, &actor, body);
     // Record the outcome — a failing plan still appends a `failure` CI Check
     // (VAL-002) before the command exits nonzero.

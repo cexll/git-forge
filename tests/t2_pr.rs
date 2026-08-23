@@ -1386,6 +1386,72 @@ fn ci_run_fallback_just_check_succeeds_without_ci_sh() {
     assert_eq!(status.trim(), "", "working tree must be clean: {status}");
 }
 
+/// F-001 regression: a `.forge/ci.sh` that is a tracked symlink redirecting CI
+/// to mutable bytes OUTSIDE the PR's immutable source snapshot must be refused —
+/// clean error, exit nonzero, and no green Check. The external target changes
+/// AFTER the PR snapshot is taken, so a run that followed the link would
+/// execute external mutable bytes instead of the frozen snapshot and record a
+/// green Check from them.
+#[test]
+fn ci_run_refuses_symlink_escape_after_target_changes() {
+    let dir = tmpdir("ci-symlink-escape");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+
+    // An external, mutable CI script that lives OUTSIDE the repo (never
+    // committed). It fails initially, then is flipped to pass AFTER PR
+    // creation — a run that follows the symlink would read the changed
+    // external bytes.
+    let ext = tmpdir("ci-symlink-escape-ext");
+    let ext_script = ext.join("evil.sh");
+    std::fs::write(&ext_script, "#!/bin/bash\nexit 1\n").unwrap();
+
+    // Commit `.forge/ci.sh` as a symlink pointing at the external script.
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    std::os::unix::fs::symlink(&ext_script, dir.join(".forge").join("ci.sh")).unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "feature + symlinked ci plan"]);
+    git(&dir, &["checkout", "-q", "main"]);
+
+    let (c, o, e) = forge(
+        &dir,
+        &[
+            "forge", "pr", "create", "--source", "feature", "--base", "main", "PR1",
+        ],
+    );
+    assert_eq!(c, 0, "pr create failed: {e} {o}");
+
+    // The external symlink target CHANGES to a passing script after the PR's
+    // immutable snapshot was taken.
+    std::fs::write(&ext_script, "#!/bin/bash\nexit 0\n").unwrap();
+
+    // The hardened selector must refuse to follow the symlink out of the
+    // snapshot: clean error, exit nonzero, and no green CI Check recorded.
+    let (cr, or_, er) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_ne!(
+        cr, 0,
+        "ci run must refuse a symlinked .forge/ci.sh: {or_} {er}"
+    );
+    assert!(
+        er.contains("symlink"),
+        "stderr must name the symlink refusal: {er}"
+    );
+
+    let event = head_event(&dir, 1);
+    assert!(
+        !event.contains("\"status\":\"success\""),
+        "must not record a green Check from external bytes: {event}"
+    );
+
+    // Working tree + current branch unchanged, no temp worktree left behind.
+    assert_eq!(git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).1, "main");
+    let (_, status, _) = git(&dir, &["status", "--porcelain"]);
+    assert_eq!(status.trim(), "", "working tree must be clean: {status}");
+    assert_no_ci_worktree(&dir);
+}
+
 /// `ci run` on a nonexistent PR is a clean error (no worktree side effects).
 #[test]
 fn ci_run_nonexistent_pr_is_clean_error() {
