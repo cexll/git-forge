@@ -24,8 +24,8 @@ Same logic has exactly one implementation in the repo. Version evolution belongs
 |------|-------------|
 | Forbidden suffixes | `.git-hooks/check-naming.sh` (pre-commit hook) |
 | Scratchpad dirs | `.git-hooks/check-naming.sh` + `.gitignore` |
-| Duplicate code | review-only (no Rust duplicate detector installed) |
-| Dead code | review-only (cargo-machete not installed) |
+| Duplicate code (src/, cargo-dupes) | `.git-hooks/pre-commit` + `just dupes-check` (cargo-dupes check -p src --exclude-tests, 3% cap in constraints.yaml) |
+| Dead code | `.git-hooks/pre-commit` + `just lint`/`just deps-check` (rustc dead_code under -D warnings + cargo-machete) |
 | Commented-out code | review-only (clippy has no such lint) |
 
 Every row above points at what actually runs. Rows marked review-only are not machine checks; do not present them as such.
@@ -118,6 +118,11 @@ git config core.hooksPath .git-hooks   # one-time hook install
 > not install it; a missing command makes `deps-check` exit non-zero with cargo's
 > "no such command" error, so a fresh clone fails loudly instead of silently passing the gate.
 
+> **Prerequisite — cargo-dupes (required, not auto-installed):** the blocking `just dupes-check`
+> drives off `cargo-dupes`, installed once via `cargo install cargo-dupes`. `just setup` does not
+> install it; a missing binary makes `dupes-check` exit 1 with `cargo-dupes missing — run cargo
+> install cargo-dupes`, so a fresh clone fails loudly instead of silently passing the gate.
+
 > **Prerequisite — GDOGFOOD_SRC for `just e2e` / `just dogfood-all` / `just dogfood`:** scripts/gf-dogfood.sh dogfoods a
 > disposable clone of `$GDOGFOOD_SRC` (default /Users/chenwenjie/workspaces/dsh-deepwork).
 > The path must exist, be a git repository, resolve to that repository's canonical worktree root
@@ -164,6 +169,7 @@ All commands route through `justfile`. Do not invent ad-hoc commands; add missin
 | Size gate | tokei per-file code lines over src/ | `just size-gate` | exit 0; non-zero if any src/ file exceeds 800 code lines (wired into `just check`) |
 | Decision records | scripts/check-decisions.py | `just decisions-check` | exit 0 |
 | Unused dependencies | cargo-machete | `just deps-check` | exit 0 |
+| Duplicate code (src/) | cargo-dupes (`check -p src --exclude-tests`) | `just dupes-check` | exit 0; src/ exact+near dup % ≤ 3% (constraints.yaml `duplicate_code_threshold_percent`) |
 | Rendered harness | check_rendered_harness.py (AGENTS.md sections/matrix/enforcement/mirror) | `just harness-check` | exit 0 |
 | Documentation gate | check_docs.py (wire-contract Known Limitations + doc cross-refs) | `just docs-check` | exit 0 |
 | CLI surface | built binary run | `just verify-cli` | exit code + --help output |
@@ -217,6 +223,7 @@ White-box review required for changes touching these (L3): `src/store.rs` (git2 
 | Decision-record structure | just check | `just decisions-check` (scripts/check-decisions.py) | block |
 | File ≤800 code lines (src/) | just check | `just size-gate` (tokei) | block |
 | Unused `[dependencies]` (cargo-machete) | pre-commit + just check | `.git-hooks/pre-commit`, `just deps-check` | block |
+| Duplicate code (src/, cargo-dupes, ≤3%) | pre-commit + just check | `.git-hooks/pre-commit`, `just dupes-check` | block |
 | Rendered harness drift (AGENTS.md sections/matrix/enforcement/mirror) | just check | `just harness-check` | block |
 | Doc cross-refs + Known Limitations | just check | `just docs-check` | block |
 | Devflow receipt integrity | devflow scheduler | `just devflow ARGS=end-feature` (git hard checks) | block |

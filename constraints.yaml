@@ -32,11 +32,6 @@ strictness_profile:
       chosen: review-only
       reason: "commitlint not installed"
       removal_trigger: "install commitlint and wire into .git-hooks/commit-msg"
-    - control: anti_drift.duplicate_code_threshold_percent
-      profile_default: block (3)
-      chosen: review-only
-      reason: "no Rust duplicate-code detector installed"
-      removal_trigger: "install a Rust duplicate-code detector (e.g. SonarQube, manual review→tool)"
   # Every row above stays L3-profile-valid; the gate is the honest gap, not a
   # silent relaxation. Re-eng-init or add tooling to convert review-only→block.
 
@@ -150,8 +145,8 @@ dependencies:
 anti_drift:
   duplicate_code_threshold_percent:
     value: 3
-    severity: "review-only"          # no Rust duplicate-code detector installed — honest gap
-    enforced_by: "PR review only (no tool wired)"
+    severity: "block"                # cargo-dupes enforces exact/near dup % against this cap (src/, excludes tests)
+    enforced_by: "just dupes-check + pre-commit (cargo-dupes check -p src --exclude-tests --max-exact-percent 3 --max-near-percent 3)"
   dead_code_min_confidence:
     value: 80
     severity: "block"                # within-crate dead code via rustc dead_code under clippy -D warnings; unused deps via cargo-machete
@@ -216,6 +211,11 @@ verification:
     deps:
       command: "just deps-check"
       evidence: "cargo-machete exits 0 (no unused [dependencies] entry); wired into just check (block)"
+      required_at: "L3"
+      level: "block"
+    dupes:
+      command: "just dupes-check"
+      evidence: "cargo-dupes check -p src --exclude-tests exits 0 — src/ exact+near dup % under duplicate_code_threshold_percent (3); wired into just check (block)"
       required_at: "L3"
       level: "block"
     harness:

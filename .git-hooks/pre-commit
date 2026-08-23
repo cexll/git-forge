@@ -11,4 +11,5 @@ if [ -f Cargo.toml ]; then
   cargo fmt --check
   cargo clippy --all-targets -- -D warnings -D clippy::cognitive_complexity -D clippy::too_many_lines
   cargo machete
+  cargo dupes check -p src --exclude-tests --max-exact-percent 3 --max-near-percent 3
 fi

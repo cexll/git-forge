@@ -14,7 +14,7 @@ setup:
 # pre-commit/just-check, and there is no CI runner to host it as a blocking
 # gate; it stays a standalone review-only check for single-user local dev (see
 # constraints.yaml downgrades).
-check: fmt-check lint deps-check test test-guardrails decisions-check size-gate harness-check docs-check
+check: fmt-check lint deps-check dupes-check test test-guardrails decisions-check size-gate harness-check docs-check
     echo "fast checks passed"
 
 # Format
@@ -33,6 +33,14 @@ lint:
 # review-only.
 deps-check:
     @if [ -f Cargo.toml ]; then cargo machete; else echo "deps-check: no Cargo.toml yet — lands with devflow t0"; fi
+
+# Duplicate-code gate (class B, block): cargo-dupes exits non-zero when src/
+# exact or near-duplicate lines exceed duplicate_code_threshold_percent (3) at
+# the default min-unit size. Scoped to src/ (production) and excludes #[test]
+# fns / #[cfg(test)] mods; integration-test helper duplication is out of scope
+# (documented). Previously the duplicate_code criterion was review-only.
+dupes-check:
+    @if [ -f Cargo.toml ]; then command -v cargo-dupes >/dev/null 2>&1 || { echo "cargo-dupes missing — run cargo install cargo-dupes" >&2; exit 1; }; cargo dupes check -p src --exclude-tests --max-exact-percent 3 --max-near-percent 3; else echo "dupes-check: no Cargo.toml yet — lands with devflow t0"; fi
 
 # Rendered eng-init harness validation (agents_md_validation): proves that
 # AGENTS.md Verification Matrix commands, Enforcement Index paths, and the
