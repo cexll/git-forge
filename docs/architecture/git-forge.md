@@ -24,8 +24,11 @@ Must-not-haves (L1): web UI, single-file export, GitHub bridge, accounts/permiss
 | `event` (model) | `Event`, `EventKind`, `JsonValue`, `is_uuid_v4` | Event schema v1, UUID generation, kind/body validation | Deep: pure, no I/O, fully testable; deletion would scatter state logic across CLI and store |
 | `fold` (state derivation) | `fold(events) -> FoldState`, `IssueState`/`PrState`/`SeqState`, `first_allocation` | Deterministic ordering, issue/PR state derivation, effective review decision | Pure, no I/O |
 | `store` (git refs) | `EventStore`: `append_event`, `read_chain`, `create_pr`, `allocate_id` (versioned counter CAS), `create_pending_result_ref`/`delete_pending_result_ref`, `finalize_pr_merge` | Ref naming under `refs/forge/*`, commit creation, packed-ref-safe reads, counter commit chain, one-transaction merge completion | Deep: hides all git plumbing; callers never touch refs directly |
-| `git` (adapter) | `worktree_add`/`worktree_remove`/`worktree_list`, `base_checked_out_elsewhere`, `execute_strategy` (merge/squash/rebase), `cleanup_failed_worktree`, `require_single_merge_base` | `git` binary shell-outs for merge execution: strategy commands, abort/reset/clean failure cleanup, merge-base --all, worktree plumbing | Deep: protocol correctness delegated to git itself; the merge-gate predicate stays in `cli` |
-| `cli` (entry) | `run_issue`, `run_pr`, `run_*` dispatch; `cmd_pr_merge` orchestration (gate + temp worktree lifecycle + atomic finalize); `cmd_pr_diff`'s `git diff` shell-out | Command parsing, merge-gate predicate, pending-result cleanup helper | Shallow by design: dispatch and orchestration only; the one exception is `cmd_pr_diff`'s `git diff` |
+| `identity` (actor) | `resolve_identity`, `bind_identity`, `open_mutation_store` | The invoking repo's `user.email` resolved once per write via `crate::git::config_get_identity` (a safe `git config --null --get` child — never libgit2, VAL-115 stage A). Stage A (config-open fault) propagates a clean CLI error; stage B (absent/empty/non-UTF-8 email) falls back to `forge@localhost`. Signature + actor are bound before any write. | Shallow: never a libgit2 `repo.config()` read at write time (the VAL-115 SIGSEGV-on-corrupt-config path) |
+| `git` (adapter) | `worktree_add`/`worktree_remove`/`worktree_list`, `base_checked_out_elsewhere`, `execute_strategy` (merge/squash/rebase), `cleanup_failed_worktree`, `require_single_merge_base` | `git` binary shell-outs for merge execution: strategy commands, abort/reset/clean failure cleanup, merge-base --all, worktree plumbing | Deep: protocol correctness delegated to git itself; the merge-gate predicate stays in `pr_merge` |
+| `ci` (runner) | `ci_timeout`, `snapshot_ci_plan`, `run_ci_plan` | Bounded CI plan execution in a disposable worktree: immutable-snapshot plan resolution/materialization, process-group kill+reap under a deadline, env tightening | Security-sensitive: isolates the plan subprocess (`/bin/bash` / `just`) and its environment |
+| `pr_merge` (merge gate) | `cmd_pr_merge` | Merge-gate predicate (effective approve required) + stale-base / checked-out-base guards, temp-worktree lifecycle, pending-result ref, one-transaction finalize | Deep: the gate predicate + merge atomicity live here (not `cli`); `cli` dispatches to it |
+| `cli` (entry) | `run_issue`, `run_pr`, `run_ci` dispatch; `cmd_pr_diff` (arguments + result handling) | Command parsing; the merge-gate predicate + orchestration live in `pr_merge`; `cmd_pr_diff` delegates the subprocess to `git::git_in_ci` | Shallow by design: dispatch only, no direct subprocess spawning (diff goes through the sanitized git adapter) |
 | `sync` (L2) | — | Explicit forge refspec push, additive fetch refspec, per-entity DAG merge convergence | Not built in L1; no `src/sync.rs` yet |
 | `hooks` (L2) | — | Pre-receive/post-receive hooks, refspec validation | Not built in L1; no `src/hooks.rs` yet |
 
@@ -34,14 +37,20 @@ Must-not-haves (L1): web UI, single-file export, GitHub bridge, accounts/permiss
 ```
 cli → store → event/fold
 cli → git
+cli → ci
+cli → pr_merge → store → event/fold
+cli → identity
+ci → git2 (plan materialization; no core, no store)
 git → git2 (no core, no store)
 event/fold: zero external dependencies (no git, no I/O)
 ```
 
 - `event`/`fold` never import git2 or perform I/O; tests run with no infrastructure.
 - `store` depends on `event`/`fold` types only.
-- `cli` is the only module that parses user input and hosts the merge-gate predicate.
+- `cli` is the only module that parses user input; the merge-gate predicate lives in `pr_merge`.
+- `pr_merge` owns the merge-gate predicate + merge orchestration; `cli` dispatches to it. `identity` resolves the actor/signature once per write.
 - `git` is the only module that shells out for merge execution; it does not import `cli` or `store`.
+- `ci` is the only module that executes the CI plan subprocess (`/bin/bash` for `.forge/ci.sh`, `just` for the `just check` fallback) and performs process-group signalling via `/bin/kill`; it imports git2 for plan materialization but never `core`/`store`.
 - `sync` (L2) will depend on `store`, `event`/`fold`, and `git`; it is not wired in L1.
 
 ## Directory Structure
@@ -60,11 +69,15 @@ git-forge/
 │   └── architecture/git-forge.md
 ├── src/
 │   ├── main.rs          # `git forge` entry binary
-│   ├── lib.rs           # module root: declares cli, event, fold, git, store
-│   ├── cli.rs           # command parsing + dispatch; cmd_pr_merge orchestration, merge-gate predicate, pending-result cleanup, cmd_pr_diff git diff
+│   ├── lib.rs           # module root: declares cli, event, fold, git, store, identity, pr_merge, ci
+│   ├── cli.rs           # command parsing + dispatch; cmd_pr_diff git diff
+│   ├── ci.rs            # CI runner: plan resolution/materialization, bounded exec (bash/just), process-group kill
+│   ├── ci/validate.rs   # Just fallback closure validator (F-012) split out for the size gate
 │   ├── event.rs         # event model + JSON schema (pure)
 │   ├── fold.rs          # state derivation (pure)
 │   ├── git.rs           # git binary adapter: merge-execution shell-outs (worktree, strategies, cleanup, merge-base)
+│   ├── identity.rs      # actor/user.email resolution (F-028) + commit-signature binding
+│   ├── pr_merge.rs      # cmd_pr_merge: merge-gate predicate + orchestration (temp worktree, pending result, atomic finalize)
 │   └── store.rs         # refs read/write via git2
 └── tests/
     ├── t0_core.rs       # event/fold unit tests
@@ -181,6 +194,7 @@ Kinds and body fields:
 ### CI (on-demand, L1)
 
 - **`git forge ci run <pr>`** executes the repo CI plan against the PR's **immutable source snapshot** (`refs/forge/prs/<n>/source`) in a temporary worktree, so it validates exactly the PR's own commits; the developer's working tree and current branch are untouched. The plan is `.forge/ci.sh` from the PR tree when it is a **regular file** in the snapshot; a `.forge/ci.sh` that is a symlink or otherwise not a regular file is **refused up front** — the plan is resolved before the temporary worktree is created, so the command errors before execution and before any `ci.check` is appended (no Check result records the refusal). When `.forge/ci.sh` is absent, the `just check` fallback runs. The command appends a `ci.check` event recording the outcome (`status`: `success` when the plan exits 0, `failed` otherwise) and the `plan` that ran — even a failing plan records a `failed` Check before the command exits nonzero — then cleans up the temporary worktree.
+- **Cleanup-before-green (F-025)**: `git forge ci run` records `success` only after the temporary worktree removal is VERIFIED (directory gone + path no longer registered). A passing plan whose worktree cannot be removed is recorded as `failed` and the command exits nonzero, so the merge gate cannot accept a green Check whose CI run actually failed integrity.
 - **Pending marker on create**: `git forge pr create` publishes an initial `ci.check` with `status: "pending"` (no `plan` — no plan executes at creation) atomically with PR allocation, as the `/head` chain tip, so a freshly created PR surfaces a pending Check without running anything. `git forge ci run <pr>` appends a later Check, and fold keeps the latest.
 - **Merge gate**: the command-level merge gate requires the latest `ci.check` to be `success`; a `pending`/`failed`/absent Check refuses the merge before any worktree/ref side effect and names `git forge ci run <pr>` as the remedy. CI is purely on-demand — no server, no daemon, nothing runs unless invoked.
 

@@ -254,13 +254,21 @@ impl EventStore {
     /// Walk a chain oldest→tip from a known tip OID, returning each
     /// event-bearing commit's OID paired with its event. Skips commits whose
     /// tree has no `.forge/event.json` (genesis roots and L2 merge nodes).
-    fn chain_from_tip(&self, tip: Oid) -> Result<Vec<(Oid, Event)>, StoreError> {
-        let mut out: Vec<(Oid, Event)> = Vec::new();
+    /// THE first-parent chain walk. One traversal primitive, shared by the
+    /// OID-bearing [`Self::chain_from_tip`] and the event-only
+    /// [`Self::chain_events_from_tip`]: walks first-parent commits from `tip`,
+    /// projects each event-bearing commit with `build`, and returns oldest→tip.
+    fn walk_first_parent<T>(
+        &self,
+        tip: Oid,
+        mut build: impl FnMut(Oid, Event) -> T,
+    ) -> Result<Vec<T>, StoreError> {
+        let mut out: Vec<T> = Vec::new();
         let mut oid = tip;
         loop {
             let commit = self.repo.find_commit(oid)?;
             if let Some(event) = self.read_event_blob(&commit)? {
-                out.push((oid, event));
+                out.push(build(oid, event));
             }
             match commit.parent_ids().next() {
                 Some(p) => oid = p,
@@ -271,28 +279,88 @@ impl EventStore {
         Ok(out)
     }
 
+    /// Event-bearing commit's OID paired with its event, oldest→tip. Skips
+    /// commits whose tree has no `.forge/event.json` (genesis roots and L2
+    /// merge nodes).
+    fn chain_from_tip(&self, tip: Oid) -> Result<Vec<(Oid, Event)>, StoreError> {
+        self.walk_first_parent(tip, |oid, ev| (oid, ev))
+    }
+
+    /// Event chain oldest→tip as events, directly (no intermediate
+    /// OID/event Vec). Skips commits with no event blob.
+    fn chain_events_from_tip(&self, tip: Oid) -> Result<Vec<Event>, StoreError> {
+        self.walk_first_parent(tip, |_, ev| ev)
+    }
+
     /// Read a single entity event chain oldest→tip. Skips commits whose tree
     /// has no `.forge/event.json` (genesis roots and L2 merge nodes).
     pub fn read_chain(&self, entity_ref: &str) -> Result<Vec<Event>, StoreError> {
         let Some(tip) = self.current_tip(entity_ref)? else {
             return Ok(Vec::new());
         };
-        Ok(self
-            .chain_from_tip(tip)?
-            .into_iter()
-            .map(|(_, event)| event)
-            .collect())
+        self.chain_events_from_tip(tip)
     }
 
-    /// Read a chain from a known tip OID. Used to bind a gate decision to the
-    /// exact tip the completion transaction will CAS from, so the fold and the
-    /// transaction's expected head can never disagree.
-    pub fn read_chain_at(&self, tip: Oid) -> Result<Vec<Event>, StoreError> {
-        Ok(self
-            .chain_from_tip(tip)?
-            .into_iter()
-            .map(|(_, event)| event)
-            .collect())
+    /// Validate that the `/source` and `/base` snapshot refs still point at the
+    /// AUTHORITATIVE `pr.created` snapshot (F-008): a retargeted ref would let
+    /// the merge gate / CI / diff operate on a different snapshot than the one
+    /// that was reviewed and CI-gated. Shared by `cmd_pr_merge`, `cmd_ci_run`
+    /// and `cmd_pr_diff` so the invariant lives in one owner.
+    pub(crate) fn validate_pr_snapshot_refs(
+        &self,
+        id: u64,
+        source_oid: Oid,
+        base_oid: Oid,
+    ) -> Result<(), String> {
+        // Read the head chain AND validate it is ANCHORED to PR `id` in ONE
+        // walk (a forged duplicate pr.created or a temporary head rewrite must
+        // not supply the snapshot fields), then compare the refs.
+        let tip = self
+            .current_tip(&pr_head_ref(id))
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| format!("PR #{id} does not exist"))?;
+        let (anchored, chain) = self
+            .read_pr_chain_anchored(id, tip)
+            .map_err(|e| e.to_string())?;
+        if !anchored {
+            return Err(format!("PR #{id} head chain is not anchored to PR #{id}"));
+        }
+        let state = crate::event::fold(&chain).pr;
+        Self::validate_snapshot_against_state(id, &state, source_oid, base_oid)
+    }
+
+    /// Pure comparison of the snapshot refs against an AUTHORITATIVE
+    /// `pr.created` state (the caller MUST have obtained it from an anchored
+    /// read). The merge gate passes its ALREADY-ANCHORED gate state here, so a
+    /// concurrent `/head` rewrite between the gate read and the finalize cannot
+    /// substitute a forged snapshot (F-008).
+    pub(crate) fn validate_snapshot_against_state(
+        id: u64,
+        state: &crate::event::PrState,
+        source_oid: Oid,
+        base_oid: Oid,
+    ) -> Result<(), String> {
+        let auth_source = state
+            .source_head
+            .as_deref()
+            .map(|s| s.parse::<Oid>())
+            .transpose()
+            .map_err(|_| "PR source_head invalid".to_string())?
+            .ok_or_else(|| "PR has no source_head".to_string())?;
+        let auth_base = state
+            .base_head
+            .as_deref()
+            .map(|s| s.parse::<Oid>())
+            .transpose()
+            .map_err(|_| "PR base_head invalid".to_string())?
+            .ok_or_else(|| "PR has no base_head".to_string())?;
+        if source_oid != auth_source || base_oid != auth_base {
+            return Err(format!(
+                "PR #{id} snapshot refs were retargeted (source {source_oid} != {auth_source} \
+                 or base {base_oid} != {auth_base}); recreate the PR"
+            ));
+        }
+        Ok(())
     }
 
     /// True iff the WHOLE chain folded at `tip` is anchored to PR `id` (F-008):
@@ -307,6 +375,29 @@ impl EventStore {
     /// approval + green CI Check. A missing `/meta` ref, a missing /
     /// replacement / duplicate `pr.created`, or a cross-entity / mixed chain all
     /// refuse.
+    /// Anchor scan shared by [`Self::pr_chain_anchored_to`] and
+    /// [`Self::read_pr_chain_anchored`]: every event must belong to entity
+    /// `pr`/`entity_id` id, and exactly one `pr.created` must be present at the
+    /// authoritative `/meta` commit.
+    fn chain_scan_pr_anchored(&self, id: u64, meta_oid: Oid, pairs: &[(Oid, Event)]) -> bool {
+        if pairs.is_empty() {
+            return false;
+        }
+        let mut created = 0usize;
+        for (oid, ev) in pairs {
+            if ev.entity != "pr" || ev.entity_id != id {
+                return false;
+            }
+            if ev.kind == EventKind::PrCreated {
+                if *oid != meta_oid {
+                    return false;
+                }
+                created += 1;
+            }
+        }
+        created == 1
+    }
+
     pub(crate) fn pr_chain_anchored_to(&self, id: u64, tip: Oid) -> bool {
         // The authoritative creation commit: `/meta` is pinned at PR allocation
         // to the exact `pr.created` snapshot commit and never moves (F-006,
@@ -320,28 +411,30 @@ impl EventStore {
         let Ok(chain) = self.chain_from_tip(tip) else {
             return false;
         };
-        if chain.is_empty() {
-            return false;
-        }
-        // Every event-bearing commit must belong to entity `pr` / `entity_id`
-        // id, exactly one `pr.created` must be present, and it must be AT the
-        // authoritative `/meta` commit. Because `/meta`'s parent is the genesis
-        // root (no event payload), the anchored `pr.created` is necessarily the
-        // first event-bearing commit in the chain — the invariant a forged
-        // same-id chain cannot reproduce without the real creation commit.
-        let mut created = 0usize;
-        for (oid, ev) in &chain {
-            if ev.entity != "pr" || ev.entity_id != id {
-                return false;
-            }
-            if ev.kind == EventKind::PrCreated {
-                if *oid != meta_oid {
-                    return false;
-                }
-                created += 1;
-            }
-        }
-        created == 1
+        self.chain_scan_pr_anchored(id, meta_oid, &chain)
+    }
+
+    /// Read the chain at `tip` AND validate it is anchored to PR `id` in a
+    /// SINGLE chain walk (F-008): the merge gate folds the returned events
+    /// directly instead of re-walking the chain a second time. Returns
+    /// `(true, events)` when anchored, `(false, Vec::new())` otherwise.
+    pub(crate) fn read_pr_chain_anchored(
+        &self,
+        id: u64,
+        tip: Oid,
+    ) -> Result<(bool, Vec<Event>), StoreError> {
+        // Propagate a REAL git error (corrupt object, I/O) so the merge gate
+        // surfaces it as a git failure, not as a misleading "not anchored to
+        // PR #id" — only a genuinely-absent `/meta` (Ok(None)) is "not
+        // anchored".
+        let meta = self.current_tip(&pr_meta_ref(id))?;
+        let Some(meta_oid) = meta else {
+            return Ok((false, Vec::new()));
+        };
+        let pairs = self.chain_from_tip(tip)?;
+        let anchored = self.chain_scan_pr_anchored(id, meta_oid, &pairs);
+        let events = pairs.into_iter().map(|(_, ev)| ev).collect();
+        Ok((anchored, events))
     }
 
     /// True when `tip` is a valid first-parent extension of `ancestor` on PR
@@ -457,10 +550,17 @@ impl BoundEventStore {
     pub fn read_chain(&self, entity_ref: &str) -> Result<Vec<Event>, StoreError> {
         self.inner.read_chain(entity_ref)
     }
-
-    /// Read a chain from a known tip OID (delegation to the read surface).
-    pub fn read_chain_at(&self, tip: Oid) -> Result<Vec<Event>, StoreError> {
-        self.inner.read_chain_at(tip)
+    /// Validate that the `/source` and `/base` snapshot refs still point at the
+    /// AUTHORITATIVE `pr.created` snapshot (F-008; delegation to the inner
+    /// store, the single owner).
+    pub(crate) fn validate_pr_snapshot_refs(
+        &self,
+        id: u64,
+        source_oid: Oid,
+        base_oid: Oid,
+    ) -> Result<(), String> {
+        self.inner
+            .validate_pr_snapshot_refs(id, source_oid, base_oid)
     }
 
     /// Read the counter next value (delegation to the read surface).

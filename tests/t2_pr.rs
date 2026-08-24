@@ -1965,6 +1965,197 @@ fn ci_run_extreme_timeout_does_not_panic() {
 /// written; if `Command::output()` unbounded capture is restored, the marker is
 /// written and this test fails — deterministically, without needing an OOM.
 #[test]
+fn ci_run_ignores_caller_bash_env() {
+    let dir = tmpdir("ci-bash-env");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    std::fs::write(dir.join(".forge").join("ci.sh"), "#!/bin/bash\nexit 1\n").unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "feature + failing ci plan"]);
+    git(&dir, &["checkout", "-q", "main"]);
+
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+
+    // F-027 (review): a caller-supplied `BASH_ENV` sourcing `exit 0` must not
+    // turn a failing snapshot plan green — the interpreter is invoked with the
+    // worktree cwd and a tightened env, so the plan's own content decides.
+    let se = dir.join("bash-env.sh");
+    std::fs::write(&se, "exit 0\n").unwrap();
+    let (c, o, e) = forge_with_env(
+        &dir,
+        &["forge", "ci", "run", "1"],
+        &[("BASH_ENV", se.to_str().unwrap())],
+    );
+    assert_ne!(
+        c, 0,
+        "failing plan must not be turned green by BASH_ENV: {o} {e}"
+    );
+
+    let event = head_event(&dir, 1);
+    assert!(event.contains("\"status\":\"failed\""), "status: {event}");
+    assert_no_ci_worktree(&dir);
+}
+
+/// F-027 (review, red-on-old): a caller selective `HOME` whose `.gitconfig`
+/// defines an alias must not let a snapshot plan's `git` command be turned
+/// green. The plan interpreter pins GIT_CONFIG_GLOBAL/SYSTEM to /dev/null, so
+/// the alias (e.g. `[alias] ci-verdict = !true`) is not resolved and the plan
+/// fails — the OLD code env-REMOVED the override, restoring `$HOME` lookup.
+#[test]
+fn ci_run_pins_git_config_ignores_home_alias() {
+    let dir = tmpdir("ci-gitconfig-pin");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    std::fs::write(
+        dir.join(".forge").join("ci.sh"),
+        "#!/bin/bash\ngit ci-verdict\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(
+        &dir,
+        &["commit", "-q", "-m", "feature + alias-aware ci plan"],
+    );
+    git(&dir, &["checkout", "-q", "main"]);
+
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+
+    let hostile_home = tmpdir("ci-gitconfig-home");
+    std::fs::create_dir_all(&hostile_home).unwrap();
+    std::fs::write(
+        hostile_home.join(".gitconfig"),
+        "[alias]\n    ci-verdict = !true\n",
+    )
+    .unwrap();
+    let (c, o, e) = forge_with_env(
+        &dir,
+        &["forge", "ci", "run", "1"],
+        &[("HOME", hostile_home.to_str().unwrap())],
+    );
+    assert_ne!(
+        c, 0,
+        "a $HOME .gitconfig alias must not green a failing plan: {o} {e}"
+    );
+    let event = head_event(&dir, 1);
+    assert!(event.contains("\"status\":\"failed\""), "status: {event}");
+    assert_no_ci_worktree(&dir);
+}
+
+/// F-008 (review): a retargeted `/source` snapshot ref must be refused by ALL
+/// consumers before side effects — `ci run` creates no worktree/Check and
+/// `pr diff` refuses, so a different patch than the one reviewed can never be
+/// CI-gated or displayed.
+#[test]
+fn ci_run_refuses_retargeted_source() {
+    let dir = tmpdir("ci-retarget-source");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    std::fs::write(dir.join(".forge").join("ci.sh"), "#!/bin/bash\nexit 0\n").unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "feature + passing ci plan"]);
+    git(&dir, &["checkout", "-q", "main"]);
+
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+
+    // Retarget `/source` to the base (`main`) commit — a different OID than the
+    // authoritative `pr.created` snapshot.
+    let main_oid = git(&dir, &["rev-parse", "main"]).1;
+    let (c, _, e) = git(
+        &dir,
+        &["update-ref", "refs/forge/prs/1/source", main_oid.trim()],
+    );
+    assert_eq!(c, 0, "update-ref source failed: {e}");
+
+    let (c, o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_ne!(c, 0, "retargeted source must refuse ci run: {o} {e}");
+    assert!(
+        e.contains("retargeted"),
+        "ci run must report the retarget: {e}"
+    );
+    assert_no_ci_worktree(&dir);
+    assert!(
+        !head_event(&dir, 1).contains("\"status\":\"success\""),
+        "no success Check may be recorded after a retarget: {}",
+        head_event(&dir, 1)
+    );
+
+    // `pr diff` must also refuse, so a reviewer never sees a forged patch.
+    let (c2, o2, e2) = forge(&dir, &["forge", "pr", "diff", "1"]);
+    assert_ne!(c2, 0, "retargeted source must refuse pr diff: {o2} {e2}");
+    assert!(
+        e2.contains("retargeted"),
+        "pr diff must report the retarget: {e2}"
+    );
+}
+
+#[test]
+fn ci_run_rejects_trailing_arguments() {
+    let dir = tmpdir("ci-trailing-args");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    std::fs::write(dir.join(".forge").join("ci.sh"), "#!/bin/bash\nexit 0\n").unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "feature + passing ci plan"]);
+    git(&dir, &["checkout", "-q", "main"]);
+
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+
+    // Before this guard the single-argument grammar silently ignored trailing
+    // tokens (`ci run 1 2` would run CI on PR 1); it must now be a usage error.
+    let (c, o, e) = forge(&dir, &["forge", "ci", "run", "1", "extra"]);
+    assert_ne!(c, 0, "trailing argument must be refused: {o} {e}");
+    assert!(
+        e.contains("expected exactly 1"),
+        "usage error expected: {e}"
+    );
+    assert!(
+        !head_event(&dir, 1).contains("\"status\":\"success\""),
+        "no success Check may be recorded: {}",
+        head_event(&dir, 1)
+    );
+}
+
+#[test]
 fn ci_run_detects_unbounded_output_capture() {
     let dir = tmpdir("ci-capture");
     init_repo(&dir);
@@ -2161,12 +2352,12 @@ fn make_passing_ci_pr(dir: &PathBuf) {
     assert_eq!(c, 0, "pr create failed: {e} {o}");
 }
 
-/// F-003 regression: a zero exit from `git worktree remove --force` must NOT
-/// be taken as proof of cleanup when the directory survives (deterministic
-/// no-op-removal). `ci run` must fail and report the leftover, never print
-/// `passed`.
+/// F-003 regression: the CI lifecycle uses a TRUSTED absolute `git` (F-027), so
+/// a caller `PATH` git shim cannot fake the `worktree remove --force` (e.g. a
+/// no-op shim that exits 0 but leaves the directory). The shim is neutralized;
+/// `ci run` proceeds normally and reports no false leftover.
 #[test]
-fn ci_run_reports_leftover_when_worktree_remove_is_noop() {
+fn ci_run_ignores_path_git_shim_for_cleanup() {
     let dir = tmpdir("ci-noremove");
     make_passing_ci_pr(&dir);
     let shim = make_git_shim(
@@ -2176,20 +2367,11 @@ fn ci_run_reports_leftover_when_worktree_remove_is_noop() {
          fi",
     );
     let (c, o, e) = run_forge(&dir, Some(&shim), &[], &["forge", "ci", "run", "1"]);
-    assert_ne!(
+    assert_eq!(
         c, 0,
-        "leftover worktree must fail ci run (got stdout {o:?})"
+        "trusted git must ignore the PATH shim and clean up correctly: {e} {o}"
     );
-    assert!(
-        e.contains("temp worktree directory still exists"),
-        "stderr must report the leftover directory: {e}"
-    );
-    assert!(
-        e.contains("worktree left at"),
-        "stderr must name the path: {e}"
-    );
-    assert!(!o.contains("passed"), "must not claim success: {o}");
-    remove_leftover_ci_worktree(&dir);
+    assert!(o.contains("passed"), "ci run output: {o}");
     assert_no_ci_worktree(&dir);
 }
 
@@ -2205,10 +2387,6 @@ fn ci_run_append_failure_reports_removal_failure() {
         "if [ \"$1\" = \"--git-dir\" ] && [ \"$3\" = \"update-ref\" ]; then\n\
          \x20 echo \"fatal: append disabled by test shim\" >&2\n\
          \x20 exit 1\n\
-         fi\n\
-         if [ \"$1\" = \"-C\" ] && [ \"$3\" = \"worktree\" ] && [ \"$4\" = \"remove\" ]; then\n\
-         \x20 echo \"fatal: worktree remove disabled by test shim\" >&2\n\
-         \x20 exit 1\n\
          fi",
     );
     let (c, _o, e) = run_forge(&dir, Some(&shim), &[], &["forge", "ci", "run", "1"]);
@@ -2217,15 +2395,8 @@ fn ci_run_append_failure_reports_removal_failure() {
         e.contains("recording the CI Check failed"),
         "append error must be reported: {e}"
     );
-    assert!(
-        e.contains("temp worktree removal failed"),
-        "removal failure must NOT be discarded: {e}"
-    );
-    assert!(
-        e.contains("worktree left at"),
-        "removal failure must name the leftover path: {e}"
-    );
-    remove_leftover_ci_worktree(&dir);
+    // The CI worktree is removed by the TRUSTED git cleanup even though the
+    // Check append failed (F-025) — no leftover remains to clean.
     assert_no_ci_worktree(&dir);
 }
 

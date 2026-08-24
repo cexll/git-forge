@@ -654,7 +654,6 @@ fn cmd_pr_review(args: &[String]) -> Result<String, String> {
 
 /// `git forge pr diff <n>` — three-dot diff from the immutable snapshot refs.
 fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String, String> {
-    use std::process::Command;
     let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
     let head = crate::store::pr_head_ref(id);
     if !store_has_ref(store, &head) {
@@ -673,16 +672,43 @@ fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String, String> {
         .find_reference(&base)
         .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
         .map_err(|_| format!("PR #{id} snapshot base ref missing"))?;
-    let out = Command::new("git")
-        .arg("-C")
-        .arg(store.repo().path())
-        .args(["diff", &format!("{base_oid}...{source_oid}")])
-        .output()
-        .map_err(|e| format!("git diff failed: {e}"))?;
-    if !out.status.success() {
-        return Err("git diff failed".into());
+    // F-008: a retargeted `/source`/`/base` would let `pr diff` display a
+    // different patch than the one a reviewer approves (shared invariant, one
+    // owner in the store).
+    store.validate_pr_snapshot_refs(id, source_oid, base_oid)?;
+    // F-027 (review): the `git diff` shell-out must run through the SANITIZED
+    // git adapter — a caller `GIT_EXTERNAL_DIFF`/`GIT_DIR`/`GIT_CONFIG` would
+    // otherwise render an arbitrary/redirected patch (or run an external-diff
+    // program), so a reviewer could approve a different display than the
+    // validated snapshot.
+    // `--no-ext-diff`/`--no-textconv` also disable a REPO-LOCAL `diff.external`
+    // or an attribute `textconv` driver, which `git_in_ci` intentionally retains
+    // (the repo's own config) and which would otherwise execute arbitrary code
+    // during `pr diff`. The repo is passed as its WORKTREE root (not the `.git`
+    // path) so `-c safe.directory=<root>` matches the path Git's ownership check
+    // actually validates for a non-bare repository.
+    let repo_dir = store
+        .repo()
+        .workdir()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| store.repo().path().to_path_buf());
+    let (ok, out, err) = crate::git::git_in_ci(
+        &repo_dir,
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            &format!("{base_oid}...{source_oid}"),
+        ],
+    );
+    if !ok {
+        return Err(if err.is_empty() {
+            "git diff failed".to_string()
+        } else {
+            err
+        });
     }
-    Ok(String::from_utf8_lossy(&out.stdout).trim_end().to_string())
+    Ok(out)
 }
 
 /// Dispatch a `git forge pr` subcommand. `argv` excludes the `pr` token.
@@ -725,6 +751,12 @@ fn pr_help() -> String {
 /// `.forge/ci.sh` that is a symlink or otherwise not a regular file is refused
 /// up front (F-001), so the plan always comes from immutable PR content.
 fn cmd_ci_run(args: &[String]) -> Result<String, String> {
+    if args.len() != 1 {
+        return Err(format!(
+            "usage: git forge ci run <pr> (got {} argument(s), expected exactly 1)",
+            args.len()
+        ));
+    }
     let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
     let (store, actor) = open_mutation_store()?;
     let head = crate::store::pr_head_ref(id);
@@ -738,6 +770,14 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
         .find_reference(&crate::store::pr_source_ref(id))
         .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
         .map_err(|_| format!("PR #{id} snapshot source ref missing"))?;
+    let base_oid = store
+        .repo()
+        .find_reference(&crate::store::pr_base_ref(id))
+        .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
+        .map_err(|_| format!("PR #{id} snapshot base ref missing"))?;
+    // F-008: the `/source` ref must still point at the AUTHORITATIVE
+    // `pr.created` snapshot (shared invariant, one owner in the store).
+    store.validate_pr_snapshot_refs(id, source_oid, base_oid)?;
     let repo_dir = store
         .repo()
         .workdir()
@@ -819,16 +859,16 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
     // sibling lock until the worktree is removed AND verified gone (directory
     // absent + path unregistered), mirroring the merge-path postconditions
     // (F-002/F-003): a leftover is reported, never silently discarded.
-    let leftover = crate::git::worktree_remove(&repo_dir, &tmp)
+    let leftover = crate::git::worktree_remove_ci(&repo_dir, &tmp)
         .err()
         .map(|e| format!("temp worktree removal failed: {e}"))
         .or_else(|| {
-            let (ok, list, err_l) = crate::git::worktree_list_raw(&repo_dir);
+            let (ok, list, err_l) = crate::git::worktree_list_raw_ci(&repo_dir);
             if tmp.exists() {
                 Some("temp worktree directory still exists".to_string())
             } else if !ok {
                 Some(format!("worktree verification failed: {err_l}"))
-            } else if crate::event::worktree_registered_path(&list, &tmp) {
+            } else if crate::git::worktree_registered_path(&list, &tmp) {
                 Some("temp worktree still registered".to_string())
             } else {
                 None
@@ -839,9 +879,11 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
 
     // F-025: do NOT publish a green Check until cleanup verified succeeded — a
     // passing plan that locks its worktree (so removal fails) must leave a
-    // failed/non-green latest Check, otherwise the merge gate would accept a
-    // green Check whose CI command actually failed integrity.
-    let status = if run.status == Some(0) && leftover.is_none() {
+    // failed/non-green latest Check. A run that exceeded its bounded deadline
+    // (`timed_out`) is ALSO never green, even if the child happened to exit 0
+    // right at the deadline (the group may have been killed / a descendant
+    // escaped), so the merge gate cannot accept it.
+    let status = if run.status == Some(0) && !run.timed_out && leftover.is_none() {
         "success"
     } else {
         "failed"
@@ -868,7 +910,7 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
     }
     append.map_err(|e| format!("CI run completed but recording the CI Check failed: {e}"))?;
 
-    if run.status == Some(0) {
+    if run.status == Some(0) && !run.timed_out {
         Ok(format!("CI run for PR #{id} passed ({})", plan.label))
     } else {
         let detail = if run.timed_out {

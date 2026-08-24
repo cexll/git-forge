@@ -9,7 +9,7 @@
 //! `cmd_pr_diff`'s `git diff` shell-out and the merge-gate predicate stay in
 //! `cli.rs` (orchestration layer).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 /// Result of running `git`: exit status (None = could not spawn), stdout,
 /// stderr, and — on spawn failure only — the raw io error so callers can
@@ -33,7 +33,26 @@ struct GitResult {
 /// `cli.rs`'s `cmd_pr_diff`.
 fn git_in_with_status(dir: &Path, args: &[&str]) -> GitResult {
     use std::process::Command;
-    let out = Command::new("git").arg("-C").arg(dir).args(args).output();
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(dir)
+        .args(args)
+        // A caller GIT-LOCATION override (e.g. `GIT_DIR` pointing at ANOTHER
+        // repo) must not redirect this `git -C <repo>` command — the repo is
+        // selected deliberately by `-C`. `GIT_CONFIG_*` is NOT removed: a
+        // legitimate `GIT_CONFIG_GLOBAL`/`GIT_CONFIG_COUNT` supplies identity
+        // that `git commit`/`merge` need, and removing it would break a normal
+        // merge for a user whose only identity comes from that env.
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_NAMESPACE")
+        .env_remove("GIT_EXTERNAL_DIFF")
+        .env_remove("GIT_EXTERNAL_DIFF_TRUST_EXIT_CODE");
+    let out = cmd.output();
     match out {
         Ok(o) => GitResult {
             status: o.status.code(),
@@ -55,6 +74,132 @@ fn git_in_with_status(dir: &Path, args: &[&str]) -> GitResult {
 fn git_in(dir: &Path, args: &[&str]) -> (bool, String, String) {
     let r = git_in_with_status(dir, args);
     (r.status == Some(0), r.stdout, r.stderr)
+}
+
+/// Resolve the `git` binary to a TRUSTED ABSOLUTE path (F-027). A caller
+/// `PATH` shim must not be able to fake a CI worktree add/remove/list (and
+/// thereby populate or hide altered files the plan then greens). The candidate
+/// must actually EXECUTE (`git --version` succeeds) so a merely-present stub
+/// is skipped; operator/common installs are preferred over the system
+/// fallback, so a Homebrew git that created the repository is chosen over an
+/// incompatible Apple `/usr/bin/git` when both exist. An install not found is
+/// an honest error (the CI run records a failure), never a caller-resolved
+/// binary. NON-STANDARD-INSTALL RESIDUAL: a git only at a path outside these
+/// locations (a custom `/nix/store`, in-repo build, or `/usr/local/opt/git/bin`)
+/// is not discovered; a future configuration seam can bind a validated path.
+fn resolve_git() -> Result<PathBuf, String> {
+    for p in [
+        "/opt/homebrew/bin/git",
+        "/usr/local/bin/git",
+        "/usr/bin/git",
+        "/bin/git",
+    ] {
+        let p = PathBuf::from(p);
+        if p.is_file()
+            && std::process::Command::new(&p)
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        {
+            return Ok(p);
+        }
+    }
+    Err("failed to resolve a runnable trusted git binary".to_string())
+}
+
+/// CI-specific `git` runner (F-027): the CI worktree lifecycle operates on an
+/// IMMUTABLE snapshot under the repo's OWN config. It resolves `git` to a
+/// trusted absolute path and strips every caller Git env override — location
+/// (`GIT_DIR`/`GIT_WORK_TREE`/…), config (`GIT_CONFIG_GLOBAL`/`SYSTEM`/
+/// `COUNT`/`PARAMETERS`), and diff (`GIT_EXTERNAL_DIFF`) — so a caller cannot
+/// inject a smudge/attribute config that rewrites non-plan source files (which
+/// the plan then greens) or a `git` shim that fakes the lifecycle. The shared
+/// [`git_in`] KEEPS `GIT_CONFIG_*` because normal merge/rebase need the
+/// operator's identity config.
+/// Convert a worktree path into a git CLI `&str`, failing CLOSED on non-UTF-8
+/// (a sentinel like `/tmp/none` could make `git worktree remove --force` target
+/// an UNRELATED worktree). A non-UTF-8 temp path is refused before any git
+/// command, never silently redirected.
+fn path_to_str(path: &Path) -> Result<&str, String> {
+    path.to_str()
+        .ok_or_else(|| format!("worktree path is not valid UTF-8: {}", path.display()))
+}
+
+pub(crate) fn git_in_ci(dir: &Path, args: &[&str]) -> (bool, String, String) {
+    use std::process::Command;
+    let git = match resolve_git() {
+        Ok(g) => g,
+        Err(e) => return (false, String::new(), e),
+    };
+    let mut cmd = Command::new(&git);
+    cmd.arg("-C")
+        .arg(dir)
+        .arg("--no-replace-objects")
+        // Preserve a repo that was trusted via global/system safe.directory
+        // (forcing those scopes to /dev/null would otherwise make every CI git
+        // command abort with 'detected dubious ownership' on a shared/other-UID
+        // checkout). safe.directory is only honored in protected config, so set
+        // it command-scope for the selected repo — a global option that MUST
+        // precede the subcommand.
+        .arg("-c")
+        .arg({
+            // Build safe.directory=<repo> as native bytes (NOT `dir.display()`,
+            // which substitutes U+FFFD for non-UTF-8 path bytes and would name a
+            // PATH git's dubious-ownership check does not recognize).
+            let mut sc = std::ffi::OsString::from("safe.directory=");
+            sc.push(dir.as_os_str());
+            sc
+        })
+        // Global `core.attributesFile` is loaded independently of GIT_CONFIG_GLOBAL;
+        // a caller-selected global attributes file (> $XDG_CONFIG_HOME/git/attributes)
+        // can drive a repo-local smudge filter that rewrites tracked source bytes, so
+        // pin it to an empty trusted file while keeping snapshot-owned `.gitattributes`.
+        .arg("-c")
+        .arg("core.attributesFile=/dev/null")
+        .args(args)
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_OBJECT_DIRECTORY")
+        .env_remove("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+        .env_remove("GIT_COMMON_DIR")
+        .env_remove("GIT_NAMESPACE")
+        .env_remove("GIT_ATTR_SOURCE")
+        // Isolate global/system config: REMOVING the override variables would
+        // restore git's normal lookup of the caller's `$HOME/.gitconfig` /
+        // `$XDG_CONFIG_HOME/git/config`, which could carry a hostile smudge
+        // filter that rewrites non-plan source files during the CI checkout.
+        // Pointing them at /dev/null (an empty trusted file) makes the checkout
+        // run under the repo's OWN local config only.
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_SYSTEM", "/dev/null")
+        .env_remove("GIT_CONFIG")
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env_remove("GIT_REPLACE_REF_BASE")
+        .env_remove("GIT_EXEC_PATH")
+        // Also strip Git TOPOLOGY overrides (a caller GIT_SHALLOW_FILE /
+        // GIT_CEILING_DIRECTORIES would otherwise alter merge-base / three-dot
+        // diff output or force a misleading failure for `pr diff`).
+        .env_remove("GIT_SHALLOW_FILE")
+        .env_remove("GIT_CEILING_DIRECTORIES")
+        .env_remove("GIT_EXTERNAL_DIFF")
+        .env_remove("GIT_EXTERNAL_DIFF_TRUST_EXIT_CODE");
+    crate::ci::sanitize_loader_env(&mut cmd);
+    let out = cmd.output();
+    match out {
+        Ok(o) => (
+            o.status.success(),
+            String::from_utf8_lossy(&o.stdout).trim().to_string(),
+            String::from_utf8_lossy(&o.stderr).trim().to_string(),
+        ),
+        Err(e) => (
+            false,
+            String::new(),
+            format!("failed to spawn trusted git: {e}"),
+        ),
+    }
 }
 
 /// True if `git rebase` is mid-flight in the worktree (either rebase-merge or
@@ -98,7 +243,7 @@ pub(crate) fn worktree_add(
             "worktree",
             "add",
             "--detach",
-            path.to_str().unwrap_or("/tmp/none"),
+            path_to_str(path)?,
             &detach_oid.to_string(),
         ],
     );
@@ -114,12 +259,19 @@ pub(crate) fn worktree_add(
 /// supply must not run during the CI checkout and hang `ci run` or accumulate
 /// output before its deadline. `core.hooksPath=/dev/null` redirects hook lookup
 /// to a path that is never a directory, so git finds no hooks.
+///
+/// KNOWN LIMITATION: the checkout still runs any configured smudge/attribute
+/// filters for matching paths, and this `git worktree add` subprocess runs
+/// before the CI deadline of [`crate::ci::run_ci_plan`] — a filter that hangs
+/// (or writes unbounded stderr) can stall the add outside any deadline.
+/// Fully bounding it requires OS-level isolation or a no-filter materializer
+/// (out of scope for this single-user local tool).
 pub(crate) fn worktree_add_ci(
     repo_dir: &Path,
     path: &Path,
     detach_oid: &git2::Oid,
 ) -> Result<(), String> {
-    let (ok, _, err) = git_in(
+    let (ok, _, err) = git_in_ci(
         repo_dir,
         &[
             "-c",
@@ -127,7 +279,7 @@ pub(crate) fn worktree_add_ci(
             "worktree",
             "add",
             "--detach",
-            path.to_str().unwrap_or("/tmp/none"),
+            path_to_str(path)?,
             &detach_oid.to_string(),
         ],
     );
@@ -144,12 +296,7 @@ pub(crate) fn worktree_add_ci(
 pub(crate) fn worktree_remove(repo_dir: &Path, path: &Path) -> Result<(), String> {
     let (ok, _, err) = git_in(
         repo_dir,
-        &[
-            "worktree",
-            "remove",
-            "--force",
-            path.to_str().unwrap_or("/tmp/none"),
-        ],
+        &["worktree", "remove", "--force", path_to_str(path)?],
     );
     if ok {
         Ok(())
@@ -166,6 +313,76 @@ pub(crate) fn worktree_remove(repo_dir: &Path, path: &Path) -> Result<(), String
 /// from the repository, never from a worktree's parent.
 pub(crate) fn worktree_list_raw(repo_dir: &Path) -> (bool, String, String) {
     git_in(repo_dir, &["worktree", "list", "--porcelain"])
+}
+
+/// CI-specific remove (trusted git + sanitized env): used only by `cmd_ci_run`
+/// so a caller `PATH` git shim cannot fake a verified cleanup (the merge path
+/// keeps [`Self::worktree_remove`] on `git_in`, whose identity config is needed
+/// for merge commits but whose PATH-shimmed failure branches are exercised by
+/// integration tests).
+pub(crate) fn worktree_remove_ci(repo_dir: &Path, path: &Path) -> Result<(), String> {
+    let (ok, _, err) = git_in_ci(
+        repo_dir,
+        &["worktree", "remove", "--force", path_to_str(path)?],
+    );
+    if ok {
+        Ok(())
+    } else {
+        Err(err)
+    }
+}
+
+/// CI-specific `git worktree list --porcelain` (trusted git + sanitized env).
+pub(crate) fn worktree_list_raw_ci(repo_dir: &Path) -> (bool, String, String) {
+    git_in_ci(repo_dir, &["worktree", "list", "--porcelain"])
+}
+
+/// Normalize `p` to a canonical absolute form for worktree-path comparison.
+/// When `p` exists the whole path is symlink-resolved; when it does not (a
+/// worktree whose directory was just removed) the nearest existing ancestor is
+/// resolved and the remaining components re-appended, so a stale registration
+/// still compares equal. This makes the raw macOS `temp_dir()` spelling
+/// `/var/...` compare equal to git's real `/private/var/...` path (F-005).
+/// Relative paths (no existing ancestor) fall back to the raw form.
+fn canonicalize_for_compare(p: &Path) -> PathBuf {
+    let mut existing = p.to_path_buf();
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    loop {
+        if let Ok(canon) = std::fs::canonicalize(&existing) {
+            let mut canon = canon;
+            for comp in tail.iter().rev() {
+                canon.push(comp);
+            }
+            return canon;
+        }
+        match existing.file_name() {
+            Some(name) => {
+                tail.push(name.to_os_string());
+                match existing.parent() {
+                    Some(parent) => existing = parent.to_path_buf(),
+                    None => return p.to_path_buf(),
+                }
+            }
+            None => return p.to_path_buf(),
+        }
+    }
+}
+
+/// True if `git worktree list --porcelain` output (`porcelain`) registers a
+/// worktree whose path EQUALS `target` after canonicalization, never by
+/// substring. A distinct registered worktree that merely shares the target's
+/// prefix (e.g. `<target>-other`) is not mistaken for the owned path (F-004).
+/// Both sides are symlink-resolved (walking up to the nearest existing
+/// ancestor when the directory was removed), so the macOS `/var` vs
+/// `/private/var` spelling difference cannot hide a stale registration
+/// (F-005). Lives in the git adapter (not the core event model) because it
+/// performs filesystem canonicalization.
+pub(crate) fn worktree_registered_path(porcelain: &str, target: &Path) -> bool {
+    let target_canonical = canonicalize_for_compare(target);
+    porcelain
+        .lines()
+        .filter_map(|l| l.strip_prefix("worktree "))
+        .any(|p| canonicalize_for_compare(Path::new(p)) == target_canonical)
 }
 
 /// List registered worktrees (`git worktree list --porcelain`), from the
@@ -190,10 +407,7 @@ pub(crate) fn worktree_list(repo_dir: &Path) -> Result<String, String> {
 /// builds and when the env var is unset. Err carries git's stderr.
 #[cfg(debug_assertions)]
 pub(crate) fn worktree_lock(repo_dir: &Path, path: &Path) -> Result<(), String> {
-    let (ok, _, err) = git_in(
-        repo_dir,
-        &["worktree", "lock", path.to_str().unwrap_or("/tmp/none")],
-    );
+    let (ok, _, err) = git_in(repo_dir, &["worktree", "lock", path_to_str(path)?]);
     if ok {
         Ok(())
     } else {
@@ -667,5 +881,72 @@ mod tests {
         write_config(&d, b"[user\nemail = broken");
         let e = config_get_identity(&d).unwrap_err();
         assert!(e.contains("repo config is unreadable"), "{e}");
+    }
+    /// F-004: `worktree_registered_path` compares each porcelain
+    /// `worktree <path>` record EXACTLY, so a registered sibling that shares
+    /// the owned path's prefix (e.g. `/tmp/owned-other` when `/tmp/owned` was
+    /// removed) is never mistaken for the owned path — the old substring
+    /// `contains` check false-matched here.
+    #[test]
+    fn worktree_registered_path_exact_not_substring() {
+        let porcelain = "worktree /repo\n\
+                         HEAD a\n\
+                         branch refs/heads/main\n\
+                         \n\
+                         worktree /repo/owned-other\n\
+                         HEAD b\n\
+                         detached\n";
+        assert!(!worktree_registered_path(
+            porcelain,
+            Path::new("/repo/owned")
+        ));
+        assert!(worktree_registered_path(
+            porcelain,
+            Path::new("/repo/owned-other")
+        ));
+        assert!(!worktree_registered_path(
+            porcelain,
+            Path::new("/repo/none")
+        ));
+
+        let with_owned = "worktree /repo\n\
+                          HEAD a\n\
+                          branch refs/heads/main\n\
+                          \n\
+                          worktree /repo/owned\n\
+                          HEAD c\n\
+                          detached\n";
+        assert!(worktree_registered_path(
+            with_owned,
+            Path::new("/repo/owned")
+        ));
+    }
+
+    /// F-005: `worktree_registered_path` canonicalizes both sides before
+    /// comparing, so a macOS `temp_dir()` spelling (`/var/...`) still matches
+    /// the real registered path — even after the directory was deleted and
+    /// only the nearest existing ancestor can be resolved.
+    #[test]
+    fn worktree_registered_path_canonicalizes_macos_temp_dir() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("gf-wt-canonical-{}-{}", std::process::id(), nonce));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = std::fs::canonicalize(&dir).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let porcelain = format!(
+            "worktree {}\nHEAD a\nbranch refs/heads/main\n\ndetached\n",
+            real.display()
+        );
+        assert!(
+            worktree_registered_path(&porcelain, &dir),
+            "raw temp_dir() spelling must match the real registered path after removal"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

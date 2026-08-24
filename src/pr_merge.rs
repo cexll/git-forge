@@ -83,6 +83,12 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
         .find_reference(&crate::store::pr_base_ref(id))
         .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
         .map_err(|_| format!("PR #{id} snapshot base ref missing"))?;
+    // The immutable-snapshot refs must still point at the AUTHORITATIVE
+    // `pr.created` snapshot. The comparison uses the ALREADY-ANCHORED gate
+    // state (F-008), NOT a fresh `/head` read — a concurrent rewrite between
+    // the gate read and the finalize cannot substitute a forged snapshot
+    // (shared invariant, one owner in the store).
+    crate::store::EventStore::validate_snapshot_against_state(id, &state, source_oid, base_oid)?;
     let merge_base = state
         .merge_base
         .as_deref()
@@ -293,7 +299,7 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
                 "merge succeeded but worktree verification failed (git worktree list: {err_l}){pending}"
             ));
         }
-        (true, list_l, _) if list_l.contains(&tmp.to_string_lossy().to_string()) => {
+        (true, list_l, _) if crate::git::worktree_registered_path(&list_l, &tmp) => {
             // Best-effort: remove the pending result ref; the stale registration
             // is reported but the result commit is not left dangling.
             let pending = cleanup_pending_result(&store, id, result_commit, &mut lock_handle, &tmp);
@@ -327,6 +333,7 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
     // a retry after a legitimate green append never publishes a freshly
     // generated event identity.
     let mut merge_body = HashMap::new();
+    merge_body.insert("strategy".into(), JsonValue::String(strategy.to_string()));
     merge_body.insert(
         "result_commit".into(),
         JsonValue::String(result_commit.to_string()),
@@ -491,13 +498,18 @@ fn validate_merge_gate_at(
     // overwrites `pr.id` for every PR event, so a mixed/foreign chain carrying
     // the target id on a later event could pass the anchor while retaining a
     // foreign snapshot, approval, and CI state.
-    if !store.pr_chain_anchored_to(id, tip) {
+    // Single chain walk (F-008): read the chain at `tip` and validate it is
+    // anchored to PR `id` in one pass, so the fold below reuses the same
+    // events instead of re-walking the whole chain a second time.
+    let (anchored, chain) = store
+        .read_pr_chain_anchored(id, tip)
+        .map_err(|e| e.to_string())?;
+    if !anchored {
         return Err(format!(
             "refs/forge/prs/{id}/head points at a tip whose chain is not anchored \
              to PR #{id}"
         ));
     }
-    let chain = store.read_chain_at(tip).map_err(|e| e.to_string())?;
     let state = crate::event::fold(&chain).pr;
     // Belt-and-suspenders: now that `pr_chain_anchored_to` guarantees identity,
     // this is only a cross-check against a malformed fold.

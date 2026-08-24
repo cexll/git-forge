@@ -125,6 +125,13 @@ ck "issue comment on missing" nonzero git forge issue comment 99 x
 # ── FR-002 / AC-002 / AC-002a..e / AC-002i / VAL-021/028: PR create guards ──
 git checkout -B feat/dogfood "$BASE_BRANCH"
 printf '\n# dogfood change\n' >> PLAN.md
+# Refuse to create the plan through a tracked `.forge`/`.forge/ci.sh` symlink:
+# a source repo that tracks either as a symlink would make this write follow
+# the link and mutate a path outside the disposable clone `$T/dogfood`.
+if [ -L .forge ] || [ -L .forge/ci.sh ]; then
+  echo "gf-dogfood: refusing to write .forge/ci.sh: .forge or .forge/ci.sh is a symlink (tracked escape)" >&2
+  exit 1
+fi
 mkdir -p .forge && printf '#!/bin/sh\necho ok\n' > .forge/ci.sh   # green CI plan (t3)
 git add PLAN.md .forge/ci.sh && git commit -qm "feat(dogfood): test change"
 git checkout -q "$BASE_BRANCH"
