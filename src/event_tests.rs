@@ -456,3 +456,70 @@ fn ci_check_event_uses_run_time_timestamp_not_epoch() {
     let state = fold(std::slice::from_ref(&ev));
     assert_eq!(state.pr.ci_ts.as_deref(), Some(ev.ts.as_str()));
 }
+
+#[test]
+fn parse_rfc3339_utc_rejects_malformed_and_out_of_range() {
+    // event_tests.rs:355 (wrong length/shape), :361 (non-digit field), and
+    // :374 (out-of-range calendar values) — the independent round-trip oracle
+    // must reject malformed input, never fabricate a date.
+    assert_eq!(parse_rfc3339_utc("2026-01-01"), None, "wrong length");
+    assert_eq!(
+        parse_rfc3339_utc("2026-01-01T00:00"),
+        None,
+        "truncated time"
+    );
+    assert_eq!(
+        parse_rfc3339_utc("2026-0a-01T00:00:00Z"),
+        None,
+        "non-digit month"
+    );
+    assert_eq!(
+        parse_rfc3339_utc("2026-01-0xT00:00:00Z"),
+        None,
+        "non-digit day"
+    );
+    assert_eq!(
+        parse_rfc3339_utc("2026-13-01T00:00:00Z"),
+        None,
+        "month out of range"
+    );
+    assert_eq!(
+        parse_rfc3339_utc("2026-01-32T00:00:00Z"),
+        None,
+        "day out of range"
+    );
+    assert_eq!(
+        parse_rfc3339_utc("2026-01-01T24:00:00Z"),
+        None,
+        "hour out of range"
+    );
+    assert_eq!(
+        parse_rfc3339_utc("2026-01-01T00:60:00Z"),
+        None,
+        "minute out of range"
+    );
+    assert_eq!(
+        parse_rfc3339_utc("2026-01-01T00:00:61Z"),
+        None,
+        "second out of range"
+    );
+}
+
+#[test]
+fn json_parser_rejects_high_surrogate_followed_by_non_unicode_escape() {
+    // event.rs:685 — a high surrogate escape followed by a backslash that does
+    // NOT start a `\u` escape (e.g. `\n`) cannot form a surrogate pair and is
+    // rejected, never silently mis-decoded.
+    assert_eq!(parse_json_value(r#""\uD83D\n""#), None);
+    assert_eq!(parse_json_value(r#""\uD83D\t""#), None);
+    assert_eq!(parse_json_value(r#""\uD83D\""#), None);
+}
+
+#[test]
+fn json_parser_rejects_truncated_surrogate_hex_escape() {
+    // event.rs:726 — a `\u` escape whose 4 hex digits run past the end of the
+    // input is rejected, never partially decoded.
+    assert_eq!(parse_json_value(r#""\uD83D\u12""#), None);
+    assert_eq!(parse_json_value(r#""\uD83D\u""#), None);
+    assert_eq!(parse_json_value(r#""\u""#), None);
+}

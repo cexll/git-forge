@@ -2191,3 +2191,80 @@ fn merge_help_usage_and_strategies() {
     assert_eq!(c2, 0, "merge -h failed: {e2}");
     assert!(o2.contains("usage: git forge pr merge"), "-h: {o2}");
 }
+
+#[test]
+fn merge_refuses_when_head_ref_disappears_during_barrier() {
+    // pr_merge.rs:384-388 — if the PR head ref is DELETED while the merge is
+    // parked at the pre-finalize barrier, the completion transaction fails and
+    // the finalizer must refuse with refs unchanged and the pending result ref
+    // left in place (never a silent retry into a vanished ref).
+    let dir = tmpdir("barrier-vanish");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "vanish PR");
+    checkout(&dir, "feature");
+    let barrier = tmpdir("barrier-vanish-window");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let head_before = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let child: Child = Command::new(bin)
+        .args(["forge", "pr", "merge", "1"])
+        .current_dir(&dir)
+        .env("GIT_FORGE_TEST_MERGE_BARRIER", &barrier)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !barrier.join("ready").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "merge never reached the barrier window"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Delete the head ref while the merge is parked at the barrier.
+    let (cd, _, ed) = git(&dir, &["update-ref", "-d", "refs/forge/prs/1/head"]);
+    assert_eq!(cd, 0, "setup: delete pr head ref: {ed}");
+
+    let release_path = barrier.join("release");
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&release_path)
+            .expect("release sentinel must be created atomically");
+        let _ = f.write_all(b"go\n");
+    }
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "a vanished head ref must fail the merge: {stderr}"
+    );
+    assert!(
+        stderr.contains("final transaction failed"),
+        "stderr must name the finalization failure: {stderr}"
+    );
+    assert!(
+        stderr.contains("pending result ref refs/forge/prs/1/result left in place"),
+        "stderr must name the stranded pending ref: {stderr}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base ref must not advance"
+    );
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/head").is_none(),
+        "head ref must stay deleted"
+    );
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_some(),
+        "pending result ref must be left in place"
+    );
+    let _ = head_before;
+}

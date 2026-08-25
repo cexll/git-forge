@@ -800,3 +800,114 @@ fn git_pr_wrapper_dispatches_to_pr() {
         "git-pr wrapper must route to the PR surface, got: {stdout}"
     );
 }
+
+/// Run a raw git command in `dir`, returning (exit, stdout-trimmed).
+fn git_out(dir: &PathBuf, args: &[&str]) -> (i32, String) {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+    )
+}
+
+#[test]
+fn issue_list_tolerates_gap_and_eventless_ref() {
+    // cli.rs:159 (absent ref inside the counter bound -> continue) and
+    // cli.rs:163 (ref present but chain has no event blob -> continue). A GC'd
+    // or rewritten ref must never abort `issue list`; it is skipped.
+    let dir = tmpdir("listgap");
+    init_repo(&dir);
+    git_out(&dir, &["commit", "--allow-empty", "-q", "-m", "base"]);
+    assert_eq!(forge(&dir, &["forge", "issue", "new", "one"]).0, 0);
+    assert_eq!(forge(&dir, &["forge", "issue", "new", "two"]).0, 0);
+
+    // Gap: #2's ref disappears (as if GC'd) while the counter still bounds
+    // the scan at 3. `list` must skip it and still report #1.
+    let (cd, _) = git_out(&dir, &["update-ref", "-d", "refs/forge/issues/2"]);
+    assert_eq!(cd, 0, "setup: delete issue 2 ref");
+    let (c1, o1, e1) = forge(&dir, &["forge", "issue", "list"]);
+    assert_eq!(c1, 0, "list with a gap must succeed: {e1}");
+    assert!(o1.contains("one"), "gap list output: {o1}");
+    assert!(
+        !o1.contains("two"),
+        "deleted issue must not be listed: {o1}"
+    );
+
+    // Eventless: #2's ref points at a plain commit with no event blob.
+    let base = git_out(&dir, &["rev-parse", "HEAD"]).1;
+    let (cr, _) = git_out(&dir, &["update-ref", "refs/forge/issues/2", &base]);
+    assert_eq!(cr, 0, "setup: repoint issue 2 at a plain commit");
+    let (c2, o2, e2) = forge(&dir, &["forge", "issue", "list"]);
+    assert_eq!(c2, 0, "list with an eventless ref must succeed: {e2}");
+    assert!(o2.contains("one"), "eventless list output: {o2}");
+    assert!(
+        !o2.contains("two"),
+        "eventless issue must not be listed: {o2}"
+    );
+}
+
+#[test]
+fn issue_show_eventless_ref_is_clean_error() {
+    // cli.rs:189 — a ref that exists but carries no event blob is "has no
+    // events", not a libgit2 internals leak.
+    let dir = tmpdir("shownoevent");
+    init_repo(&dir);
+    git_out(&dir, &["commit", "--allow-empty", "-q", "-m", "base"]);
+    assert_eq!(forge(&dir, &["forge", "issue", "new", "T"]).0, 0);
+    let base = git_out(&dir, &["rev-parse", "HEAD"]).1;
+    let (cr, _) = git_out(&dir, &["update-ref", "refs/forge/issues/1", &base]);
+    assert_eq!(cr, 0, "setup: repoint issue 1 at a plain commit");
+    let (c, _o, e) = forge(&dir, &["forge", "issue", "show", "1"]);
+    assert_ne!(c, 0, "eventless show must fail");
+    assert!(e.contains("issue #1 has no events"), "show: {e}");
+    assert!(
+        !e.contains("class=Object") && !e.contains("could not find"),
+        "must not leak libgit2 internals: {e}"
+    );
+}
+
+#[test]
+fn pr_review_extra_positional_is_ignored_cleanly() {
+    // cli.rs:595 — a trailing positional that is not a flag is ignored by the
+    // review parser (the decision flag decides), never a panic.
+    let dir = tmpdir("revextra");
+    init_repo(&dir);
+    let (c, _o, e) = forge(
+        &dir,
+        &["forge", "pr", "review", "999", "--approve", "extra"],
+    );
+    assert_ne!(c, 0, "review on a nonexistent PR must still fail");
+    assert!(e.contains("PR #999 does not exist"), "review: {e}");
+}
+
+#[test]
+fn ci_dispatch_help_and_unknown_subcommand() {
+    // cli.rs:936 (bare `ci` -> help) and :937 (unknown ci subcommand).
+    let dir = tmpdir("cidisp");
+    init_repo(&dir);
+    let (ch, oh, _eh) = forge(&dir, &["forge", "ci"]);
+    assert_eq!(ch, 0, "bare ci must print help");
+    assert!(oh.contains("usage: git forge ci"), "ci help: {oh}");
+
+    let (cu, _ou, eu) = forge(&dir, &["forge", "ci", "bogus"]);
+    assert_ne!(cu, 0, "unknown ci subcommand must fail");
+    assert!(
+        eu.contains("unknown ci subcommand 'bogus'"),
+        "ci bogus: {eu}"
+    );
+}
+
+#[test]
+fn bare_forge_direct_form_prints_top_help() {
+    // main.rs:52 — `git-forge forge` with no subcommand prints the top-level
+    // usage and exits 0.
+    let dir = tmpdir("forgebare");
+    init_repo(&dir);
+    let (c, o, e) = forge(&dir, &["forge"]);
+    assert_eq!(c, 0, "bare forge must print help: {e}");
+    assert!(o.contains("usage: git forge"), "bare forge help: {o}");
+}

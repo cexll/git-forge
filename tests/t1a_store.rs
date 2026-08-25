@@ -807,3 +807,515 @@ fn val115_postopen_corrupt_write_does_not_segv() {
         String::from_utf8_lossy(&out.stderr)
     );
 }
+
+#[test]
+fn read_chain_on_absent_ref_is_empty() {
+    // store.rs:299 — read_chain on a ref that does not exist yields an empty
+    // chain (Ok), never an error: the "no events yet" state is normal.
+    let dir = tmpdir("chainabsent");
+    let store = bound(&dir);
+    let chain = store
+        .read_chain(&issue_ref(999))
+        .expect("absent ref must read as an empty chain");
+    assert!(chain.is_empty(), "absent ref chain must be empty");
+}
+
+#[test]
+fn read_chain_on_non_commit_ref_is_store_error() {
+    // store.rs:104-106 — a ref pointing at a NON-COMMIT object (here: a blob)
+    // surfaces as StoreError::Git via the From<GitError> conversion, never a
+    // panic and never a silent empty chain.
+    let dir = tmpdir("chainblob");
+    let store = bound(&dir);
+    let repo = store.repo();
+    let blob_oid = repo.blob(b"not a commit").expect("write a scratch blob");
+    repo.reference(&issue_ref(1), blob_oid, false, "corrupt")
+        .unwrap();
+    let res = store.read_chain(&issue_ref(1));
+    assert!(
+        matches!(res, Err(StoreError::Git(_))),
+        "a non-commit ref must be a StoreError::Git, got: {res:?}"
+    );
+}
+
+#[test]
+fn read_chain_rejects_event_json_that_is_not_a_blob() {
+    // store.rs:490-492 — a tree entry at `.forge/event.json` that is a
+    // SUBTREE (directory), not a blob, is an InvalidState, never a panic.
+    let dir = tmpdir("eventtree");
+    let store = bound(&dir);
+    let repo = store.repo();
+    let sig = test_signature();
+    // Build: root commit with a directory at .forge/event.json.
+    let mut root = repo.treebuilder(None).unwrap();
+    let mut forge_tb = repo.treebuilder(None).unwrap();
+    let event_tb = repo.treebuilder(None).unwrap();
+    let sub_tree_oid = event_tb.write().unwrap();
+    forge_tb
+        .insert("event.json", sub_tree_oid, 0o040000)
+        .unwrap();
+    let forge_oid = forge_tb.write().unwrap();
+    root.insert(".forge", forge_oid, 0o040000).unwrap();
+    let tree_oid = root.write().unwrap();
+    let tree = repo.find_tree(tree_oid).unwrap();
+    let base = repo.commit(None, &sig, &sig, "base", &tree, &[]).unwrap();
+    repo.reference(&issue_ref(1), base, false, "corrupt")
+        .unwrap();
+    let res = store.read_chain(&issue_ref(1));
+    assert!(
+        matches!(res, Err(StoreError::InvalidState(_))),
+        "a subtree at event.json must be InvalidState, got: {res:?}"
+    );
+}
+
+#[test]
+fn read_chain_rejects_non_utf8_event_json() {
+    // store.rs:484-485 — an event blob with invalid UTF-8 is an InvalidState,
+    // never a panic and never a silently-skipped event.
+    let dir = tmpdir("eventutf8");
+    let store = bound(&dir);
+    let repo = store.repo();
+    let sig = test_signature();
+    let bad = repo.blob(&[0xff, 0xfe, 0x00, 0x01]).unwrap();
+    let mut root = repo.treebuilder(None).unwrap();
+    let mut forge_tb = repo.treebuilder(None).unwrap();
+    forge_tb.insert("event.json", bad, 0o100644).unwrap();
+    let forge_oid = forge_tb.write().unwrap();
+    root.insert(".forge", forge_oid, 0o040000).unwrap();
+    let tree_oid = root.write().unwrap();
+    let tree = repo.find_tree(tree_oid).unwrap();
+    let base = repo.commit(None, &sig, &sig, "base", &tree, &[]).unwrap();
+    repo.reference(&issue_ref(1), base, false, "corrupt")
+        .unwrap();
+    let res = store.read_chain(&issue_ref(1));
+    assert!(
+        matches!(res, Err(StoreError::InvalidState(_))),
+        "a non-UTF8 event blob must be InvalidState, got: {res:?}"
+    );
+}
+
+#[test]
+fn allocate_id_refuses_when_entity_ref_preexists() {
+    // store.rs:737-740 — a pre-existing entity ref at the id the counter would
+    // allocate is the stale-collision case: RefExists, counter untouched.
+    let dir = tmpdir("allocexist");
+    let store = bound(&dir);
+    let repo = store.repo();
+    let sig = test_signature();
+    let tree_oid = repo.treebuilder(None).unwrap().write().unwrap();
+    let tree = repo.find_tree(tree_oid).unwrap();
+    let base = repo.commit(None, &sig, &sig, "base", &tree, &[]).unwrap();
+    repo.reference(&issue_ref(1), base, false, "pre").unwrap();
+    let res = store.allocate_id();
+    assert!(
+        matches!(res, Err(StoreError::RefExists(_))),
+        "a pre-existing entity ref must be RefExists, got: {res:?}"
+    );
+    assert!(
+        repo.find_reference(COUNTER_REF).is_err(),
+        "counter must be untouched by a refused allocation"
+    );
+}
+
+#[test]
+fn merge_squash_refuses_pr_created_with_empty_title() {
+    // git.rs:472-477 — the squash path refuses a PR whose stored title is
+    // empty (a direct-store PR bypasses the CLI's title validation): the
+    // worktree is cleaned and no merge ref advances.
+    let dir = tmpdir("emptytitle");
+    {
+        let store = bound(&dir);
+        let repo = store.repo();
+        let sig = test_signature();
+        let tree_oid = repo.treebuilder(None).unwrap().write().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let base = repo.commit(None, &sig, &sig, "base", &tree, &[]).unwrap();
+        // Feature carries its own justfile so the CI fallback has a plan in the
+        // PR snapshot (the justfile must predate create_pr to be snapshotted).
+        let mut feat_tb = repo.treebuilder(None).unwrap();
+        let just_blob = repo.blob(b"check:\n    echo ok\n").unwrap();
+        feat_tb.insert("justfile", just_blob, 0o100644).unwrap();
+        let feat_tree_oid = feat_tb.write().unwrap();
+        let feat_tree = repo.find_tree(feat_tree_oid).unwrap();
+        let head = repo
+            .commit(
+                None,
+                &sig,
+                &sig,
+                "head",
+                &feat_tree,
+                &[&repo.find_commit(base).unwrap()],
+            )
+            .unwrap();
+        repo.branch("main", &repo.find_commit(base).unwrap(), false)
+            .unwrap();
+        repo.branch("feature", &repo.find_commit(head).unwrap(), false)
+            .unwrap();
+        let merge_base = repo.merge_base(base, head).unwrap();
+        let _id = {
+            let id = store
+                .create_pr(
+                    "",
+                    "feature",
+                    "main",
+                    head,
+                    base,
+                    merge_base,
+                    "a@x",
+                    None,
+                    &[],
+                )
+                .expect("store-level create_pr accepts an empty title");
+            assert_eq!(id, 1);
+            id
+        };
+    }
+
+    // Drive the merge through the real CLI: approve, run CI to green, then
+    // squash — the empty title must refuse the squash.
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let run = |args: &[&str]| {
+        let out = Command::new(bin)
+            .args(args)
+            .current_dir(&dir)
+            .output()
+            .unwrap();
+        (
+            out.status.code().unwrap_or(-1),
+            String::from_utf8_lossy(&out.stdout).trim().to_string(),
+            String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        )
+    };
+    assert_eq!(run(&["forge", "pr", "review", "1", "--approve"]).0, 0);
+    let (cc, _oc, ec) = run(&["forge", "ci", "run", "1"]);
+    assert_eq!(cc, 0, "ci run must succeed for the squash fixture: {ec}");
+    let (cm, _om, em) = run(&["forge", "pr", "merge", "1", "--squash"]);
+    assert_ne!(cm, 0, "squash of an empty-title PR must fail: {em}");
+    assert!(
+        em.contains("PR has no title"),
+        "stderr must name the empty-title refusal: {em}"
+    );
+}
+
+#[test]
+fn validate_refuses_created_event_outside_meta_commit() {
+    // store.rs:409 — a pr.created event appended at the chain TIP (not the
+    // authoritative /meta commit) breaks the anchor: the scan refuses.
+    let dir = tmpdir("forgedcreated");
+    {
+        let store = bound(&dir);
+        let repo = store.repo();
+        let sig = test_signature();
+        let tree_oid = repo.treebuilder(None).unwrap().write().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let base = repo.commit(None, &sig, &sig, "base", &tree, &[]).unwrap();
+        let head = repo
+            .commit(
+                None,
+                &sig,
+                &sig,
+                "head",
+                &tree,
+                &[&repo.find_commit(base).unwrap()],
+            )
+            .unwrap();
+        repo.branch("main", &repo.find_commit(base).unwrap(), false)
+            .unwrap();
+        repo.branch("feature", &repo.find_commit(head).unwrap(), false)
+            .unwrap();
+        let merge_base = repo.merge_base(base, head).unwrap();
+        let id = store
+            .create_pr(
+                "T",
+                "feature",
+                "main",
+                head,
+                base,
+                merge_base,
+                "a@x",
+                None,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(id, 1);
+        // Forge: append a SECOND pr.created (id 1) at the tip — it is not at /meta.
+        let dup = event(
+            EventKind::PrCreated,
+            "pr",
+            1,
+            "a@x",
+            &[("title", JsonValue::String("dup".into()))],
+        );
+        store
+            .append_event(&pr_head_ref(1), &dup)
+            .expect("append the forged duplicate created");
+    }
+
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let out = Command::new(bin)
+        .args(["forge", "ci", "run", "1"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert_ne!(
+        out.status.code().unwrap_or(-1),
+        0,
+        "a duplicated created outside /meta must refuse the run"
+    );
+}
+
+#[test]
+fn validate_refuses_chain_with_no_created_event() {
+    // store.rs:412 — a PR head chain carrying events but ZERO pr.created
+    // events is not anchored: the scan refuses.
+    let dir = tmpdir("nocreated");
+    {
+        let store = bound(&dir);
+        let repo = store.repo();
+        let sig = test_signature();
+        let tree_oid = repo.treebuilder(None).unwrap().write().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let base = repo.commit(None, &sig, &sig, "base", &tree, &[]).unwrap();
+        let head = repo
+            .commit(
+                None,
+                &sig,
+                &sig,
+                "head",
+                &tree,
+                &[&repo.find_commit(base).unwrap()],
+            )
+            .unwrap();
+        repo.branch("main", &repo.find_commit(base).unwrap(), false)
+            .unwrap();
+        repo.branch("feature", &repo.find_commit(head).unwrap(), false)
+            .unwrap();
+        let merge_base = repo.merge_base(base, head).unwrap();
+        let id = store
+            .create_pr(
+                "T",
+                "feature",
+                "main",
+                head,
+                base,
+                merge_base,
+                "a@x",
+                None,
+                &[],
+            )
+            .unwrap();
+        assert_eq!(id, 1);
+        // Forge: strip the chain down to events with NO pr.created — append two
+        // comments, then repoint /meta away so the scan sees created != 1.
+        let comment = event(
+            EventKind::PrComment,
+            "pr",
+            1,
+            "a@x",
+            &[("body", JsonValue::String("c".into()))],
+        );
+        store
+            .append_event(&pr_head_ref(1), &comment)
+            .expect("append comment 1");
+        store
+            .append_event(&pr_head_ref(1), &comment)
+            .expect("append comment 2");
+        // Point /meta at a commit that is NOT the created commit: the scan's
+        // created-at-meta check then never matches, leaving created == 0.
+        let tip = repo
+            .find_reference(&pr_head_ref(1))
+            .unwrap()
+            .target()
+            .unwrap();
+        repo.reference(&pr_meta_ref(1), tip, true, "forge-meta")
+            .unwrap();
+    }
+
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let out = Command::new(bin)
+        .args(["forge", "ci", "run", "1"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert_ne!(
+        out.status.code().unwrap_or(-1),
+        0,
+        "a chain with no created event must refuse the run"
+    );
+}
+
+#[test]
+fn current_tip_surfaces_corrupt_ref_file_as_store_error() {
+    // store.rs:250 — a ref FILE with unparseable content is a REAL git error
+    // (not NotFound): current_tip must surface StoreError::Git, never treat it
+    // as an absent entity.
+    let dir = tmpdir("corruptref");
+    {
+        let store = bound(&dir);
+        let repo = store.repo();
+        // Create the ref properly first, then corrupt its on-disk file.
+        let tree_oid = repo.treebuilder(None).unwrap().write().unwrap();
+        let sig = test_signature();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let base = repo.commit(None, &sig, &sig, "base", &tree, &[]).unwrap();
+        repo.reference(&issue_ref(1), base, false, "seed").unwrap();
+    }
+    let ref_path = dir.join(".git").join("refs/forge/issues/1");
+    std::fs::create_dir_all(ref_path.parent().unwrap()).unwrap();
+    std::fs::write(&ref_path, b"not-a-ref-value\n").unwrap();
+    let store = EventStore::open(&dir).expect("reopen the repo");
+    let res = store.read_chain(&issue_ref(1));
+    assert!(
+        matches!(res, Err(StoreError::Git(_))),
+        "a corrupt ref file must surface StoreError::Git, got: {res:?}"
+    );
+}
+
+#[test]
+fn allocate_id_surfaces_batch_failure_when_entity_ref_is_absent() {
+    // store.rs:740 — a ref update batch that fails for a reason OTHER than a
+    // pre-existing entity ref (here: a stale .lock file) surfaces the raw git
+    // error once the counter is proven unchanged and the entity ref absent.
+    let dir = tmpdir("alloclock");
+    let store = bound(&dir);
+    let lock = dir.join(".git").join("refs/forge/issues/1.lock");
+    std::fs::create_dir_all(lock.parent().unwrap()).unwrap();
+    std::fs::write(&lock, b"stale").unwrap();
+    let res = store.allocate_id();
+    assert!(res.is_err(), "a locked entity ref must fail the allocation");
+    match res {
+        Err(StoreError::RefExists(_)) => {
+            unreachable!("the entity ref does not exist; RefExists would be wrong");
+        }
+        Err(_) => {}
+        Ok(_) => unreachable!("allocation must fail under a stale lock"),
+    }
+}
+
+#[test]
+fn read_chain_rejects_event_entry_whose_oid_is_not_a_blob() {
+    // store.rs:496 — a `.forge/event.json` entry whose object id names a TREE
+    // while carrying a blob file mode is malformed; reading the chain must
+    // error (Git/InvalidState), never panic and never yield a phantom event.
+    // Built via `update-index --cacheinfo`, which does not type-check the
+    // object against the mode.
+    let dir = tmpdir("eventtreeoid");
+    let index = dir.join(".git").join("index");
+    let sub_tree;
+    {
+        let store = bound(&dir);
+        let repo = store.repo();
+        let event_tb = repo.treebuilder(None).unwrap();
+        sub_tree = event_tb.write().unwrap();
+    }
+    let ci = Command::new("git")
+        .args([
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("100644,{sub_tree},event.json"),
+        ])
+        .env("GIT_INDEX_FILE", &index)
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert_eq!(ci.status.code(), Some(0), "setup: stage malformed entry");
+    let cw = Command::new("git")
+        .args(["write-tree"])
+        .env("GIT_INDEX_FILE", &index)
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert_eq!(cw.status.code(), Some(0), "setup: write forge tree");
+    let forge_tree_oid =
+        git2::Oid::from_str(String::from_utf8_lossy(&cw.stdout).trim()).expect("parse tree oid");
+
+    let store = bound(&dir);
+    let repo = store.repo();
+    let sig = test_signature();
+    let mut root_tb = repo.treebuilder(None).unwrap();
+    root_tb.insert(".forge", forge_tree_oid, 0o040000).unwrap();
+    let root_oid = root_tb.write().unwrap();
+    let tree = repo.find_tree(root_oid).unwrap();
+    let base = repo.commit(None, &sig, &sig, "base", &tree, &[]).unwrap();
+    repo.reference(&issue_ref(1), base, false, "corrupt")
+        .unwrap();
+    let res = store.read_chain(&issue_ref(1));
+    assert!(
+        matches!(res, Err(StoreError::Git(_))) || matches!(res, Err(StoreError::InvalidState(_))),
+        "a tree-oid event entry must be an error, got: {res:?}"
+    );
+}
+
+#[test]
+fn concurrent_create_pr_retries_and_yields_distinct_ids() {
+    // store.rs:851 — two concurrent create_pr calls race on the SAME repo's
+    // counter; the loser retries with a fresh id and both PRs publish with
+    // distinct ids and intact chains.
+    let dir = tmpdir("concpr");
+    let (base, head, merge_base) = {
+        let store = bound(&dir);
+        let repo = store.repo();
+        let sig = test_signature();
+        let tree_oid = repo.treebuilder(None).unwrap().write().unwrap();
+        let tree = repo.find_tree(tree_oid).unwrap();
+        let base = repo.commit(None, &sig, &sig, "base", &tree, &[]).unwrap();
+        let head = repo
+            .commit(
+                None,
+                &sig,
+                &sig,
+                "head",
+                &tree,
+                &[&repo.find_commit(base).unwrap()],
+            )
+            .unwrap();
+        repo.branch("main", &repo.find_commit(base).unwrap(), false)
+            .unwrap();
+        repo.branch("feature", &repo.find_commit(head).unwrap(), false)
+            .unwrap();
+        let merge_base = repo.merge_base(base, head).unwrap();
+        (base, head, merge_base)
+    };
+    let d1 = dir.clone();
+    let d2 = dir.clone();
+    let h1 = std::thread::spawn(move || {
+        let s = EventStore::open(&d1)
+            .unwrap()
+            .bind_signature(test_signature());
+        s.create_pr(
+            "A",
+            "feature",
+            "main",
+            head,
+            base,
+            merge_base,
+            "a@x",
+            None,
+            &[],
+        )
+    });
+    let h2 = std::thread::spawn(move || {
+        let s = EventStore::open(&d2)
+            .unwrap()
+            .bind_signature(test_signature());
+        s.create_pr(
+            "B",
+            "feature",
+            "main",
+            head,
+            base,
+            merge_base,
+            "a@x",
+            None,
+            &[],
+        )
+    });
+    let r1 = h1.join().unwrap();
+    let r2 = h2.join().unwrap();
+    let (id1, id2) = match (r1, r2) {
+        (Ok(a), Ok(b)) => (a, b),
+        (r1, r2) => panic!("both concurrent create_pr must succeed: {r1:?} {r2:?}"),
+    };
+    assert_ne!(id1, id2, "distinct ids from a concurrent race");
+}

@@ -4033,3 +4033,644 @@ fn merge_refuses_forged_same_id_creation_chain_during_finalize() {
         "pending result ref must be left in place on a forged-chain refusal"
     );
 }
+
+#[test]
+fn pr_show_eventless_ref_and_pr_list_gap_are_clean() {
+    // cli.rs:462 (pr show on a ref with no event blob), :525/:529 (pr list
+    // skips an absent then an eventless head inside the counter bound), and
+    // :488 (the list skip block closes cleanly).
+    let dir = tmpdir("prlistgap");
+    init_repo(&dir);
+    make_feature(&dir, "feature", "feat\n");
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "one",],
+        )
+        .0,
+        0
+    );
+    // A second PR so the list bound covers a gap at #2.
+    git(&dir, &["checkout", "-q", "feature"]);
+    std::fs::write(dir.join("feature.txt"), "feat2\n").unwrap();
+    git(&dir, &["add", "feature.txt"]);
+    git(&dir, &["commit", "-q", "-m", "feat2"]);
+    git(&dir, &["checkout", "-q", "main"]);
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "two",],
+        )
+        .0,
+        0
+    );
+
+    // Gap: PR #2's head ref disappears; list must skip it and still show #1.
+    let (cd, _, ed) = git(&dir, &["update-ref", "-d", "refs/forge/prs/2/head"]);
+    assert_eq!(cd, 0, "setup: delete pr 2 head: {ed}");
+    let (c1, o1, e1) = forge(&dir, &["forge", "pr", "list"]);
+    assert_eq!(c1, 0, "pr list with a gap must succeed: {e1}");
+    assert!(o1.contains("one"), "gap list output: {o1}");
+    assert!(!o1.contains("two"), "deleted pr must not be listed: {o1}");
+
+    // Eventless: PR #2's head points at a plain commit with no event blob.
+    let base = git(&dir, &["rev-parse", "main"]).1;
+    let (cr, _, er) = git(&dir, &["update-ref", "refs/forge/prs/2/head", &base]);
+    assert_eq!(cr, 0, "setup: repoint pr 2 head: {er}");
+    let (c2, o2, e2) = forge(&dir, &["forge", "pr", "list"]);
+    assert_eq!(c2, 0, "pr list with an eventless ref must succeed: {e2}");
+    assert!(o2.contains("one"), "eventless list output: {o2}");
+
+    // pr show on an eventless head is the clean "has no events" error.
+    let (c3, _o3, e3) = forge(&dir, &["forge", "pr", "show", "2"]);
+    assert_ne!(c3, 0, "eventless pr show must fail");
+    assert!(e3.contains("PR #2 has no events"), "pr show 2: {e3}");
+}
+
+/// Stage a gitlink (mode 160000) entry at `path` pointing at `target_oid` and
+/// commit it on the current branch. Git does not verify gitlink targets, so a
+/// plain commit oid is a valid gitlink payload.
+fn commit_gitlink(dir: &PathBuf, path: &str, target_oid: &str, msg: &str) {
+    let (c, _, e) = git(
+        dir,
+        &[
+            "update-index",
+            "--add",
+            "--cacheinfo",
+            &format!("160000,{target_oid},{path}"),
+        ],
+    );
+    assert_eq!(c, 0, "setup: stage gitlink {path}: {e}");
+    let (c, _, e) = git(dir, &["commit", "-q", "-m", msg]);
+    assert_eq!(c, 0, "setup: commit gitlink {path}: {e}");
+}
+
+#[test]
+fn ci_run_refuses_gitlink_ci_sh() {
+    // ci.rs:83 — a `.forge/ci.sh` whose tree entry is a gitlink (mode 160000)
+    // is neither a regular file nor a symlink: the selector must refuse it
+    // ("not a regular file") so CI never treats a submodule pointer as a plan.
+    let dir = tmpdir("ci-gitlink-ci");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "feature.txt"]);
+    git(&dir, &["commit", "-q", "-m", "feature"]);
+    let base_oid = git(&dir, &["rev-parse", "HEAD"]).1;
+    commit_gitlink(&dir, ".forge/ci.sh", &base_oid, "gitlink ci.sh");
+    git(&dir, &["checkout", "-q", "main"]);
+
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1",],
+        )
+        .0,
+        0
+    );
+    let (c, _o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_ne!(c, 0, "gitlink ci.sh must be refused: {e}");
+    assert!(
+        e.contains("not a regular file"),
+        "stderr must name the non-regular refusal: {e}"
+    );
+    let event = head_event(&dir, 1);
+    assert!(
+        !event.contains("\"status\":\"success\""),
+        "must not record a green Check: {event}"
+    );
+    assert_no_ci_worktree(&dir);
+}
+
+#[test]
+fn ci_run_fallback_refuses_gitlink_justfile() {
+    // ci.rs:70 — the `just check` fallback refuses a justfile whose tree entry
+    // is a gitlink: not a regular file, so the fallback has no readable plan.
+    let dir = tmpdir("ci-gitlink-just");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "feature.txt"]);
+    git(&dir, &["commit", "-q", "-m", "feature"]);
+    let base_oid = git(&dir, &["rev-parse", "HEAD"]).1;
+    commit_gitlink(&dir, "justfile", &base_oid, "gitlink justfile");
+    git(&dir, &["checkout", "-q", "main"]);
+
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1",],
+        )
+        .0,
+        0
+    );
+    let (c, _o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_ne!(c, 0, "gitlink justfile must be refused: {e}");
+    assert!(
+        e.contains("not a regular file"),
+        "stderr must name the non-regular refusal: {e}"
+    );
+    let event = head_event(&dir, 1);
+    assert!(
+        !event.contains("\"status\":\"success\""),
+        "must not record a green Check: {event}"
+    );
+    assert_no_ci_worktree(&dir);
+}
+
+#[test]
+fn ci_run_sanitizes_bash_func_env() {
+    // ci.rs:321 — a `BASH_FUNC_*%%` environment entry (the Shellshock shape)
+    // must be removed from the plan interpreter's environment byte-preservingly.
+    let dir = tmpdir("ci-bashfunc");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    make_feature_with_ci(&dir, "feature", "feat\n", 0);
+    git(&dir, &["checkout", "-q", "main"]);
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1",],
+        )
+        .0,
+        0
+    );
+    let (c, o, e) = forge_with_env(
+        &dir,
+        &["forge", "ci", "run", "1"],
+        &[("BASH_FUNC_evil%%", "() { echo pwned; }")],
+    );
+    assert_eq!(
+        c, 0,
+        "benign plan must pass with a BASH_FUNC var set: {o} {e}"
+    );
+    assert_no_ci_worktree(&dir);
+}
+
+#[test]
+fn ci_run_fallback_refuses_relative_home() {
+    // ci.rs:364 — a RELATIVE HOME could let the disposable worktree ship its
+    // own `.cargo/bin/just`; the resolver must refuse before spawning it.
+    let dir = tmpdir("ci-relhome");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(
+        dir.join("justfile"),
+        "check:\n    echo \"just check passed\"\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "feature + justfile"]);
+    git(&dir, &["checkout", "-q", "main"]);
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1",],
+        )
+        .0,
+        0
+    );
+    let (c, _o, e) = forge_with_env(&dir, &["forge", "ci", "run", "1"], &[("HOME", "rel")]);
+    assert_ne!(c, 0, "relative HOME must refuse the fallback: {e}");
+    let event = head_event(&dir, 1);
+    assert!(
+        !event.contains("\"status\":\"success\""),
+        "must not record a green Check: {event}"
+    );
+    assert_no_ci_worktree(&dir);
+}
+
+#[test]
+fn ci_run_fails_when_descendant_survives_leader_exit() {
+    // ci.rs:508-513 — a plan whose leader exits while a background descendant
+    // is still alive in the group must FAIL the run (never green): the group
+    // cannot be proven empty, so the kill+reap path fires with timed_out.
+    let dir = tmpdir("ci-descendant");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    std::fs::write(
+        dir.join(".forge").join("ci.sh"),
+        "#!/bin/bash\nsleep 5 &\nexit 0\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(
+        &dir,
+        &["commit", "-q", "-m", "leader exits, descendant lives"],
+    );
+    git(&dir, &["checkout", "-q", "main"]);
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1",],
+        )
+        .0,
+        0
+    );
+    let (c, _o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_ne!(
+        c, 0,
+        "a leader exit with a live descendant must fail the run: {e}"
+    );
+    let event = head_event(&dir, 1);
+    assert!(
+        event.contains("\"status\":\"failed\""),
+        "the Check must record failure, got: {event}"
+    );
+    assert_no_ci_worktree(&dir);
+}
+
+#[test]
+fn ci_run_fallback_allows_benign_set_directive() {
+    // validate.rs:99-100 — a `set` directive whose name is not on the refused
+    // list (e.g. `temp-dir`) is allowed: the fallback stays self-contained.
+    let dir = tmpdir("ci-setbenign");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(
+        dir.join("justfile"),
+        "set positional-arguments := true\ncheck:\n    echo \"just check passed\"\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "feature + benign set"]);
+    git(&dir, &["checkout", "-q", "main"]);
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1",],
+        )
+        .0,
+        0
+    );
+    // The validator must allow the unlisted setting (no non-immutable
+    // refusal); a plan-stage Just failure is fine — the branch under test is
+    // the refused-list miss.
+    let (_c, _o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert!(
+        !e.contains("non-immutable"),
+        "an unlisted `set` directive must not be refused: {e}"
+    );
+    assert_no_ci_worktree(&dir);
+}
+
+#[test]
+fn ci_run_fallback_allows_import_variable_assignment() {
+    // validate.rs:320 — `import = 'x'` is a VARIABLE ASSIGNMENT, not a source
+    // directive, so the fallback stays allowed.
+    let dir = tmpdir("ci-importvar");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(
+        dir.join("justfile"),
+        "import = 'x'\ncheck:\n    echo \"just check passed\"\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "feature + import variable"]);
+    git(&dir, &["checkout", "-q", "main"]);
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1",],
+        )
+        .0,
+        0
+    );
+    // The validator must ALLOW the assignment (no non-immutable refusal); a
+    // plan-stage Just failure is fine — the branch under test is the validator.
+    let (_c, _o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert!(
+        !e.contains("non-immutable"),
+        "an `import =` variable assignment must not be refused as a source: {e}"
+    );
+    let event = head_event(&dir, 1);
+    assert!(
+        !event.contains("non-immutable"),
+        "the Check must not record a validator refusal: {event}"
+    );
+}
+
+#[test]
+fn ci_run_fallback_refuses_bare_import() {
+    // validate.rs:310 — a bare `import` line (no argument) IS treated as a
+    // source directive and refused (Just itself would error non-green).
+    let dir = tmpdir("ci-bareimport");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(dir.join("justfile"), "import\ncheck:\n    echo ok\n").unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "feature + bare import"]);
+    git(&dir, &["checkout", "-q", "main"]);
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1",],
+        )
+        .0,
+        0
+    );
+    let (c, _o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_ne!(c, 0, "bare import must be refused: {e}");
+    let event = head_event(&dir, 1);
+    assert!(
+        !event.contains("\"status\":\"success\""),
+        "must not record a green Check: {event}"
+    );
+    let event = head_event(&dir, 1);
+    assert!(
+        !event.contains("\"status\":\"success\""),
+        "must not record a green Check: {event}"
+    );
+}
+
+#[test]
+fn ci_run_fallback_flushes_trailing_continuation_line() {
+    // validate.rs:135 — a justfile that ENDS mid-continuation (`set \` with no
+    // following line) still flushes the buffered logical line through the
+    // checker instead of silently dropping it.
+    let dir = tmpdir("ci-trailcont");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(dir.join("justfile"), "check:\n    echo ok\nset \\").unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(
+        &dir,
+        &["commit", "-q", "-m", "feature + trailing continuation"],
+    );
+    git(&dir, &["checkout", "-q", "main"]);
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1",],
+        )
+        .0,
+        0
+    );
+    // The flushed `set ` fragment is not a refused setting: the validator must
+    // allow it (a plan-stage Just failure is fine — the branch under test is
+    // the flush path).
+    let (_c, _o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert!(
+        !e.contains("non-immutable"),
+        "the flushed continuation must not be refused as a setting: {e}"
+    );
+    assert_no_ci_worktree(&dir);
+}
+
+#[test]
+fn ci_run_fallback_allows_multiline_benign_attribute_block() {
+    // validate.rs:213-217 — a recipe-attribute block spanning lines closes
+    // cleanly when it does not enable script mode.
+    let dir = tmpdir("ci-multiline-attr");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::write(
+        dir.join("justfile"),
+        "[no-exit-message,\n confirm(\"x\")]\ncheck:\n    echo \"just check passed\"\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(
+        &dir,
+        &["commit", "-q", "-m", "feature + multiline benign attribute"],
+    );
+    git(&dir, &["checkout", "-q", "main"]);
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1",],
+        )
+        .0,
+        0
+    );
+    // The validator must allow the script-free block (no non-immutable
+    // refusal); a plan-stage Just failure is fine — the branch under test is
+    // the multi-line block flush.
+    let (_c, _o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert!(
+        !e.contains("non-immutable"),
+        "a script-free multiline attribute block must not be refused: {e}"
+    );
+    assert_no_ci_worktree(&dir);
+}
+
+#[test]
+fn ci_run_refuses_head_chain_not_anchored_to_the_pr() {
+    // store.rs:406 (an event whose entity/id does not match the PR) and :326
+    // (validate_pr_snapshot_refs refuses a head chain that is not anchored to
+    // the PR), plus :384 (a head chain with no events at all).
+    let dir = tmpdir("ci-forgedhead");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    make_feature(&dir, "feature", "feat\n");
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1",],
+        )
+        .0,
+        0
+    );
+
+    // Forge A: point the PR head at an ISSUE chain (entity mismatch).
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    assert_eq!(
+        forge(&dir, &["forge", "issue", "new", "decoy"]).0,
+        0,
+        "setup: issue new must succeed"
+    );
+    // The PR already consumed id 1 from the shared counter, so the decoy
+    // issue is #2.
+    let issue_head = ref_oid(&dir, "refs/forge/issues/2").unwrap();
+    let (cr, _, er) = git(&dir, &["update-ref", "refs/forge/prs/1/head", &issue_head]);
+    assert_eq!(cr, 0, "setup: forge pr head to an issue chain: {er}");
+    let (c1, _o1, e1) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_ne!(c1, 0, "an issue chain must not validate as PR #1: {e1}");
+    assert!(
+        e1.contains("not anchored") || e1.contains("does not"),
+        "stderr must name the anchor refusal: {e1}"
+    );
+
+    // Forge B: point the PR head at a plain commit (no events at all).
+    let base = ref_oid(&dir, "refs/heads/main").unwrap();
+    let (cr2, _, _) = git(&dir, &["update-ref", "refs/forge/prs/1/head", &base]);
+    assert_eq!(cr2, 0, "setup: forge pr head to a plain commit");
+    let (c2, _o2, e2) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_ne!(c2, 0, "an eventless head must not validate: {e2}");
+    assert!(
+        e2.contains("not anchored"),
+        "stderr must name the anchor refusal: {e2}"
+    );
+}
+
+#[test]
+fn ci_run_refuses_retargeted_base_ref() {
+    // store.rs:452/460 — the /base snapshot ref must still point at the
+    // recorded base_head; a retargeted base refuses the run like a retargeted
+    // source does.
+    let dir = tmpdir("ci-retarget-base");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    make_feature(&dir, "feature", "feat\n");
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1",],
+        )
+        .0,
+        0
+    );
+    // Move main forward, then retarget the PR's /base snapshot ref at the NEW
+    // main tip (different from the recorded base_head).
+    git(&dir, &["checkout", "-q", "main"]);
+    std::fs::write(dir.join("other.txt"), "other\n").unwrap();
+    git(&dir, &["add", "other.txt"]);
+    git(&dir, &["commit", "-q", "-m", "advance main"]);
+    let new_main = ref_oid(&dir, "refs/heads/main").unwrap();
+    let (cr, _, er) = git(&dir, &["update-ref", "refs/forge/prs/1/base", &new_main]);
+    assert_eq!(cr, 0, "setup: retarget pr base ref: {er}");
+    let (c, _o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_ne!(c, 0, "a retargeted base ref must refuse the run: {e}");
+    assert!(
+        e.contains("snapshot") || e.contains("retarget") || e.contains("base"),
+        "stderr must name the snapshot refusal: {e}"
+    );
+}
+
+#[test]
+fn merge_refuses_unrelated_history_at_merge_time() {
+    // git.rs:592 — if the base and source histories become UNRELATED after the
+    // PR was created (base rewritten to a fresh root), the merge-time
+    // merge-base resolution refuses instead of fabricating a merge.
+    let dir = tmpdir("merge-unrelated");
+    init_repo(&dir);
+    config_identity(&dir);
+    // The CI plan must be in the snapshot BEFORE pr create, so the run can go
+    // green prior to the unrelated-history rewrite.
+    make_feature_with_ci(&dir, "feature", "feat\n", 0);
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1",],
+        )
+        .0,
+        0
+    );
+    assert_eq!(
+        forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
+        0
+    );
+    git(&dir, &["checkout", "-q", "main"]);
+    assert_eq!(
+        forge(&dir, &["forge", "ci", "run", "1"]).0,
+        0,
+        "ci run must go green before the unrelated-history rewrite"
+    );
+    // Rewrite main to a FRESH ROOT (unrelated history).
+    git(&dir, &["checkout", "-q", "--orphan", "fresh-main"]);
+    git(&dir, &["rm", "-rq", "--force", "."]);
+    std::fs::write(dir.join("root.txt"), "root\n").unwrap();
+    git(&dir, &["add", "root.txt"]);
+    git(&dir, &["commit", "-q", "-m", "unrelated root"]);
+    let fresh = ref_oid(&dir, "HEAD").unwrap();
+    git(&dir, &["checkout", "-q", "main"]);
+    let (cr, _, er) = git(&dir, &["update-ref", "refs/heads/main", &fresh]);
+    assert_eq!(cr, 0, "setup: rewrite main to an unrelated root: {er}");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let (cm, _om, em) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_ne!(cm, 0, "unrelated histories must refuse the merge: {em}");
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base ref must be unchanged on a refused merge"
+    );
+}
+
+#[test]
+fn ci_run_refuses_pr_whose_meta_ref_is_absent() {
+    // store.rs:432 — a PR whose /meta ref is gone is "not anchored" (the
+    // authoritative creation commit can no longer be verified).
+    let dir = tmpdir("ci-nometa");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    make_feature(&dir, "feature", "feat\n");
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1",],
+        )
+        .0,
+        0
+    );
+    let (cd, _, ed) = git(&dir, &["update-ref", "-d", "refs/forge/prs/1/meta"]);
+    assert_eq!(cd, 0, "setup: delete pr meta ref: {ed}");
+    let (c, _o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_ne!(c, 0, "an absent /meta must refuse the run: {e}");
+    assert!(
+        e.contains("not anchored"),
+        "stderr must name the anchor refusal: {e}"
+    );
+}
+
+#[test]
+fn merge_refuses_criss_cross_multiple_merge_bases() {
+    // git.rs:587 — a criss-cross rewrite that leaves TWO merge bases between
+    // source and base refuses the merge (ambiguous base), never picks one.
+    let dir = tmpdir("merge-crisscross");
+    init_repo(&dir);
+    config_identity(&dir);
+    make_feature_with_ci(&dir, "feature", "feat\n", 0);
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1",],
+        )
+        .0,
+        0
+    );
+    assert_eq!(
+        forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
+        0
+    );
+    git(&dir, &["checkout", "-q", "main"]);
+    assert_eq!(forge(&dir, &["forge", "ci", "run", "1"]).0, 0);
+
+    // Build a criss-cross: crossA merges feature; feature merges main; then
+    // main is repointed at crossA — main and feature now share two bases.
+    git(&dir, &["checkout", "-q", "-b", "crossA", "main"]);
+    let (cm, _, em) = git(&dir, &["merge", "--no-edit", "-q", "feature"]);
+    assert_eq!(cm, 0, "setup: crossA merge failed: {em}");
+    git(&dir, &["checkout", "-q", "feature"]);
+    let (cm2, _, em2) = git(&dir, &["merge", "--no-edit", "-q", "main"]);
+    assert_eq!(cm2, 0, "setup: feature merge failed: {em2}");
+    let cross_tip = ref_oid(&dir, "crossA").unwrap();
+    let (cr, _, er) = git(&dir, &["update-ref", "refs/heads/main", &cross_tip]);
+    assert_eq!(cr, 0, "setup: repoint main at the cross tip: {er}");
+
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let (c, _o, e) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_ne!(c, 0, "a criss-cross history must refuse the merge: {e}");
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base ref must be unchanged"
+    );
+}
