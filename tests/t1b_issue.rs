@@ -701,3 +701,102 @@ fn issue_new_supports_body_and_labels_shown_in_show() {
     assert!(os.contains("description: a body"), "body shown: {os}");
     assert!(os.contains("labels: bug, urgent"), "labels shown: {os}");
 }
+#[test]
+fn issue_label_flag_value_validation() {
+    // cli.rs:97 --label with no value; cli.rs:101 --label with empty value.
+    let dir = tmpdir("labelval");
+    init_repo(&dir);
+    let (c, _o, e) = forge(&dir, &["forge", "issue", "new", "T", "--label"]);
+    assert_ne!(c, 0, "--label with no value must fail");
+    assert!(
+        e.contains("--label requires a value"),
+        "stderr should name the missing label value: {e}"
+    );
+    let (c2, _o2, e2) = forge(&dir, &["forge", "issue", "new", "T", "--label", ""]);
+    assert_ne!(c2, 0, "--label with empty value must fail");
+    assert!(
+        e2.contains("--label requires a non-empty value"),
+        "stderr should name the empty label value: {e2}"
+    );
+}
+
+#[test]
+fn issue_unknown_subcommand_is_clean_error() {
+    // cli.rs:290 unknown issue subcommand.
+    let dir = tmpdir("unksub");
+    init_repo(&dir);
+    let (c, _o, e) = forge(&dir, &["forge", "issue", "bogus"]);
+    assert_ne!(c, 0, "unknown issue subcommand must fail");
+    assert!(
+        e.contains("unknown issue subcommand 'bogus'"),
+        "stderr should name the unknown subcommand: {e}"
+    );
+}
+
+#[test]
+fn issue_nonexistent_entity_and_empty_body_are_clean_errors() {
+    // store.rs:185 issue show nonexistent; store.rs:225 empty comment body;
+    // store.rs:230 comment on nonexistent; store.rs:248 close/reopen nonexistent.
+    let dir = tmpdir("missing");
+    init_repo(&dir);
+    let (c1, _o1, e1) = forge(&dir, &["forge", "issue", "show", "999"]);
+    assert_ne!(c1, 0, "show nonexistent must fail");
+    assert!(e1.contains("issue #999 does not exist"), "show: {e1}");
+
+    let (c2, _o2, e2) = forge(&dir, &["forge", "issue", "comment", "1", "   "]);
+    assert_ne!(c2, 0, "whitespace-only comment body must fail");
+    assert!(
+        e2.contains("comment body must be non-empty"),
+        "comment: {e2}"
+    );
+
+    let (c3, _o3, e3) = forge(&dir, &["forge", "issue", "comment", "999", "x"]);
+    assert_ne!(c3, 0, "comment on nonexistent must fail");
+    assert!(
+        e3.contains("issue #999 does not exist"),
+        "comment 999: {e3}"
+    );
+
+    let (c4, _o4, e4) = forge(&dir, &["forge", "issue", "close", "999"]);
+    assert_ne!(c4, 0, "close nonexistent must fail");
+    assert!(e4.contains("issue #999 does not exist"), "close 999: {e4}");
+
+    let (c5, _o5, e5) = forge(&dir, &["forge", "issue", "reopen", "999"]);
+    assert_ne!(c5, 0, "reopen nonexistent must fail");
+    assert!(e5.contains("issue #999 does not exist"), "reopen 999: {e5}");
+}
+#[test]
+fn git_pr_wrapper_dispatches_to_pr() {
+    // main.rs:77 run_wrapper: argv[0] basename `git-pr` must route to the PR
+    // command surface (run_pr), not the issue surface.
+    let dir = tmpdir("wrappr");
+    init_repo(&dir);
+    let bindir = dir.join(".gpralias");
+    std::fs::create_dir_all(&bindir).unwrap();
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    std::fs::copy(bin, bindir.join("git-pr")).unwrap();
+    let path = format!(
+        "{}:{}",
+        bindir.display(),
+        std::env::var("PATH").unwrap_or_default()
+    );
+    // `git pr list` in an empty repo: the PR surface's "(no pull requests)".
+    let out = Command::new("git")
+        .args(["pr", "list"])
+        .current_dir(&dir)
+        .env("PATH", &path)
+        .output()
+        .unwrap();
+    let code = out.status.code().unwrap_or(-1);
+    assert_eq!(
+        code,
+        0,
+        "git pr list failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("no pull requests"),
+        "git-pr wrapper must route to the PR surface, got: {stdout}"
+    );
+}

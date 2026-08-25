@@ -1086,6 +1086,214 @@ fn cli_arg_validation_errors_are_user_facing() {
         );
     }
 }
+#[test]
+fn pr_create_flag_value_and_option_errors_are_clean() {
+    // cli.rs:371/378/385/392/401/404/316 and store.rs:559.
+    let dir = tmpdir("prflags");
+    init_repo(&dir);
+    make_feature(&dir, "feature", "feat\n");
+
+    let cases: [(&[&str], &str); 10] = [
+        (
+            &["forge", "pr", "create", "--source"],
+            "--source requires a branch name",
+        ),
+        (
+            &["forge", "pr", "create", "--source", "feature", "--base"],
+            "--base requires a branch name",
+        ),
+        (
+            &[
+                "forge", "pr", "create", "--source", "feature", "--base", "main", "--body",
+            ],
+            "--body requires a description",
+        ),
+        (
+            &[
+                "forge", "pr", "create", "--source", "feature", "--base", "main", "--label",
+            ],
+            "--label requires a value",
+        ),
+        (
+            &[
+                "forge", "pr", "create", "--source", "feature", "--base", "main", "--label", "",
+            ],
+            "--label requires a non-empty value",
+        ),
+        (
+            &[
+                "forge",
+                "pr",
+                "create",
+                "--source",
+                "feature",
+                "--base",
+                "main",
+                "--bogus-flag",
+            ],
+            "unknown option '--bogus-flag'",
+        ),
+        (
+            &["forge", "pr", "create", "one", "two"],
+            "too many positional arguments",
+        ),
+        (
+            &[
+                "forge", "pr", "create", "--source", "feature", "--base", "main", "--", "one",
+                "two",
+            ],
+            "too many positional arguments",
+        ),
+        (
+            &[
+                "forge", "pr", "create", "--source", "", "--base", "main", "t",
+            ],
+            "branch name must be non-empty",
+        ),
+        (
+            &["forge", "pr", "comment", "999", "x"],
+            "PR #999 does not exist",
+        ),
+    ];
+    for (cmd, needle) in &cases {
+        let (c, _o, e) = forge(&dir, cmd);
+        assert_ne!(c, 0, "cmd {cmd:?} must fail: {e}");
+        assert!(
+            e.contains(needle),
+            "cmd {cmd:?} stderr should contain '{needle}': {e}"
+        );
+        assert!(
+            !e.contains("class=Repository") && !e.contains("could not find repository"),
+            "cmd {cmd:?} must not leak libgit2 internals: {e}"
+        );
+    }
+}
+
+#[test]
+fn pr_review_flag_and_option_errors_are_clean() {
+    // cli.rs:583 (next_arg requires value) and :594 (unknown option), and the
+    // inline-review-anchor refusal (cli.rs, --file/--line without --commit).
+    let dir = tmpdir("prreviewflags");
+    init_repo(&dir);
+    make_feature(&dir, "feature", "feat\n");
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "t",],
+        )
+        .0,
+        0,
+    );
+
+    let cases: [(&[&str], &str); 4] = [
+        (
+            &["forge", "pr", "review", "1", "--file"],
+            "--file requires a path",
+        ),
+        (
+            &["forge", "pr", "review", "1", "--line"],
+            "--line requires a number",
+        ),
+        (
+            &["forge", "pr", "review", "1", "--commit"],
+            "--commit requires a hash",
+        ),
+        (
+            &["forge", "pr", "review", "1", "--bogus-flag"],
+            "unknown option '--bogus-flag'",
+        ),
+    ];
+    for (cmd, needle) in &cases {
+        let (c, _o, e) = forge(&dir, cmd);
+        assert_ne!(c, 0, "cmd {cmd:?} must fail: {e}");
+        assert!(
+            e.contains(needle),
+            "cmd {cmd:?} stderr should contain '{needle}': {e}"
+        );
+        assert!(
+            !e.contains("class=Repository") && !e.contains("could not find repository"),
+            "cmd {cmd:?} must not leak libgit2 internals: {e}"
+        );
+    }
+}
+
+#[test]
+fn pr_unknown_subcommand_is_clean_error() {
+    // cli.rs:727 unknown pr subcommand.
+    let dir = tmpdir("prunksub");
+    init_repo(&dir);
+    let (c, _o, e) = forge(&dir, &["forge", "pr", "bogus"]);
+    assert_ne!(c, 0, "unknown pr subcommand must fail");
+    assert!(
+        e.contains("unknown pr subcommand 'bogus'"),
+        "stderr should name the unknown subcommand: {e}"
+    );
+}
+#[test]
+fn pr_show_comment_review_nonexistent_and_shape_errors_are_clean() {
+    // cli.rs:462 pr_show nonexistent; :525 pr_comment nonexistent; :529 empty
+    // comment body; :541 pr_review missing decision; :554 pr_review nonexistent;
+    // :415/416 missing title; :322-324 malformed refs/heads/ form.
+    let dir = tmpdir("prmissing");
+    init_repo(&dir);
+    make_feature(&dir, "feature", "feat\n");
+
+    // pr_show nonexistent (cli.rs:462).
+    let (c1, _o1, e1) = forge(&dir, &["forge", "pr", "show", "999"]);
+    assert_ne!(c1, 0, "pr show nonexistent must fail");
+    assert!(e1.contains("PR #999 does not exist"), "pr show 999: {e1}");
+
+    // pr_comment empty body (cli.rs:529) then nonexistent (cli.rs:525).
+    let (c2, _o2, e2) = forge(&dir, &["forge", "pr", "comment", "1", "   "]);
+    assert_ne!(c2, 0, "empty pr comment body must fail");
+    assert!(
+        e2.contains("comment body must be non-empty"),
+        "comment: {e2}"
+    );
+
+    let (c3, _o3, e3) = forge(&dir, &["forge", "pr", "comment", "999", "x"]);
+    assert_ne!(c3, 0, "comment nonexistent PR must fail");
+    assert!(e3.contains("PR #999 does not exist"), "comment 999: {e3}");
+
+    // pr_review without a decision (cli.rs:541) and on nonexistent (cli.rs:554).
+    let (c4, _o4, e4) = forge(&dir, &["forge", "pr", "review", "1"]);
+    assert_ne!(c4, 0, "review without --approve/--reject must fail");
+    assert!(e4.contains("usage: git forge pr review"), "review: {e4}");
+
+    let (c5, _o5, e5) = forge(&dir, &["forge", "pr", "review", "999", "--approve"]);
+    assert_ne!(c5, 0, "review nonexistent PR must fail");
+    assert!(e5.contains("PR #999 does not exist"), "review 999: {e5}");
+
+    // pr_create with source+base but no title (cli.rs:415/416).
+    let (c6, _o6, e6) = forge(
+        &dir,
+        &[
+            "forge", "pr", "create", "--source", "feature", "--base", "main",
+        ],
+    );
+    assert_ne!(c6, 0, "missing title must fail");
+    assert!(e6.contains("usage: git forge pr create"), "no title: {e6}");
+
+    // Malformed refs/heads/ form (cli.rs:322-324): empty remainder after refs/heads/.
+    let (c7, _o7, e7) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "create",
+            "--source",
+            "refs/heads/",
+            "--base",
+            "main",
+            "t",
+        ],
+    );
+    assert_ne!(c7, 0, "bare refs/heads/ must fail");
+    assert!(
+        e7.contains("not a canonical local branch"),
+        "refs/heads/: {e7}"
+    );
+}
 
 // ─────────────────────────── CI run (t0) ───────────────────────────
 
