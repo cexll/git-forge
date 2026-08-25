@@ -1914,6 +1914,68 @@ fn ci_run_fallback_refuses_when_snapshot_has_no_justfile() {
     assert_eq!(status.trim(), "", "working tree must be clean: {status}");
     assert_no_ci_worktree(&dir);
 }
+#[test]
+fn ci_run_fallback_refuses_when_no_trusted_just_resolves() {
+    // ci.rs:376/378 — the `just check` fallback needs a TRUSTED `just` from a
+    // system location or `~/.cargo/bin`/`~/.local/bin`. A PATH that contains
+    // neither a real `just` nor the operator locations must refuse the run
+    // cleanly (F-014: never a bare `just` on PATH, and never a shim).
+    let dir = tmpdir("ci-nojust");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    // A justfile with a check recipe triggers the `just check` fallback.
+    std::fs::write(
+        dir.join("justfile"),
+        "check:\n    echo \"just check passed\"\n",
+    )
+    .unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(
+        &dir,
+        &["commit", "-q", "-m", "feature + justfile, no .forge/ci.sh"],
+    );
+    git(&dir, &["checkout", "-q", "main"]);
+
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1"]
+        )
+        .0,
+        0
+    );
+
+    // HOME is redirected to a throwaway dir (no ~/.cargo/bin/just) and PATH is
+    // narrowed so the only `just`-resolution source is a nonexistent file the
+    // probe cannot invoke. The run must fail cleanly naming the missing just.
+    let isolated = tmpdir("ci-nojust-home");
+    let (c, _o, e) = forge_with_env(
+        &dir,
+        &["forge", "ci", "run", "1"],
+        &[("HOME", isolated.to_str().unwrap())],
+    );
+    assert_ne!(
+        c, 0,
+        "just check fallback with no resolvable trusted just must fail cleanly: {e}"
+    );
+    assert!(
+        e.contains("just"),
+        "stderr must name the missing trusted just: {e}"
+    );
+
+    // No green Check, no temp worktree left behind, working tree untouched.
+    let event = head_event(&dir, 1);
+    assert!(
+        !event.contains("\"status\":\"success\""),
+        "must not record a green Check: {event}"
+    );
+    assert_eq!(git(&dir, &["rev-parse", "--abbrev-ref", "HEAD"]).1, "main");
+    let (_, status, _) = git(&dir, &["status", "--porcelain"]);
+    assert_eq!(status.trim(), "", "working tree must be clean: {status}");
+    assert_no_ci_worktree(&dir);
+}
 
 /// F-013 regression: a checkout smudge/attribute filter must NOT replace the CI
 /// plan that runs. A `.gitattributes` filter rewrites `.forge/ci.sh` so that
