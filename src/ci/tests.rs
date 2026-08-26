@@ -274,3 +274,25 @@ fn allows_script_in_argument_but_refuses_script_name() {
         "a real `script` attribute in a list must be refused even with a comma in an argument"
     );
 }
+// Review (round 15 / F4): the attribute-list splitter must honor Just's RAW
+// single-quote rule (a `\` does NOT escape the closing `'`) — the same rule the
+// directive scanner uses. A `script` attribute following a single-quoted
+// argument that ENDS in a backslash must still be detected (a splitter that
+// treats `\'` as an escape keeps the quote open and swallows the `script`).
+#[test]
+fn refuses_script_after_backslash_terminated_single_quoted_arg() {
+    assert!(
+        validate_justfile_closure(b"[confirm('x\\'), script]\ncheck:\n  exit 1", "justfile")
+            .is_err(),
+        "a `script` attribute after a backslash-terminated single-quoted argument must be refused"
+    );
+    // Positive control: no `script` attribute -> allowed before and after.
+    assert!(
+        validate_justfile_closure(
+            b"[confirm('x\\'), no-exit-message]\ncheck:\n  true",
+            "justfile"
+        )
+        .is_ok(),
+        "a benign attribute list with a backslash-terminated single-quoted arg must be allowed"
+    );
+}

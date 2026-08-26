@@ -743,6 +743,30 @@ fn pr_help() -> String {
 
 // ─────────────────────────── CI commands (t0) ───────────────────────────
 
+/// Detect a leftover disposable worktree after a removal attempt (F-002/F-003):
+/// best-effort remove `tmp`, then report WHY it is not fully cleaned (removal
+/// failed, directory still present, verification failed, or still registered) —
+/// or None when it is gone. Shared by `cmd_ci_run`'s happy-path and add-failure
+/// cleanup so a leftover is always reported, never silently discarded.
+fn worktree_leftover(repo_dir: &std::path::Path, tmp: &std::path::Path) -> Option<String> {
+    crate::git::worktree_remove_ci(repo_dir, tmp)
+        .err()
+        .map(|e| format!("temp worktree removal failed: {e}"))
+        .or_else(|| {
+            let (ok, list, err_l) = crate::git::worktree_list_raw_ci(repo_dir);
+            if tmp.exists() {
+                Some("temp worktree directory still exists".to_string())
+            } else if !ok {
+                Some(format!("worktree verification failed: {err_l}"))
+            } else if crate::git::worktree_registered_path(&list, tmp) {
+                Some("temp worktree still registered".to_string())
+            } else {
+                None
+            }
+        })
+        .map(|reason| format!("{reason} (worktree left at {})", tmp.display()))
+}
+
 /// `git forge ci run <pr>` — execute the repo CI plan against the PR's own
 /// commits in a temporary worktree, append a CI Check event recording the
 /// outcome, and leave the developer's working tree and current branch
@@ -842,10 +866,16 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
         }
     };
     if !ok_wt {
+        // A failed `git worktree add` can leave a partially-created/registered
+        // worktree behind. Remove it and report a leftover the same way as the
+        // happy path (never silently discarded); an Err from removing a path the
+        // add never registered (clean early-validation failure) is no leftover.
+        let leftover = worktree_leftover(&repo_dir, &tmp);
         release_lock(&mut lock_handle, &tmp);
-        return Err(format!(
-            "failed to create temporary worktree for CI run: {err_wt}"
-        ));
+        return Err(match leftover {
+            Some(l) => format!("failed to create temporary worktree for CI run: {err_wt}; {l}"),
+            None => format!("failed to create temporary worktree for CI run: {err_wt}"),
+        });
     }
 
     // Run the plan. The exact immutable snapshot bytes are materialized and
@@ -859,22 +889,7 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
     // sibling lock until the worktree is removed AND verified gone (directory
     // absent + path unregistered), mirroring the merge-path postconditions
     // (F-002/F-003): a leftover is reported, never silently discarded.
-    let leftover = crate::git::worktree_remove_ci(&repo_dir, &tmp)
-        .err()
-        .map(|e| format!("temp worktree removal failed: {e}"))
-        .or_else(|| {
-            let (ok, list, err_l) = crate::git::worktree_list_raw_ci(&repo_dir);
-            if tmp.exists() {
-                Some("temp worktree directory still exists".to_string())
-            } else if !ok {
-                Some(format!("worktree verification failed: {err_l}"))
-            } else if crate::git::worktree_registered_path(&list, &tmp) {
-                Some("temp worktree still registered".to_string())
-            } else {
-                None
-            }
-        })
-        .map(|reason| format!("{reason} (worktree left at {})", tmp.display()));
+    let leftover = worktree_leftover(&repo_dir, &tmp);
     release_lock(&mut lock_handle, &tmp);
 
     // F-025: do NOT publish a green Check until cleanup verified succeeded — a
@@ -890,7 +905,7 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
     };
     let mut body = HashMap::new();
     body.insert("status".into(), json_str(status));
-    body.insert("plan".into(), json_str(plan.label));
+    body.insert("plan".into(), json_str(plan.label()));
     let ev = Event::new(EventKind::CiCheck, "pr", id, &actor, body);
     // Record the outcome — a failing plan still appends a `failure` CI Check
     // (VAL-002) before the command exits nonzero.
@@ -911,10 +926,12 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
     append.map_err(|e| format!("CI run completed but recording the CI Check failed: {e}"))?;
 
     if run.status == Some(0) && !run.timed_out {
-        Ok(format!("CI run for PR #{id} passed ({})", plan.label))
+        Ok(format!("CI run for PR #{id} passed ({})", plan.label()))
     } else {
         let detail = if run.timed_out {
             ": timed out".to_string()
+        } else if let Some(d) = run.detail {
+            format!(": {d}")
         } else {
             run.status
                 .map(|c| format!(": exited with status {c}"))
@@ -922,7 +939,7 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
         };
         Err(format!(
             "CI run for PR #{id} failed ({}){detail}",
-            plan.label
+            plan.label()
         ))
     }
 }

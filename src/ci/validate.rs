@@ -17,6 +17,14 @@ fn is_escape_at(bytes: &[u8], i: usize) -> bool {
     count % 2 == 1
 }
 
+/// True if the byte at `i` CLOSES an open quote of type `q`. Just single-quoted
+/// strings are RAW: a `\` never escapes the closing `'`, so a single quote ALWAYS
+/// closes; double-quoted strings honor backslash parity (a `\` escapes the closing
+/// `"`). Single source of truth for the quote rule shared by every scanner here.
+fn closes_quote(bytes: &[u8], i: usize, q: u8) -> bool {
+    bytes[i] == q && (q == b'\'' || !is_escape_at(bytes, i))
+}
+
 fn find_unquoted_colon(line: &str) -> Option<usize> {
     let bytes = line.as_bytes();
     let mut i = 0;
@@ -24,10 +32,7 @@ fn find_unquoted_colon(line: &str) -> Option<usize> {
     while i < bytes.len() {
         let c = bytes[i];
         if let Some(q) = quote {
-            // Just single-quoted strings are RAW: a `\` does not escape the closing
-            // `'`, so a single quote ALWAYS closes. Backslash parity applies only to
-            // `"` (which DOES honor `\`).
-            if c == q && (q == b'\'' || !is_escape_at(bytes, i)) {
+            if closes_quote(bytes, i, q) {
                 quote = None;
             }
         } else if c == b'\'' || c == b'"' {
@@ -152,7 +157,7 @@ fn split_top_level_commas(s: &str) -> Vec<&str> {
     while i < b.len() {
         let c = b[i];
         if let Some(q) = quote {
-            if c == q && !is_escape_at(b, i) {
+            if closes_quote(b, i, q) {
                 quote = None;
             }
         } else if c == b'\'' || c == b'"' {
@@ -332,10 +337,7 @@ fn without_comment(line: &str) -> &str {
     while i < bytes.len() {
         let c = bytes[i];
         if let Some(q) = quote {
-            // Just single-quoted strings are RAW: a `\` does not escape the closing
-            // `'`, so a single quote ALWAYS closes. Backslash parity applies only to
-            // `"` (which DOES honor `\`).
-            if c == q && (q == b'\'' || !is_escape_at(bytes, i)) {
+            if closes_quote(bytes, i, q) {
                 quote = None;
             }
         } else if c == b'\'' || c == b'"' {

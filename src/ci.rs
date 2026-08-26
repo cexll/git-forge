@@ -3,16 +3,30 @@
 //! termination. Split out of `git.rs` so the general git adapter stays within
 //! the size gate while the security-sensitive CI runner is isolated.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::time::Duration;
 
-/// The immutable-snapshot CI plan to execute (F-001/F-012). `label` is the
-/// persisted plan name (`.forge/ci.sh` or `just check`); `justfile` is the
-/// snapshot justfile path (relative to the worktree root) for `just --justfile`
-/// when the label is the fallback.
-pub(crate) struct CiPlan {
-    pub(crate) label: &'static str,
-    pub(crate) justfile: Option<PathBuf>,
+/// The immutable-snapshot CI plan to execute (F-001/F-012). The variant is
+/// the persisted plan name (`.forge/ci.sh` or `just check`); `JustCheck`
+/// carries the snapshot justfile path relative to the worktree root
+/// (`justfile` / `Justfile` / `.justfile`) for `just --justfile`.
+pub(crate) enum CiPlan {
+    /// `.forge/ci.sh` from the immutable snapshot.
+    CiSh,
+    /// The `just check` fallback over a snapshot justfile (its relative name:
+    /// `justfile` / `Justfile` / `.justfile`).
+    JustCheck(&'static str),
+}
+
+impl CiPlan {
+    /// The persisted plan label (`.forge/ci.sh` or `just check`) recorded in the
+    /// ci.check event body and shown in CLI output (F-001/F-012).
+    pub(crate) fn label(&self) -> &'static str {
+        match self {
+            CiPlan::CiSh => ".forge/ci.sh",
+            CiPlan::JustCheck(_) => "just check",
+        }
+    }
 }
 
 /// Outcome of a bounded CI plan run (F-002/F-015): the exit status (None when
@@ -23,6 +37,11 @@ pub(crate) struct CiPlan {
 pub(crate) struct CiRun {
     pub(crate) status: Option<i32>,
     pub(crate) timed_out: bool,
+    /// Why a non-green run is not green when it is neither a plain non-zero exit
+    /// nor a deadline timeout (F-015): a surviving background descendant or an
+    /// unprovable group probe. Drives the user-facing reason so a
+    /// descendant-survival failure is not mislabeled "timed out".
+    pub(crate) detail: Option<&'static str>,
 }
 
 /// Bound and validate the configured CI deadline (F-011): an extreme
@@ -58,10 +77,7 @@ pub(crate) fn snapshot_ci_plan(repo: &git2::Repository, oid: git2::Oid) -> Resul
                     Err(_) => continue,
                     Ok(e) => match e.filemode() {
                         0o100644 | 0o100755 | 0o100664 => {
-                            return Ok(CiPlan {
-                                label: "just check",
-                                justfile: Some(PathBuf::from(name)),
-                            });
+                            return Ok(CiPlan::JustCheck(name));
                         }
                         0o120000 => {
                             return Err(format!("refusing {name}: symlink (F-012)"));
@@ -75,10 +91,7 @@ pub(crate) fn snapshot_ci_plan(repo: &git2::Repository, oid: git2::Oid) -> Resul
             Err("no justfile in PR snapshot for the `just check` fallback (F-012)".to_string())
         }
         Ok(e) => match e.filemode() {
-            0o100644 | 0o100755 | 0o100664 => Ok(CiPlan {
-                label: ".forge/ci.sh",
-                justfile: None,
-            }),
+            0o100644 | 0o100755 | 0o100664 => Ok(CiPlan::CiSh),
             0o120000 => Err("refusing .forge/ci.sh: symlink (F-001)".to_string()),
             _ => Err("refusing .forge/ci.sh: not a regular file (F-001)".to_string()),
         },
@@ -95,14 +108,9 @@ fn materialize_plan(
     worktree: &Path,
     plan: &CiPlan,
 ) -> Result<(), String> {
-    let rel = match plan.label {
-        ".forge/ci.sh" => ".forge/ci.sh",
-        "just check" => plan
-            .justfile
-            .as_ref()
-            .map(|p| p.to_str().unwrap_or("justfile"))
-            .unwrap_or("justfile"),
-        other => return Err(format!("unknown CI plan '{other}'")),
+    let rel: &str = match plan {
+        CiPlan::CiSh => ".forge/ci.sh",
+        CiPlan::JustCheck(name) => name,
     };
     let commit = repo
         .find_commit(oid)
@@ -119,7 +127,7 @@ fn materialize_plan(
         std::fs::create_dir_all(parent)
             .map_err(|e| format!("cannot create plan directory: {e}"))?;
     }
-    if plan.label == "just check" {
+    if matches!(plan, CiPlan::JustCheck(_)) {
         // F-012/F-013: a `just check` fallback must be a SELF-CONTAINED
         // justfile — `set fallback` and any `import`/`mod` source directive are
         // refused below, so the only source `just --justfile` reads is this
@@ -158,86 +166,58 @@ fn materialize_plan(
 mod validate;
 
 /// Signal the process group `pgid` (a child that leads its own group) with
-/// `sig` via a TRUSTED absolute `/bin/kill` (F-024): a PATH shim must not be
-/// able to no-op termination, and `--` is passed so negative-pgid parsing is
-/// portable. Returns an error carrying stderr on failure.
-fn signal_pg(pgid: i32, sig: &str) -> Result<(), String> {
-    let mut cmd = std::process::Command::new("/bin/kill");
-    cmd.arg("-s")
-        .arg(sig)
-        .arg("--")
-        .arg(format!("-{pgid}"))
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
-    tighten_kill_env(&mut cmd);
-    let out = cmd.output();
-    match out {
-        Ok(o) if o.status.success() => Ok(()),
-        Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
-        Err(e) => Err(format!("failed to spawn /bin/kill: {e}")),
+/// `sig` via a DIRECT `kill(2)` syscall (F-024/F-015): no subprocess means no
+/// fork+exec latency window, so the reap-to-signal gap is a single instruction
+/// and a reaped leader's pid cannot realistically be recycled into an unrelated
+/// group in time (the window is minimized, not eliminated — a documented
+/// containment residual). It also removes the `/bin/kill` spawn-failure mode
+/// and the locale-fragile stderr parse.
+fn signal_pg(pgid: i32, sig: i32) -> Result<(), String> {
+    // Safety: `pgid` is the child's process-group id and `sig` a valid signal
+    // number; `kill(2)` is always safe to call.
+    let rc = unsafe { libc::kill(-pgid, sig) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(format!(
+            "kill -{pgid} signal {sig} failed: {}",
+            std::io::Error::last_os_error()
+        ))
     }
 }
 
-/// True if any process in the group `pgid` is still alive (kill(-pgid, 0)
-/// probe via trusted `/bin/kill`), OR an error if the group's liveness CANNOT
-/// be proven (a spawn failure, or an unexpected exit code). Used by F-015 to
-/// prove the process group is empty before a leader-exit is treated as a
-/// completed run: an unprovable probe must FAIL the run, never assume the
-/// group is empty (a descendant could still be alive).
+/// True if any process in the group `pgid` is still alive (a direct
+/// `kill(-pgid, 0)` syscall), OR an error if the group's liveness CANNOT be
+/// proven (an unexpected errno). Used by F-015 to prove the process group is
+/// empty before a leader-exit is treated as a completed run: an unprovable
+/// probe must FAIL the run, never assume the group is empty (a descendant
+/// could still be alive). The direct syscall keeps the probe-to-KILL window
+/// at nanoseconds, so a reaped leader's pid cannot realistically be recycled
+/// between the probe and the signal.
 fn pgid_alive(pgid: i32) -> Result<bool, String> {
-    let mut cmd = std::process::Command::new("/bin/kill");
-    cmd.arg("-0")
-        .arg("--")
-        .arg(format!("-{pgid}"))
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped());
-    tighten_kill_env(&mut cmd);
-    let out = cmd.output();
-    match out {
-        Ok(o) if o.status.success() => Ok(true),
-        // `kill(2)` returns ESRCH for an empty group and EPERM for an EXISTING
-        // but unsignalable group — both surface as a non-zero exit, so read the
-        // diagnostic to distinguish them: only ESRCH ("No such process") proves
-        // the group is empty; EPERM/anything else is "cannot prove empty" and
-        // fails closed.
-        Ok(o) => {
-            let err = String::from_utf8_lossy(&o.stderr).to_string();
-            if err.contains("No such process") || err.contains("no such process") {
-                Ok(false)
-            } else {
-                Err(format!(
-                    "kill -0 -{pgid} failed (cannot prove the group is empty): {err}"
-                ))
-            }
-        }
-        Err(e) => Err(format!("failed to spawn /bin/kill: {e}")),
+    // Safety: `pgid` is the child's process-group id; signal 0 is a pure
+    // liveness probe and `kill(2)` is always safe to call.
+    let rc = unsafe { libc::kill(-pgid, 0) };
+    if rc == 0 {
+        return Ok(true);
     }
-}
-
-/// F-027: remove the caller-env vectors that could redirect or fake the
-/// snapshot plan in a subprocess. `BASH_ENV`/`ENV` and the Bash exported
-/// functions (`BASH_FUNC_*%%`) can inject statements that exit before the
-/// plan's failing line; the Git location overrides (`GIT_DIR`,
-/// `GIT_WORK_TREE`, `GIT_INDEX_FILE`, `GIT_OBJECT_DIRECTORY`,
-/// `GIT_ALTERNATE_OBJECT_DIRECTORIES` and the Git config knobs) redirect a
-/// plan `git` to a different repository/worktree/index; `CDPATH`/`IFS`/`SHELL`
-/// alter path/word splitting. The plan interpreter is invoked by absolute path
-/// (`/bin/bash` for `.forge/ci.sh`, a trusted absolute path for `just`) so a
-/// `PATH` shim cannot replace it.
-/// Sanitize a `/bin/kill` Command (F-027): a caller loader constructor
-/// (`LD_PRELOAD`/`LD_TRACE_LOADED_OBJECTS`, …) could otherwise make `kill` exit
-/// 0 without signalling, so the deadline path hangs or the leader-exit branch
-/// leaks a descendant. Also forces `LC_ALL=C` so the `kill -0` ESRCH diagnostic
-/// is the stable English "No such process" (locale-independent).
-fn tighten_kill_env(cmd: &mut std::process::Command) {
-    sanitize_loader_env(cmd);
-    cmd.env("LC_ALL", "C");
+    // `kill(2)` returns ESRCH for an empty group and EPERM for an EXISTING
+    // but unsignalable group — read errno to distinguish them: only ESRCH
+    // proves the group is empty; EPERM/anything else is "cannot prove empty"
+    // and fails closed.
+    let err = std::io::Error::last_os_error();
+    match err.raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        _ => Err(format!(
+            "kill -0 -{pgid} failed (cannot prove the group is empty): {err}"
+        )),
+    }
 }
 
 /// Remove the dynamic-loader injection variables (`LD_*`/`DYLD_*`) from a
 /// Command: a caller-supplied constructor can otherwise run before the trusted
-/// program and exit 0 or alter its behavior. Shared by the plan interpreter,
-/// `/bin/kill`, and the CI lifecycle `git` (F-027).
+/// program and exit 0 or alter its behavior. Shared by the plan interpreter
+/// and the CI lifecycle `git` (F-027).
 pub(crate) fn sanitize_loader_env(cmd: &mut std::process::Command) {
     for var in [
         "LD_PRELOAD",
@@ -332,10 +312,10 @@ fn tighten_ci_env(cmd: &mut std::process::Command) {
 /// tool there is no separate-principal boundary to cross. An install not found
 /// is a spawn failure (honest), never a caller-resolved binary.
 fn resolve_just() -> Result<std::path::PathBuf, String> {
-    // ONLY system install locations: a caller cannot influence the result
-    // through `PATH`, `HOME`, or any other environment value. An install not
-    // at one of these is a spawn failure (honest), never a caller-resolved
-    // binary.
+    // Phase 1 — system install locations (this probe reads no caller env). If
+    // no runnable `just` is found here, fall through to the operator's own
+    // `~/.cargo/bin` / `~/.local/bin` below. An install found nowhere is a
+    // spawn failure (honest), never a caller-resolved `PATH` binary.
     for d in ["/usr/bin", "/usr/local/bin", "/opt/homebrew/bin"] {
         let p = std::path::PathBuf::from(d).join("just");
         if p.is_file()
@@ -386,8 +366,9 @@ fn resolve_just() -> Result<std::path::PathBuf, String> {
 /// so a high-volume plan cannot grow git-forge's heap. The wait is bounded
 /// (`timeout`); on expiry (F-015) the WHOLE process group is killed and reaped
 /// (not just the direct child), so a background descendant whose leader exits
-/// cannot survive the deadline. Returns the exit status and whether the
-/// deadline was hit (F-002/F-015).
+/// cannot survive the deadline. Returns the exit status, whether the deadline
+/// was hit (F-002/F-015), and a `detail` reason for non-green runs that are
+/// neither a plain non-zero exit nor a timeout.
 ///
 /// KNOWN LIMITATION: a descendant that creates its own new session/process
 /// group (e.g. a plan that `setsid`s a long-lived job) leaves the original
@@ -398,9 +379,10 @@ fn resolve_just() -> Result<std::path::PathBuf, String> {
 /// requires OS-level isolation (container/chroot), which is out of scope for
 /// this single-user local tool.
 ///
-/// Related residual: if the group-KILL itself fails (e.g. under process-quota
-/// exhaustion the trusted `/bin/kill` cannot spawn), a same-group descendant
-/// is not terminated. The run is always recorded FAILED (never green) in that
+/// Related residual: if the group-KILL itself fails (e.g. EPERM from a
+/// process-quota restriction on the direct `kill(2)` syscall), a same-group
+/// descendant is not terminated. The run is always recorded FAILED (never
+/// green) in that
 /// case — the leader-exit path only returns success when the group is PROVEN
 /// empty — but the descendant may survive. This is fail-closed, not a false
 /// green; fully bounding it needs the same OS-level containment.
@@ -418,16 +400,13 @@ pub(crate) fn run_ci_plan(
         return CiRun {
             status: None,
             timed_out: false,
+            detail: None,
         };
     }
-    let (prog, jf_arg): (std::path::PathBuf, Option<std::path::PathBuf>) = match plan.label {
-        ".forge/ci.sh" => (std::path::PathBuf::from("/bin/bash"), None),
-        "just check" => {
-            let jf = plan
-                .justfile
-                .as_ref()
-                .map(|p| worktree.join(p))
-                .unwrap_or_else(|| worktree.join("justfile"));
+    let (prog, jf_arg): (std::path::PathBuf, Option<std::path::PathBuf>) = match plan {
+        CiPlan::CiSh => (std::path::PathBuf::from("/bin/bash"), None),
+        CiPlan::JustCheck(name) => {
+            let jf = worktree.join(name);
             // F-027: resolve `just` to a TRUSTED ABSOLUTE path so a caller
             // cannot prepend a `just` shim to `PATH` and fake a green Check.
             let just = match resolve_just() {
@@ -439,12 +418,12 @@ pub(crate) fn run_ci_plan(
                     return CiRun {
                         status: None,
                         timed_out: false,
+                        detail: None,
                     };
                 }
             };
             (just, Some(jf))
         }
-        _ => (std::path::PathBuf::from("/bin/bash"), None),
     };
     let mut cmd = std::process::Command::new(&prog);
     // F-027: Just's default recipe shell is `sh` resolved through PATH; a PATH
@@ -483,6 +462,7 @@ pub(crate) fn run_ci_plan(
             return CiRun {
                 status: None,
                 timed_out: false,
+                detail: None,
             };
         }
     };
@@ -505,33 +485,36 @@ pub(crate) fn run_ci_plan(
                         // Descendants are alive: kill the group and FAIL the
                         // run (a survivor that cannot be proven dead must not
                         // be recorded green).
-                        let _ = signal_pg(pgid, "KILL");
+                        let _ = signal_pg(pgid, libc::SIGKILL);
                         let _ = child.wait();
                         return CiRun {
                             status: None,
-                            timed_out: true,
+                            timed_out: false,
+                            detail: Some("left a background process running"),
                         };
                     }
                     Ok(false) => {
                         return CiRun {
                             status: st.code(),
                             timed_out: false,
+                            detail: None,
                         };
                     }
                     Err(_) => {
                         // Cannot prove the group is empty — a descendant may
                         // still be alive, so the run is NOT completed. This is
                         // NOT a deadline timeout: the leader exited on its own,
-                        // but group liveness could not be proven (a probe or
-                        // spawn failure), so the deadline-integrity label does
-                        // not apply. Fail containment: signal the group then
+                        // but group liveness could not be proven (an errno
+                        // other than ESRCH), so the deadline label does not
+                        // apply. Fail containment: signal the group then
                         // bounded-reap so a descendant is not left running while
                         // the worktree is removed.
-                        let _ = signal_pg(pgid, "KILL");
+                        let _ = signal_pg(pgid, libc::SIGKILL);
                         let _ = reap_with_grace(&mut child);
                         return CiRun {
                             status: None,
                             timed_out: false,
+                            detail: Some("could not prove the process group is empty"),
                         };
                     }
                 }
@@ -542,32 +525,34 @@ pub(crate) fn run_ci_plan(
                 // group is empty — the plan may still be running. Fail CLOSED:
                 // signal the whole group then bounded-reap, so a surviving
                 // descendant is not left running while the worktree is removed.
-                let _ = signal_pg(pgid, "KILL");
+                let _ = signal_pg(pgid, libc::SIGKILL);
                 let _ = reap_with_grace(&mut child);
                 return CiRun {
                     status: None,
                     timed_out: false,
+                    detail: Some("could not prove the process group is empty"),
                 };
             }
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    // F-015/F-024: kill+reap the COMPLETE process group via a trusted absolute
-    // kill (a PATH shim must not no-op it) so a background descendant cannot
-    // survive the bounded deadline. The kill RESULT is checked: on failure
-    // (e.g. the user's process quota is exhausted) the child may still be
-    // running, so the reap is bounded — an unbounded `child.wait()` on a live
-    // child would hang `ci run` and leave the run unrecorded.
+    // F-015/F-024: kill+reap the COMPLETE process group via a direct `kill(2)`
+    // syscall so a background descendant cannot survive the bounded deadline.
+    // The kill RESULT is checked: on failure (e.g. EPERM under a restrictive
+    // process quota) the child may still be running, so the reap is bounded —
+    // an unbounded `child.wait()` on a live child would hang `ci run` and
+    // leave the run unrecorded.
     // The kill RESULT is not a signal of completion either way: even a
     // SUCCESSFUL signal does not prove prompt termination (a child in an
     // uninterruptible kernel wait can remain unreaped), and a FAILED signal
     // (e.g. the user's process quota is exhausted) leaves the child running —
     // so the reap is bounded in both cases (never hang without a Check).
-    let _ = signal_pg(pgid, "KILL");
+    let _ = signal_pg(pgid, libc::SIGKILL);
     let status = reap_with_grace(&mut child);
     CiRun {
         status,
         timed_out: true,
+        detail: None,
     }
 }
 

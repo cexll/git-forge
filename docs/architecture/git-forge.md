@@ -50,7 +50,7 @@ event/fold: zero external dependencies (no git, no I/O)
 - `cli` is the only module that parses user input; the merge-gate predicate lives in `pr_merge`.
 - `pr_merge` owns the merge-gate predicate + merge orchestration; `cli` dispatches to it. `identity` resolves the actor/signature once per write.
 - `git` is the only module that shells out for merge execution; it does not import `cli` or `store`.
-- `ci` is the only module that executes the CI plan subprocess (`/bin/bash` for `.forge/ci.sh`, `just` for the `just check` fallback) and performs process-group signalling via `/bin/kill`; it imports git2 for plan materialization but never `core`/`store`.
+- `ci` is the only module that executes the CI plan subprocess (`/bin/bash` for `.forge/ci.sh`, `just` for the `just check` fallback) and performs process-group signalling via a direct `kill(2)` syscall (`libc`, no spawned `/bin/kill`); it imports git2 for plan materialization but never `core`/`store`.
 - `sync` (L2) will depend on `store`, `event`/`fold`, and `git`; it is not wired in L1.
 
 ## Directory Structure

@@ -4285,6 +4285,46 @@ fn ci_run_fails_when_descendant_survives_leader_exit() {
         "the Check must record failure, got: {event}"
     );
     assert_no_ci_worktree(&dir);
+    assert!(
+        !e.contains("timed out"),
+        "a descendant-survival failure is not a deadline timeout: {e}"
+    );
+    assert!(
+        e.contains("background process"),
+        "the failure must name the surviving background process: {e}"
+    );
+}
+
+#[test]
+fn ci_run_removes_worktree_when_add_fails_after_registration() {
+    // git.rs worktree_add_ci seam + cli.rs failure-path cleanup (F3 review):
+    // when the add reports failure AFTER registering the worktree, cmd_ci_run
+    // must still remove the partially-registered worktree before returning.
+    let dir = tmpdir("ci-wt-add-fail");
+    init_repo(&dir);
+    git(&dir, &["config", "user.email", "ci@example.com"]);
+    git(&dir, &["checkout", "-q", "-b", "feature"]);
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    std::fs::write(dir.join(".forge").join("ci.sh"), "#!/bin/bash\nexit 0\n").unwrap();
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    git(&dir, &["add", "."]);
+    git(&dir, &["commit", "-q", "-m", "feature with ci plan"]);
+    git(&dir, &["checkout", "-q", "main"]);
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR1",],
+        )
+        .0,
+        0
+    );
+    let (c, _o, e) = forge_with_env(
+        &dir,
+        &["forge", "ci", "run", "1"],
+        &[("GIT_FORGE_TEST_FAIL_WORKTREE_ADD", "1")],
+    );
+    assert_ne!(c, 0, "an injected add failure must fail the run: {e}");
+    assert_no_ci_worktree(&dir);
 }
 
 #[test]

@@ -284,6 +284,13 @@ pub(crate) fn worktree_add_ci(
         ],
     );
     if ok {
+        // Debug-only test seam (F3 review): the worktree is registered for real,
+        // then an add failure is reported so cmd_ci_run's failure-path cleanup is
+        // exercised. Inert in release builds and when the env var is unset.
+        #[cfg(debug_assertions)]
+        if std::env::var("GIT_FORGE_TEST_FAIL_WORKTREE_ADD").as_deref() == Ok("1") {
+            return Err("test seam: injected worktree-add failure after registration".to_string());
+        }
         Ok(())
     } else {
         Err(err)

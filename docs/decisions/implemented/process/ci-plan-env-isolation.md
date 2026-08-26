@@ -60,8 +60,8 @@ recorded and no worktree cleanup.
    green. `resolve_just()` and `resolve_git()` also PROBE the candidate
    (`--version` succeeds) before accepting it, so a stale/non-executable system
    file does not shadow a valid `~/.cargo/bin` install.
-3. **Check the group-kill result on the deadline path**: if `/bin/kill` fails
-   (e.g. EAGAIN after process-quota exhaustion), do NOT `child.wait()`
+3. **Check the group-kill result on the deadline path**: if the group kill fails
+   (e.g. EPERM under a restrictive process quota), do NOT `child.wait()`
    unbounded. Instead `reap_with_grace` polls `try_wait` for ~500 ms, then
    `child.kill()`s the direct child and reaps it, so a still-running leader is
    not leaked and the run is recorded as failed.
