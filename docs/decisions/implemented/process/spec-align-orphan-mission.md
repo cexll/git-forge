@@ -78,4 +78,22 @@ record it as **unrecoverable via the current devflow interface**:
 - Future devflow work that touches mission lifecycle (add/abandon/orphan
   recovery) should re-read this record before changing the plan-file
   requirement — a mission whose source is gone is currently a dead end.
-- The directory stays on disk, unreferenced, until a tool owner retires it.
+- The durable lesson is the devflow lifecycle gap itself: a mission whose plan
+  source is gone is a dead end for every subcommand, so mission-level
+  abandon/drop remains the wanted enhancement.
+
+## Update (2026-08-28): orphan directory no longer present
+
+As of 2026-08-28 `.specs/git-forge-spec-align/` is no longer on disk. It was
+gitignored, so its removal is not recorded in git history and must have
+happened outside both git and devflow. Consequences:
+
+- The stale `pending` copy of VAL-202 is gone with the directory; the
+  assertion remains proven under `git-forge-e2e-gate` (evidence artifacts
+  listed above). No reconciliation is needed.
+- The tool defect this record exists to document is UNCHANGED: devflow still
+  has no mission-level abandon/drop command. If another orphaned
+  `initializing`/`features_source_missing` mission appears, this record's
+  analysis still applies — recover via a devflow enhancement, not hand-edits.
+- This record stays in `implemented/` as the standing analysis of that gap;
+  the "keep the directory in place" posture above is now moot, not reversed.

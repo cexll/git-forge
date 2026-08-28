@@ -143,3 +143,7 @@ entirely (require `.forge/ci.sh`), or (b) validate via a real Just parser — we
 considered; (a) is a feature regression and (b) is disproportionate for L1, so the
 fallback stays with the reject-on-ambiguity scanner. Future scanner gaps should be
 triaged under this posture, not as cross-principal escape findings.
+
+**Maintainer decision (2026-08-28): confirmed — keep the fallback with the
+reject-on-ambiguity scanner.** Options (a) drop-the-fallback and (b) real-Just-parser
+remain rejected for L1; reopening either requires a new record.
