@@ -2,3 +2,5 @@
 .DS_Store
 # Python bytecode cache from the repo's tracked gate scripts (scripts/*.py)
 __pycache__/
+# devflow plans/validation state — local-only, never committed or pushed
+/.specs/

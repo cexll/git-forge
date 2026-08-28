@@ -83,7 +83,7 @@ git-forge/
 │   ├── git.rs            # git binary adapter: merge-execution shell-outs (worktree, strategies, cleanup, merge-base)
 │   └── store.rs          # refs read/write via git2
 ├── tests/                # t0_core, t1a_store, t1b_issue, t2_pr, t3_merge
-└── .specs/git-forge/     # plan + validation contract (committed); missions/ is gitignored
+└── .specs/               # local devflow plans + validation evidence (untracked — gitignored, never committed)
 ```
 
 ### Module boundaries
