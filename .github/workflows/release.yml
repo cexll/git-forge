@@ -1,0 +1,88 @@
+name: release
+
+# Tag-driven: pushing v* builds release tarballs and creates the GitHub Release.
+# Matrix is native-only (no cross): GitHub's intel macOS runners are paid
+# -large labels (macos-26-intel etc.) and cross-building x86_64-apple-darwin on
+# arm64 hits per-arch openssl, so Intel macOS builds from source instead.
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+    runs-on: ${{ matrix.os }}
+    env:
+      RUSTUP_TOOLCHAIN: "1.93.0" # canonical toolchain per AGENTS.md stack table
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev
+
+      - name: Install pinned Rust toolchain
+        run: rustup toolchain install "${RUSTUP_TOOLCHAIN}" --profile minimal
+
+      - name: Tag must match Cargo.toml version
+        run: |
+          tag="${GITHUB_REF_NAME#v}"
+          ver=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          if [ -z "$ver" ] || [ "$tag" != "$ver" ]; then
+            echo "tag ${GITHUB_REF_NAME} does not match Cargo.toml version '${ver}'" >&2
+            exit 1
+          fi
+
+      - name: Build release binary
+        run: cargo build --release --locked
+
+      - name: Package tarball
+        run: |
+          pkg="git-forge-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          mkdir -p "$pkg" dist
+          cp "target/release/git-forge" "$pkg/git-forge"
+          strip "$pkg/git-forge" || true
+          ln -s git-forge "$pkg/git-issue"
+          ln -s git-forge "$pkg/git-pr"
+          tar czf "dist/${pkg}.tar.gz" "$pkg"
+          rm -rf "$pkg"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: create release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dist-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: sha256sum *.tar.gz > SHA256SUMS.txt
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create "${GITHUB_REF_NAME}" --title "git-forge ${GITHUB_REF_NAME}" --generate-notes dist/*.tar.gz dist/SHA256SUMS.txt

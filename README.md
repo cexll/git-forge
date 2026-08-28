@@ -25,6 +25,16 @@ repository. Forge-state sync/refspec wiring across clones is L2.
 
 ## Install
 
+Prebuilt binaries are attached to each GitHub Release (tagged `v*`, built by
+`.github/workflows/release.yml`) for `aarch64-apple-darwin` and
+`x86_64-unknown-linux-gnu` (Intel macOS is not prebuilt — GitHub's intel
+runners are paid larger-runner labels; build from source instead). Each
+`git-forge-<tag>-<target>.tar.gz` contains the `git-forge` binary plus
+relative `git-issue`/`git-pr` symlinks; `SHA256SUMS.txt` covers every tarball.
+Unpack onto a PATH dir (e.g. `~/.local/bin`) and `git forge ...` dispatches.
+
+Or build from source:
+
 ```sh
 # Build and install `git-forge` itself so `git forge ...` dispatches.
 # Cargo installs into ~/.cargo/bin by default (already on your PATH when
