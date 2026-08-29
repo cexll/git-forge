@@ -27,7 +27,7 @@ Requests tabs stay unused. A web view is deferred L2 roadmap.
   regular `.forge/ci.sh` runs; the `just check` fallback runs only when
   `.forge/ci.sh` is absent; a present symlink or other non-regular entry is
   refused up front without appending a Check result.
-- **Merge strategies**:  **Merge strategies**: `--merge` (default, merge commit), `--squash`
+- **Merge strategies**: `--merge` (default, merge commit), `--squash`
   (single commit), `--rebase` (linear replay onto the base tip).
 - All state in git refs (`refs/forge/*`); no daemon, no second protocol.
 
