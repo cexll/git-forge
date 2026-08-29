@@ -640,7 +640,7 @@ fn maybe_run_test_retry_barrier() -> Result<(), String> {
     run_test_barrier("GIT_FORGE_TEST_MERGE_RETRY_BARRIER")
 }
 
-fn pr_merge_help() -> String {
+pub(crate) fn pr_merge_help() -> String {
     "usage: git forge pr merge [<n>] [--merge|--squash|--rebase]\n\
      \x20 default / --merge: merge commit (--no-ff --no-edit)\n\
      \x20 --squash: single squashed commit\n\

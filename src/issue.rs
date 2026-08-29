@@ -7,7 +7,8 @@
 use std::collections::HashMap;
 
 use crate::cli::{
-    body_obj, json_str, open_store, parse_entity_id, sanitize_terminal, store_has_ref,
+    body_obj, help_requested, json_str, open_store, parse_entity_id, sanitize_terminal,
+    store_has_ref,
 };
 use crate::event::{Event, EventKind, JsonValue};
 use crate::identity::open_mutation_store;
@@ -28,6 +29,7 @@ fn issue_event(kind: EventKind, id: u64, actor: &str, body: HashMap<String, Json
 
 /// `git forge issue new <title> [description]`
 fn cmd_new(args: &[String]) -> Result<String, String> {
+    const USAGE: &str = "usage: git forge issue new <title> [description] [--label <x>]...";
     // Pure argument validation first — a usage error must not be masked by a
     // later config-open failure (error precedence, F-028). Supports
     // `--label <x>` (repeatable) alongside the positional `<title> [description]`.
@@ -59,19 +61,13 @@ fn cmd_new(args: &[String]) -> Result<String, String> {
         i += 1;
     }
     if positional.is_empty() || positional[0].trim().is_empty() {
-        return Err(
-            "usage: git forge issue new <title> [description] [--label <x>]... — title is required and non-empty"
-                .into(),
-        );
+        return Err(format!("{USAGE} — title is required and non-empty"));
     }
     if positional.len() > 2 {
         // Documented grammar is `<title> [description]`; a third value after
         // `--` (or an over-long positional list) would otherwise be silently
         // discarded.
-        return Err(
-            "usage: git forge issue new <title> [description] [--label <x>]... — too many positional arguments"
-                .into(),
-        );
+        return Err(format!("{USAGE} — too many positional arguments"));
     }
     let title = positional[0].trim().to_string();
     let description = positional
@@ -168,8 +164,9 @@ fn cmd_show(store: &EventStore, args: &[String]) -> Result<String, String> {
 
 /// `git forge issue comment <n> <body>`
 fn cmd_comment(args: &[String]) -> Result<String, String> {
+    const USAGE: &str = "usage: git forge issue comment <n> <body>";
     if args.len() < 2 {
-        return Err("usage: git forge issue comment <n> <body>".into());
+        return Err(USAGE.into());
     }
     let id = parse_entity_id(&args[0])?;
     let body = args[1..].join(" ").trim().to_string();
@@ -212,6 +209,13 @@ fn cmd_state(kind: EventKind, args: &[String]) -> Result<String, String> {
 /// Dispatch a `git forge issue` subcommand. `argv` excludes the `issue` token.
 pub fn run_issue(argv: &[String]) -> Result<String, String> {
     let sub = argv.first().map(|s| s.as_str()).unwrap_or("");
+    // Subcommand-level `-h`/`--help` is answered HERE, before any store open,
+    // so help works outside a git repository (same as the namespace helps).
+    if help_requested(argv.get(1..).unwrap_or(&[])) {
+        if let Some(usage) = issue_sub_usage(sub) {
+            return Ok(usage.into());
+        }
+    }
     match sub {
         "new" => cmd_new(&argv[1..]),
         "list" => cmd_list(&open_store()?),
@@ -229,6 +233,18 @@ pub fn run_issue(argv: &[String]) -> Result<String, String> {
         "" => Ok(issue_help()),
         other => Err(format!("unknown issue subcommand '{other}'")),
     }
+}
+
+fn issue_sub_usage(sub: &str) -> Option<&'static str> {
+    Some(match sub {
+        "new" => "usage: git forge issue new <title> [description] [--label <x>]...",
+        "list" => "usage: git forge issue list",
+        "show" => "usage: git forge issue show <n>",
+        "comment" => "usage: git forge issue comment <n> <body>",
+        "close" => "usage: git forge issue close <n>",
+        "reopen" => "usage: git forge issue reopen <n>",
+        _ => return None,
+    })
 }
 
 fn issue_help() -> String {

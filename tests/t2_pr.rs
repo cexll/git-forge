@@ -975,6 +975,39 @@ fn pr_help_lists_every_subcommand() {
 }
 
 #[test]
+fn pr_subcommand_help_flags() {
+    // Every pr subcommand honors `-h`/`--help` with a success-exit usage print
+    // (the `pr merge` convention), instead of the flag falling into entity-id
+    // parsing or "unknown option". Help must work outside a repo: no init_repo.
+    let dir = tmpdir("psubhelp");
+    for (args, usage) in [
+        ("create", "usage: git forge pr create --source"),
+        ("list", "usage: git forge pr list"),
+        ("show", "usage: git forge pr show <n>"),
+        ("comment", "usage: git forge pr comment <n> <body>"),
+        (
+            "review",
+            "usage: git forge pr review <n> --approve|--reject",
+        ),
+        ("diff", "usage: git forge pr diff <n>"),
+    ] {
+        for flag in ["--help", "-h"] {
+            let (c, o, e) = forge(&dir, &["forge", "pr", args, flag]);
+            assert_eq!(c, 0, "pr {args} {flag} failed: {e}");
+            assert!(o.contains(usage), "pr {args} {flag}: {o}");
+        }
+    }
+    // help in the flag loop (any position), same as `pr merge`.
+    let (c, o, e) = forge(&dir, &["forge", "pr", "review", "1", "--help"]);
+    assert_eq!(c, 0, "pr review 1 --help failed: {e}");
+    assert!(o.contains("usage: git forge pr review"), "review help: {o}");
+    // `merge` keeps its own help text in pr_merge — also reachable repo-free.
+    let (c, o, e) = forge(&dir, &["forge", "pr", "merge", "--help"]);
+    assert_eq!(c, 0, "pr merge --help failed: {e}");
+    assert!(o.contains("usage: git forge pr merge"), "merge help: {o}");
+}
+
+#[test]
 fn pr_create_supports_body_and_labels() {
     // `pr create --source <b> --base <b> <title> --body <text> --label <x>...`
     // stores a description and labels; `pr show` renders both.
@@ -2499,6 +2532,20 @@ fn ci_help_lists_run_subcommand() {
     assert_eq!(c, 0, "ci --help failed: {e}");
     assert!(o.contains("usage: git forge ci"), "help head: {o}");
     assert!(o.contains("run"), "help missing 'run': {o}");
+}
+
+#[test]
+fn ci_run_help_flag() {
+    // `ci run --help` prints the run usage with success, outside any repo.
+    let dir = tmpdir("cirunhelp");
+    for flag in ["--help", "-h"] {
+        let (c, o, e) = forge(&dir, &["forge", "ci", "run", flag]);
+        assert_eq!(c, 0, "ci run {flag} failed: {e}");
+        assert!(
+            o.contains("usage: git forge ci run <pr>"),
+            "ci run help: {o}"
+        );
+    }
 }
 
 /// VAL-004: `pr create` records a pending CI Check marker (fast, non-destructive,

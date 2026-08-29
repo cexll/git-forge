@@ -22,6 +22,17 @@ pub(crate) fn parse_entity_id(s: &str) -> Result<u64, String> {
     Ok(n)
 }
 
+/// True when the first argument is `-h`/`--help`: a leading help flag prints
+/// the subcommand's usage with a success exit — the convention set by
+/// `pr merge`. Without this the flag fell into entity-id parsing
+/// ("invalid entity id '--help'") or, for `issue new`, became an issue title.
+pub(crate) fn help_requested(args: &[String]) -> bool {
+    matches!(
+        args.first().map(String::as_str),
+        Some("-h") | Some("--help")
+    )
+}
+
 pub(crate) fn json_str(value: &str) -> JsonValue {
     JsonValue::String(value.to_string())
 }
@@ -114,6 +125,10 @@ fn resolve_local_branch(store: &EventStore, arg: &str) -> Result<(String, git2::
 
 /// `git forge pr create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]...`
 fn cmd_pr_create(args: &[String]) -> Result<String, String> {
+    const USAGE: &str = "usage: git forge pr create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]...";
+    if help_requested(args) {
+        return Ok(USAGE.into());
+    }
     let mut source = None;
     let mut base = None;
     let mut title = None;
@@ -165,6 +180,7 @@ fn cmd_pr_create(args: &[String]) -> Result<String, String> {
                 }
                 labels.push(v);
             }
+            "-h" | "--help" => return Ok(USAGE.into()),
             a if a.starts_with("--") || a.starts_with('-') => {
                 return Err(format!("unknown option '{a}'"));
             }
@@ -313,8 +329,9 @@ fn cmd_pr_list(store: &EventStore) -> Result<String, String> {
 
 /// `git forge pr comment <n> <body>`
 fn cmd_pr_comment(args: &[String]) -> Result<String, String> {
+    const USAGE: &str = "usage: git forge pr comment <n> <body>";
     if args.len() < 2 {
-        return Err("usage: git forge pr comment <n> <body>".into());
+        return Err(USAGE.into());
     }
     let id = parse_entity_id(&args[0])?;
     let body = args[1..].join(" ").trim().to_string();
@@ -339,6 +356,8 @@ fn cmd_pr_comment(args: &[String]) -> Result<String, String> {
 
 /// `git forge pr review <n> --approve|--reject [--file <f> --line <l> --commit <c>]`
 fn cmd_pr_review(args: &[String]) -> Result<String, String> {
+    const USAGE: &str =
+        "usage: git forge pr review <n> --approve|--reject [--file <f> --line <l> --commit <c>]";
     let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
     let mut decision = None;
     let mut file = None;
@@ -359,13 +378,13 @@ fn cmd_pr_review(args: &[String]) -> Result<String, String> {
             "--file" => file = Some(next_arg(&mut i, "--file requires a path")?),
             "--line" => line = Some(next_arg(&mut i, "--line requires a number")?),
             "--commit" => commit = Some(next_arg(&mut i, "--commit requires a hash")?),
+            "-h" | "--help" => return Ok(USAGE.into()),
             a if a.starts_with('-') => return Err(format!("unknown option '{a}'")),
             _ => {}
         }
         i += 1;
     }
-    let decision = decision
-        .ok_or_else(|| String::from("usage: git forge pr review <n> --approve|--reject"))?;
+    let decision = decision.ok_or_else(|| USAGE.to_string())?;
     let (store, actor) = open_mutation_store()?;
     let r = crate::store::pr_head_ref(id);
     if !store_has_ref(store.store(), &r) {
@@ -482,6 +501,16 @@ fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String, String> {
 /// Dispatch a `git forge pr` subcommand. `argv` excludes the `pr` token.
 pub fn run_pr(argv: &[String]) -> Result<String, String> {
     let sub = argv.first().map(|s| s.as_str()).unwrap_or("");
+    // Subcommand-level `-h`/`--help` is answered HERE, before any store open,
+    // so help works outside a git repository (same as the namespace helps).
+    if help_requested(argv.get(1..).unwrap_or(&[])) {
+        if sub == "merge" {
+            return Ok(crate::pr_merge::pr_merge_help());
+        }
+        if let Some(usage) = pr_sub_usage(sub) {
+            return Ok(usage.into());
+        }
+    }
     match sub {
         "create" => cmd_pr_create(&argv[1..]),
         "list" => cmd_pr_list(&open_store()?),
@@ -494,6 +523,18 @@ pub fn run_pr(argv: &[String]) -> Result<String, String> {
         "" => Ok(pr_help()),
         other => Err(format!("unknown pr subcommand '{other}'")),
     }
+}
+
+fn pr_sub_usage(sub: &str) -> Option<&'static str> {
+    Some(match sub {
+        "create" => "usage: git forge pr create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]...",
+        "list" => "usage: git forge pr list",
+        "show" => "usage: git forge pr show <n>",
+        "comment" => "usage: git forge pr comment <n> <body>",
+        "review" => "usage: git forge pr review <n> --approve|--reject [--file <f> --line <l> --commit <c>]",
+        "diff" => "usage: git forge pr diff <n>",
+        _ => return None,
+    })
 }
 
 fn pr_help() -> String {
@@ -715,6 +756,9 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
 /// Dispatch a `git forge ci` subcommand. `argv` excludes the `ci` token.
 pub fn run_ci(argv: &[String]) -> Result<String, String> {
     let sub = argv.first().map(|s| s.as_str()).unwrap_or("");
+    if help_requested(argv.get(1..).unwrap_or(&[])) && sub == "run" {
+        return Ok("usage: git forge ci run <pr>".into());
+    }
     match sub {
         "run" => cmd_ci_run(&argv[1..]),
         "help" | "-h" | "--help" => Ok(ci_help()),

@@ -645,6 +645,41 @@ fn issue_help_lists_every_subcommand() {
 }
 
 #[test]
+fn issue_subcommand_help_flags() {
+    // Every issue subcommand honors a leading `-h`/`--help` with a
+    // success-exit usage print (the `pr merge` convention), instead of the
+    // flag falling into entity-id parsing ("invalid entity id '--help'") or —
+    // for `new` — becoming an issue TITLE. Help must work outside a repo, so
+    // no init_repo here.
+    let dir = tmpdir("isubhelp");
+    for (args, usage) in [
+        ("new", "usage: git forge issue new"),
+        ("list", "usage: git forge issue list"),
+        ("show", "usage: git forge issue show <n>"),
+        ("comment", "usage: git forge issue comment <n> <body>"),
+        ("close", "usage: git forge issue close <n>"),
+        ("reopen", "usage: git forge issue reopen <n>"),
+    ] {
+        for flag in ["--help", "-h"] {
+            let (c, o, e) = forge(&dir, &["forge", "issue", args, flag]);
+            assert_eq!(c, 0, "issue {args} {flag} failed: {e}");
+            assert!(o.contains(usage), "issue {args} {flag}: {o}");
+        }
+    }
+    // Regression: inside a repo, `issue new --help` still prints usage and must
+    // not create an issue titled --help.
+    init_repo(&dir);
+    let (c, _o, e) = forge(&dir, &["forge", "issue", "new", "--help"]);
+    assert_eq!(c, 0, "issue new --help in repo failed: {e}");
+    let (c, o, _) = forge(&dir, &["forge", "issue", "list"]);
+    assert_eq!(c, 0, "issue list failed");
+    assert!(
+        !o.contains("--help"),
+        "help flag must not create an issue: {o}"
+    );
+}
+
+#[test]
 fn top_level_dispatch_unknown_and_forge_direct() {
     // main.rs dispatch: unknown top-level command errors; the direct
     // `forge forge` form dispatches help and rejects unknown forge subcommands.
