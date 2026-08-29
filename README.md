@@ -25,13 +25,23 @@ repository. Forge-state sync/refspec wiring across clones is L2.
 
 ## Install
 
-Prebuilt binaries are attached to each GitHub Release (tagged `v*`, built by
-`.github/workflows/release.yml`) for `aarch64-apple-darwin` and
+Quick install — downloads the latest prebuilt release, verifies its SHA-256
+against the release's `SHA256SUMS.txt`, and installs into `~/.local/bin`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/cexll/git-forge/master/scripts/install.sh | sh
+```
+
+Environment overrides: `VERSION=v0.2.1` pins a release tag,
+`INSTALL_DIR=/some/path` changes the install dir (sudo is used automatically
+for non-writable dirs). Prebuilt targets: `aarch64-apple-darwin` and
 `x86_64-unknown-linux-gnu` (Intel macOS is not prebuilt — GitHub's intel
 runners are paid larger-runner labels; build from source instead). Each
 `git-forge-<tag>-<target>.tar.gz` contains the `git-forge` binary plus
-relative `git-issue`/`git-pr` symlinks; `SHA256SUMS.txt` covers every tarball.
-Unpack onto a PATH dir (e.g. `~/.local/bin`) and `git forge ...` dispatches.
+relative `git-issue`/`git-pr` symlinks, re-created by the installer, so
+`git forge ...` / `git issue ...` / `git pr ...` all dispatch. Re-running the
+script upgrades in place; uninstall by removing those three files from the
+install dir.
 
 Or build from source:
 
