@@ -28,7 +28,8 @@ Must-not-haves (L1): web UI, single-file export, GitHub bridge, accounts/permiss
 | `git` (adapter) | `worktree_add`/`worktree_remove`/`worktree_list`, `base_checked_out_elsewhere`, `execute_strategy` (merge/squash/rebase), `cleanup_failed_worktree`, `require_single_merge_base` | `git` binary shell-outs for merge execution: strategy commands, abort/reset/clean failure cleanup, merge-base --all, worktree plumbing | Deep: protocol correctness delegated to git itself; the merge-gate predicate stays in `pr_merge` |
 | `ci` (runner) | `ci_timeout`, `snapshot_ci_plan`, `run_ci_plan` | Bounded CI plan execution in a disposable worktree: immutable-snapshot plan resolution/materialization, process-group kill+reap under a deadline, env tightening | Security-sensitive: isolates the plan subprocess (`/bin/bash` / `just`) and its environment |
 | `pr_merge` (merge gate) | `cmd_pr_merge` | Merge-gate predicate (effective approve required) + stale-base / checked-out-base guards, temp-worktree lifecycle, pending-result ref, one-transaction finalize | Deep: the gate predicate + merge atomicity live here (not `cli`); `cli` dispatches to it |
-| `cli` (entry) | `run_issue`, `run_pr`, `run_ci` dispatch; `cmd_pr_diff` (arguments + result handling) | Command parsing; the merge-gate predicate + orchestration live in `pr_merge`; `cmd_pr_diff` delegates the subprocess to `git::git_in_ci` | Shallow by design: dispatch only, no direct subprocess spawning (diff goes through the sanitized git adapter) |
+| `issue` (commands) | `run_issue` dispatch; issue `cmd_*` handlers | Issue command parsing + human-readable output; all storage via `store`; shared plumbing (entity-id parsing, sanitization, store openers) from `cli` | Shallow: command surface only |
+| `cli` (entry) | `run_pr`, `run_ci` dispatch; `cmd_pr_diff` (arguments + result handling) | Command parsing; the merge-gate predicate + orchestration live in `pr_merge`; `cmd_pr_diff` delegates the subprocess to `git::git_in_ci` | Shallow by design: dispatch only, no direct subprocess spawning (diff goes through the sanitized git adapter) |
 | `sync` (L2) | — | Explicit forge refspec push, additive fetch refspec, per-entity DAG merge convergence | Not built in L1; no `src/sync.rs` yet |
 | `hooks` (L2) | — | Pre-receive/post-receive hooks, refspec validation | Not built in L1; no `src/hooks.rs` yet |
 
@@ -69,14 +70,15 @@ git-forge/
 │   └── architecture/git-forge.md
 ├── src/
 │   ├── main.rs          # `git forge` entry binary
-│   ├── lib.rs           # module root: declares cli, event, fold, git, store, identity, pr_merge, ci
-│   ├── cli.rs           # command parsing + dispatch; cmd_pr_diff git diff
+│   ├── lib.rs           # module root: declares ci, cli, event, fold, git, identity, issue, pr_merge, store
+│   ├── cli.rs           # shared CLI plumbing + pr/ci command surfaces + dispatch; cmd_pr_diff git diff
 │   ├── ci.rs            # CI runner: plan resolution/materialization, bounded exec (bash/just), process-group kill
 │   ├── ci/validate.rs   # Just fallback closure validator (F-012) split out for the size gate
 │   ├── event.rs         # event model + JSON schema (pure)
 │   ├── fold.rs          # state derivation (pure)
 │   ├── git.rs           # git binary adapter: merge-execution shell-outs (worktree, strategies, cleanup, merge-base)
 │   ├── identity.rs      # actor/user.email resolution (F-028) + commit-signature binding
+│   ├── issue.rs         # issue command surface (t1b): new/list/show/comment/close/reopen
 │   ├── pr_merge.rs      # cmd_pr_merge: merge-gate predicate + orchestration (temp worktree, pending result, atomic finalize)
 │   └── store.rs         # refs read/write via git2
 └── tests/

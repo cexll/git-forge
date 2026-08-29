@@ -37,14 +37,14 @@ fn main() -> ExitCode {
 fn run_forge(argv: &[String]) -> Result<String, String> {
     match argv.first().map(|s| s.as_str()) {
         // `git forge issue ...` → git runs `git-forge` with argv = ["issue", ...]
-        Some("issue") => git_forge::cli::run_issue(&argv[1..]),
+        Some("issue") => git_forge::issue::run_issue(&argv[1..]),
         // `git forge pr ...` → argv = ["pr", ...]
         Some("pr") => git_forge::cli::run_pr(&argv[1..]),
         // `git forge ci ...` → argv = ["ci", ...]
         Some("ci") => git_forge::cli::run_ci(&argv[1..]),
         // Direct binary form `git-forge forge issue ...` (used in tests).
         Some("forge") => match argv.get(1).map(|s| s.as_str()) {
-            Some("issue") => git_forge::cli::run_issue(&argv[2..]),
+            Some("issue") => git_forge::issue::run_issue(&argv[2..]),
             Some("pr") => git_forge::cli::run_pr(&argv[2..]),
             Some("ci") => git_forge::cli::run_ci(&argv[2..]),
             Some("help") | Some("-h") | Some("--help") => Ok(top_help()),
@@ -76,6 +76,6 @@ fn run_wrapper(argv: &[String]) -> Result<String, String> {
     if invoked_as_pr {
         git_forge::cli::run_pr(argv)
     } else {
-        git_forge::cli::run_issue(argv)
+        git_forge::issue::run_issue(argv)
     }
 }

@@ -4,5 +4,6 @@ pub mod event;
 pub mod fold;
 pub mod git;
 pub mod identity;
+pub mod issue;
 pub mod pr_merge;
 pub mod store;
