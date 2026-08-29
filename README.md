@@ -1,10 +1,17 @@
 # git-forge
 
+[![release](https://img.shields.io/github/v/release/cexll/git-forge)](https://github.com/cexll/git-forge/releases)
+
 A local, git-native forge: issues, pull requests, review, and merge inside an
 ordinary git repository — git protocol only, zero resident processes, no
 GitHub synchronization, no second protocol. Forge state lives as event chains
 under `refs/forge/*`, so code and forge state can be stored in the same
 repository. Forge-state sync/refspec wiring across clones is L2.
+
+There is no web UI: `refs/forge/*` is not rendered by GitHub's (or any forge
+host's) web interface — issues and PRs are read and written through the CLI
+(`git forge ...` / `git issue ...` / `git pr ...`), and a host's Issues/Pull
+Requests tabs stay unused. A web view is deferred L2 roadmap.
 
 ## What it does
 
@@ -19,7 +26,8 @@ repository. Forge-state sync/refspec wiring across clones is L2.
   immutable snapshot and records the outcome as a `ci.check` Forge Event. A
   regular `.forge/ci.sh` runs; the `just check` fallback runs only when
   `.forge/ci.sh` is absent; a present symlink or other non-regular entry is
-  refused up front without appending a Check result.- **Merge strategies**: `--merge` (default, merge commit), `--squash`
+  refused up front without appending a Check result.
+- **Merge strategies**:  **Merge strategies**: `--merge` (default, merge commit), `--squash`
   (single commit), `--rebase` (linear replay onto the base tip).
 - All state in git refs (`refs/forge/*`); no daemon, no second protocol.
 
