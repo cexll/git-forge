@@ -1,0 +1,96 @@
+{
+  "contract_version": "1",
+  "authority": "machine contract for forge-p0; spec.md Validation Plan is the human-readable view, this JSON is the machine grammar consumed by devflow.cjs validate",
+  "assertions": [
+    {
+      "id": "VAL-001",
+      "title": "PR create 声明 closes 后,pr show 展示 closes 目标",
+      "behavior": "PR create 声明 closes 后,pr show 展示 closes 目标",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "`git forge pr show <n>` 输出含 `closes: #<issue>`",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-002",
+      "title": "closes 目标 Issue 在 PR 合并成功后变为 closed",
+      "behavior": "closes 目标 Issue 在 PR 合并成功后变为 closed",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "`git forge issue show <n>` 输出 closed;merge exit 0",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-003",
+      "title": "目标 Issue 已 closed 时合并仍成功且不写第二个 close 事件",
+      "behavior": "目标 Issue 已 closed 时合并仍成功且不写第二个 close 事件",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "merge exit 0;issue show 仍 closed(事件链长度不变,fold 值不变)",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-004",
+      "title": "合并失败时(门未过/冲突)目标 Issue 保持 open",
+      "behavior": "合并失败时(门未过/冲突)目标 Issue 保持 open",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "构造 merge 失败后 `issue show` 仍 open;merge exit 非零",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-005",
+      "title": "abandon 后 pr show 展示 abandoned 与 reason",
+      "behavior": "abandon 后 pr show 展示 abandoned 与 reason",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "`git forge pr show <n>` 输出含 `abandoned: <reason>`",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-006",
+      "title": "abandon 后 merge 拒绝、退出非零、错误消息命名 reason",
+      "behavior": "abandon 后 merge 拒绝、退出非零、错误消息命名 reason",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "`git forge pr merge <n>` exit 非零,stderr 含 reason",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-007",
+      "title": "abandon 后 review 拒绝",
+      "behavior": "abandon 后 review 拒绝",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "`git forge pr review <n> --approve` exit 非零",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-008",
+      "title": "abandon 后 ci run 拒绝且不追加 ci.check",
+      "behavior": "abandon 后 ci run 拒绝且不追加 ci.check",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "`git forge ci run <n>` exit 非零;`pr show` 的 CI 状态不变(仍为 create 时的 pending)",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-009",
+      "title": "二次 abandon 拒绝,不写第二个 abandoned 事件",
+      "behavior": "二次 abandon 拒绝,不写第二个 abandoned 事件",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "第二次 `pr abandon` exit 非零;`pr show` 展示同一(首个)reason",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-010",
+      "title": "已 merge 的 PR 拒绝 abandon",
+      "behavior": "已 merge 的 PR 拒绝 abandon",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "merge 成功后 `pr abandon` exit 非零",
+      "status": "pending"
+    }
+  ]
+}

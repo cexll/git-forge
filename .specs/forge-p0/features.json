@@ -1,0 +1,362 @@
+{
+  "mission": "forge-p0",
+  "generatedBy": "devflow.cjs compile",
+  "generatedAt": "2026-09-03",
+  "statusNote": "This is the plan and holds no status. Live status is in <spec-dir>/missions/runtime.json (gitignored, written only by devflow). Read it with: devflow.cjs brief --mission-dir <spec-dir>/missions — that answers \"is it done\", read-only. Never edit this file by hand: append with 'devflow.cjs amend --add-feature', and drop work with 'devflow.cjs cancel'.",
+  "features": [
+    {
+      "id": "a-final",
+      "description": "exercise every contract assertion through its real surface and report per assertion",
+      "dependsOn": [
+        "t0",
+        "t1",
+        "t2",
+        "t3",
+        "t4",
+        "t5",
+        "t6",
+        "v-p0"
+      ],
+      "milestone": "acceptance",
+      "touches": [],
+      "fulfills": [],
+      "proves": [
+        "VAL-001",
+        "VAL-002",
+        "VAL-003",
+        "VAL-004",
+        "VAL-005",
+        "VAL-006",
+        "VAL-007",
+        "VAL-008",
+        "VAL-009",
+        "VAL-010"
+      ],
+      "reportOnly": true,
+      "validatorKind": "acceptance",
+      "skillName": "user-validate-flow",
+      "expectedBehavior": [
+        "Every contract assertion carries a verdict and at least one evidence artifact"
+      ],
+      "origin": "plan",
+      "addressesItemId": []
+    },
+    {
+      "id": "p-promote",
+      "description": "turn the accepted P0 flows (issue closed via merge transaction; abandon terminal state) into install-e2e flow contracts under `.agents/qa/flows/`, reviewed and merged like any other change.",
+      "dependsOn": [
+        "a-final"
+      ],
+      "milestone": "acceptance",
+      "touches": [
+        ".agents/qa/"
+      ],
+      "fulfills": [],
+      "skillName": "tdd",
+      "expectedBehavior": [
+        "Two flow contract files exist under `.agents/qa/flows/` with the five required headings each",
+        "Each flow names the CLI steps and the exit-code/ref-state assertions the acceptance sweep observed",
+        "The install-e2e parser accepts them (its own shape check passes)",
+        "Nothing else changes — the flows are documentation-of-proof, not code"
+      ],
+      "origin": "plan",
+      "addressesItemId": []
+    },
+    {
+      "id": "t0",
+      "description": "Extract merge-gate state machine + finalize transaction construction into their own module, byte-for-byte behavior-preserving, so store.rs/pr_merge.rs stay under the 800-code-line size gate when P0 adds keys/fields/checks.",
+      "dependsOn": [],
+      "milestone": "p0-core",
+      "touches": [
+        "src/pr_merge.rs",
+        "src/store.rs",
+        "src/event.rs",
+        "src/fold.rs",
+        "src/lib.rs"
+      ],
+      "fulfills": [],
+      "verification": {
+        "mode": "steps",
+        "steps": [
+          {
+            "id": "check",
+            "command": "cargo test",
+            "expectedExit": "zero"
+          }
+        ]
+      },
+      "skillName": "tdd",
+      "expectedBehavior": [
+        "Behavior byte-for-byte identical: cargo test (45/45) green before AND after, no test changed",
+        "Lint/cargo gates green: fmt, clippy -D warnings -D too_many_lines, no new size-gate violations",
+        "Every file that P0 will touch has room under the 800-code-line gate (report final line counts)",
+        "No public API renaming that would ripple into tests that P0 does not own"
+      ],
+      "origin": "plan",
+      "addressesItemId": []
+    },
+    {
+      "id": "t1",
+      "description": "`git forge pr create` gains a single `--closes <issue-id>`; the closes relationship is recorded in `pr.created` and shown by `pr show`.",
+      "dependsOn": [
+        "t0"
+      ],
+      "milestone": "p0-core",
+      "touches": [
+        "src/cli.rs",
+        "src/store.rs",
+        "src/event.rs",
+        "src/fold.rs",
+        "src/issue.rs",
+        "tests/t2_pr.rs",
+        "scripts/gf-dogfood.sh"
+      ],
+      "fulfills": [
+        "VAL-001"
+      ],
+      "verification": {
+        "mode": "steps",
+        "steps": [
+          {
+            "id": "check",
+            "command": "cargo test",
+            "expectedExit": "zero"
+          }
+        ]
+      },
+      "skillName": "tdd",
+      "expectedBehavior": [
+        "`pr create --closes <n>` succeeds and the PR shows the closes relationship",
+        "`pr create --closes <n>` with a non-existent issue id exits non-zero, creates no PR, and consumes no sequence id (create is atomic)",
+        "`pr create` without `--closes` behaves exactly as before (no closes field in the event/body)",
+        "`pr show` output for a PR created before this ticket (no closes) renders exactly as before",
+        "Existing suite stays green (no assertion weakened)"
+      ],
+      "origin": "plan",
+      "addressesItemId": []
+    },
+    {
+      "id": "t2",
+      "description": "When a PR created with `--closes <n>` merges, the `issue.close` is written in the SAME `update-ref` transaction as base CAS + PR-head CAS + pending-result delete.",
+      "dependsOn": [
+        "t1"
+      ],
+      "milestone": "p0-core",
+      "touches": [
+        "src/pr_merge.rs",
+        "src/store.rs",
+        "scripts/gf-dogfood.sh"
+      ],
+      "fulfills": [
+        "VAL-002",
+        "VAL-003"
+      ],
+      "verification": {
+        "mode": "steps",
+        "steps": [
+          {
+            "id": "check",
+            "command": "cargo test",
+            "expectedExit": "zero"
+          }
+        ]
+      },
+      "skillName": "tdd",
+      "expectedBehavior": [
+        "Merge with `--closes` leaves the linked issue closed on success",
+        "Already-closed target: merge still succeeds, no second close event, fold state unchanged (still `open: true`→ no — still closed, i.e. `open: false`; the fold's issue chain length is unchanged)",
+        "Failed transaction (test-injected CAS clash with GIT_FORGE_TEST_MERGE_BARRIER or a forced base-move) leaves issue open, no partial event",
+        "The empty-body `issue.close` event's actor/ts are resolved through the same single identity resolution as every other write (no second path)",
+        "Dogfood oracle gains a merge-closes assertion (green in the ordinary merge path)"
+      ],
+      "origin": "plan",
+      "addressesItemId": []
+    },
+    {
+      "id": "t3",
+      "description": "A merge that fails its gate (missing approve, stale base, conflict) must never write a partial `issue.close` — the issue stays open and the PR stays unmerged.",
+      "dependsOn": [
+        "t2"
+      ],
+      "milestone": "p0-core",
+      "touches": [
+        "src/pr_merge.rs",
+        "src/store.rs",
+        "tests/t3_merge.rs",
+        "scripts/gf-dogfood.sh"
+      ],
+      "fulfills": [
+        "VAL-004"
+      ],
+      "verification": {
+        "mode": "steps",
+        "steps": [
+          {
+            "id": "check",
+            "command": "cargo test",
+            "expectedExit": "zero"
+          }
+        ]
+      },
+      "skillName": "tdd",
+      "expectedBehavior": [
+        "Gate red (missing approve) with `--closes` → merge exits non-zero, issue open, no `pr.merge` event",
+        "Stale base with `--closes` → merge refuses, issue open, no ref change",
+        "Conflict on merge with `--closes` → issue open, temp worktree cleaned (existing invariant)",
+        "CAS-exhaustion (via test injection) → issue open",
+        "Pre-existing failure-class tests unchanged and green (no weakened assertions)"
+      ],
+      "origin": "plan",
+      "addressesItemId": []
+    },
+    {
+      "id": "t4",
+      "description": "`git forge pr abandon <n> --reason <text>` writes a `pr.abandoned` event; the PR becomes terminal, and `pr show` displays abandoned + reason. Merge refuses abandoned PRs.",
+      "dependsOn": [
+        "t2"
+      ],
+      "milestone": "p0-core",
+      "touches": [
+        "src/cli.rs",
+        "src/store.rs",
+        "src/event.rs",
+        "src/fold.rs",
+        "src/pr_merge.rs",
+        "tests/t2_pr.rs",
+        "tests/t3_merge.rs",
+        "scripts/gf-dogfood.sh"
+      ],
+      "fulfills": [
+        "VAL-005",
+        "VAL-006"
+      ],
+      "verification": {
+        "mode": "steps",
+        "steps": [
+          {
+            "id": "check",
+            "command": "cargo test",
+            "expectedExit": "zero"
+          }
+        ]
+      },
+      "skillName": "tdd",
+      "expectedBehavior": [
+        "`pr abandon <n> --reason <text>` exits zero; `pr show <n>` shows the reason",
+        "`pr merge` on an abandoned PR exits non-zero, names the reason, no ref change (no `pr.merge` event, base untouched)",
+        "Already-merged PR: `abandon` exits non-zero, no event appended",
+        "Unknown PR id: exit non-zero, no counter consumption",
+        "Missing/empty reason: exit non-zero, no event"
+      ],
+      "origin": "plan",
+      "addressesItemId": []
+    },
+    {
+      "id": "t5",
+      "description": "`git forge pr review` and `git forge ci run` refuse an abandoned PR, appending no event (no new review, no new ci.check).",
+      "dependsOn": [
+        "t4"
+      ],
+      "milestone": "p0-core",
+      "touches": [
+        "src/cli.rs",
+        "src/fold.rs",
+        "scripts/gf-dogfood.sh"
+      ],
+      "fulfills": [
+        "VAL-007",
+        "VAL-008"
+      ],
+      "verification": {
+        "mode": "steps",
+        "steps": [
+          {
+            "id": "check",
+            "command": "cargo test",
+            "expectedExit": "zero"
+          }
+        ]
+      },
+      "skillName": "tdd",
+      "expectedBehavior": [
+        "`pr review --approve` on abandoned: exit non-zero, review chain unchanged (pr show shows no new decision)",
+        "`ci run` on abandoned: exit non-zero, no new ci.check (pr show still shows the pending check from create)",
+        "Both messages name the abandon reason",
+        "Non-abandoned PR: existing review/CI behavior byte-identical"
+      ],
+      "origin": "plan",
+      "addressesItemId": []
+    },
+    {
+      "id": "t6",
+      "description": "The abandon terminality is enforced on all boundaries: second abandon refuses without writing; merged PR refuses; refs stay unchanged on every refusal.",
+      "dependsOn": [
+        "t5"
+      ],
+      "milestone": "p0-core",
+      "touches": [
+        "src/cli.rs",
+        "src/fold.rs",
+        "scripts/gf-dogfood.sh"
+      ],
+      "fulfills": [
+        "VAL-009",
+        "VAL-010"
+      ],
+      "verification": {
+        "mode": "steps",
+        "steps": [
+          {
+            "id": "check",
+            "command": "cargo test",
+            "expectedExit": "zero"
+          }
+        ]
+      },
+      "skillName": "tdd",
+      "expectedBehavior": [
+        "Second abandon: non-zero exit, chain still one `pr.abandoned`, show displays original reason",
+        "Merged-then-abandon: non-zero exit, no event",
+        "All mutators (merge/review/ci/abandon) refuse an abandoned PR with the same reason text",
+        "gf-dogfood.sh covers the double-abandon and merged-abandon refusals"
+      ],
+      "origin": "plan",
+      "addressesItemId": []
+    },
+    {
+      "id": "v-p0",
+      "description": "exercise every p0-core ASSERTION through its real surface (CLI) and report per assertion",
+      "dependsOn": [
+        "t0",
+        "t1",
+        "t2",
+        "t3",
+        "t4",
+        "t5",
+        "t6"
+      ],
+      "milestone": "p0-core",
+      "touches": [],
+      "fulfills": [],
+      "proves": [
+        "VAL-001",
+        "VAL-002",
+        "VAL-003",
+        "VAL-004",
+        "VAL-005",
+        "VAL-006",
+        "VAL-007",
+        "VAL-008",
+        "VAL-009",
+        "VAL-010"
+      ],
+      "reportOnly": true,
+      "skillName": "user-validate-flow",
+      "expectedBehavior": [
+        "Every assigned assertion carries a verdict and at least one evidence artifact"
+      ],
+      "origin": "plan",
+      "addressesItemId": []
+    }
+  ]
+}
