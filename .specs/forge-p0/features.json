@@ -357,6 +357,30 @@
       ],
       "origin": "plan",
       "addressesItemId": []
+    },
+    {
+      "dependsOn": [],
+      "touches": [
+        "docs/architecture/git-forge.md"
+      ],
+      "fulfills": [],
+      "expectedBehavior": [
+        "wire contract documents pr.abandoned kind and terminality; skill mirror byte-for-byte; CONTEXT.md glossary has abandon entry"
+      ],
+      "addressesItemId": [
+        "F-013",
+        "F-014"
+      ],
+      "id": "t7-doc-sync",
+      "description": "wire contract sync: add pr.abandoned row + terminality doc; sync skill mirror + CONTEXT.md glossary (F-013, F-014)",
+      "milestone": "p0-core",
+      "proves": [],
+      "skillName": "tdd",
+      "cause": {
+        "kind": "review",
+        "itemId": "F-013"
+      },
+      "origin": "amend"
     }
   ]
 }
