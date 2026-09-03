@@ -368,6 +368,18 @@ pub(crate) fn run_finalize(
             None => None,
         };
         let issue_expected = issue_stage.map(|(_, _, exp)| exp);
+        // Test-only per-attempt issue-stage barrier (F-006): pauses after the
+        // issue close is staged for THIS attempt (fresh fold + tip) and before
+        // the update-ref batch, so a regression can move the linked issue
+        // exactly between staging and the transaction — the window the CAS
+        // retry loop exists to heal. The ready sentinel's content is the
+        // attempt number, so multi-round tests never mistake a consumed
+        // round-0 sentinel for the next round. Debug builds only; inert in
+        // release and when the env var is unset.
+        #[cfg(debug_assertions)]
+        if issue_event.is_some() {
+            maybe_run_issue_stage_barrier(store, &spec, attempts, lock_handle, tmp)?;
+        }
         match finalize_pr_merge(store, &spec, &merge_event, head_expected, issue_stage) {
             Ok(()) => break,
             Err(e) => {
@@ -562,6 +574,63 @@ fn run_test_barrier(env_key: &str) -> Result<(), String> {
 #[cfg(debug_assertions)]
 pub(crate) fn maybe_run_test_barrier() -> Result<(), String> {
     run_test_barrier("GIT_FORGE_TEST_MERGE_BARRIER")
+}
+
+/// Test-only per-attempt issue-stage barrier wrapper: park the merge between
+/// ONE finalize attempt's issue staging and its update-ref batch (F-006). On
+/// barrier failure (deadline) or on the pending-ref cleanup failing, the
+/// error is returned with the pending result ref best-effort cleaned.
+#[cfg(debug_assertions)]
+fn maybe_run_issue_stage_barrier(
+    store: &BoundEventStore,
+    spec: &MergeFinalizeSpec<'_>,
+    attempts: u32,
+    lock_handle: &mut Option<std::fs::File>,
+    tmp: &std::path::Path,
+) -> Result<(), String> {
+    if let Err(b) = maybe_run_test_issue_barrier(attempts) {
+        let pending = cleanup_pending_result(store, spec.id, spec.result_commit, lock_handle, tmp);
+        return Err(format!("{b}{pending}"));
+    }
+    Ok(())
+}
+
+/// Per-attempt issue-stage barrier (F-006): pauses right after the linked-issue
+/// close is staged for one finalize attempt and before the update-ref batch —
+/// the exact window where a concurrent issue write makes the batch's issue CAS
+/// fail and the retry loop re-stage. The ready sentinel's CONTENT is the
+/// attempt number (0 = first staging, 1 = first retry, ...), so a multi-round
+/// regression never mistakes a consumed round-0 sentinel for the next round.
+/// Debug builds only; inert in release and when the env var is unset.
+#[cfg(debug_assertions)]
+fn maybe_run_test_issue_barrier(attempt: u32) -> Result<(), String> {
+    use std::io::Write;
+    let Ok(dir) = std::env::var("GIT_FORGE_TEST_MERGE_ISSUE_BARRIER") else {
+        return Ok(());
+    };
+    let dir = std::path::PathBuf::from(dir);
+    std::fs::create_dir_all(&dir).map_err(|e| format!("barrier dir: {e}"))?;
+    let ready = dir.join("ready");
+    let release = dir.join("release");
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&ready)
+        .map_err(|e| format!("barrier ready sentinel: {e}"))?;
+    writeln!(f, "{attempt}").ok();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !release.exists() {
+        if std::time::Instant::now() > deadline {
+            let _ = std::fs::remove_file(&ready);
+            let _ = std::fs::remove_file(&release);
+            return Err("test merge barrier deadline exceeded; no ref updates made".into());
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    // Observed release: delete it and the ready sentinel, then continue.
+    let _ = std::fs::remove_file(&release);
+    let _ = std::fs::remove_file(&ready);
+    Ok(())
 }
 
 /// Retry-window barrier (F-010): pauses right after the merge has adopted a

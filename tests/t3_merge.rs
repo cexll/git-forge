@@ -1304,6 +1304,55 @@ fn assert_no_temp_worktree(dir: &Path) {
     );
 }
 
+/// Like [`assert_no_temp_worktree`] but for a SPECIFIC PR id — the merge
+/// tests with a `--closes` target run PR #2 (the linked issue took id 1), so
+/// the PR #1 assertion would be a vacuous pass.
+fn assert_no_temp_worktree_pr(dir: &Path, pr: u64) {
+    let (wl, out, _) = git(dir, &["worktree", "list", "--porcelain"]);
+    assert_eq!(wl, 0, "worktree list must succeed");
+    assert!(
+        !out.contains(&format!("git-forge-pr{pr}-merge")),
+        "temp worktree for PR #{pr} left behind: {out}"
+    );
+}
+
+/// Wait until the per-attempt issue-stage barrier creates `<dir>/ready` whose
+/// CONTENT is exactly the expected attempt number (the first round parks with
+/// "0", the first retry with "1", ...). Content-matching makes multi-round
+/// tests unambiguous: a round-0 ready that the merge has since consumed (and
+/// whose round-1 ready is already up) cannot be mistaken for the next round.
+fn wait_issue_barrier_round(dir: &Path, round: u32, deadline: Instant, tag: &str) {
+    let expected = round.to_string();
+    let mut seen = String::new();
+    while seen != expected {
+        assert!(
+            Instant::now() < deadline,
+            "{tag}: merge never reached the issue-stage barrier round {round}"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+        let p = dir.join("ready");
+        if p.exists() {
+            seen = std::fs::read_to_string(&p)
+                .unwrap_or_default()
+                .trim()
+                .to_string();
+        }
+    }
+}
+
+/// Create the atomic `release` sentinel that unpauses one issue-stage barrier
+/// round.
+fn release_issue_barrier(dir: &Path) {
+    let release_path = dir.join("release");
+    use std::io::Write as _;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&release_path)
+        .expect("release sentinel must be created atomically");
+    let _ = f.write_all(b"go\n");
+}
+
 #[test]
 fn merge_explicit_merge_flag_conflict_rejected() {
     // pr_merge.rs:24 — the `--merge` arm's duplicate-flag check. The existing
@@ -2531,9 +2580,16 @@ fn finalize_cas_failure_leaves_linked_issue_open() {
     assert_no_temp_worktree(&dir);
 }
 
-/// The linked issue may move DURING finalization (the finalize retry loop).
-/// The close event is then re-parented to the moved tip (same event, one
-/// close event in the final chain) and the merge still succeeds.
+/// The linked issue may move BETWEEN the per-attempt staging and the
+/// update-ref batch — the exact window the finalize retry loop exists to
+/// heal (F-006: the previous version parked at the PRE-finalize barrier, so
+/// the move landed before the first staging and the first transaction CASed
+/// the already-moved tip — no retry). GIT_FORGE_TEST_MERGE_ISSUE_BARRIER
+/// (in run_finalize, right after per-attempt staging) parks the merge there;
+/// the concurrent comment lands AFTER the close was staged at the old tip, so
+/// the first transaction CASes a stale issue tip and fails, the loop
+/// re-stages at the moved tip (same event, one close event in the final
+/// chain) and the merge still succeeds.
 #[test]
 fn merge_retries_when_issue_moves_during_finalize() {
     let dir = tmpdir("mcloses-move");
@@ -2542,45 +2598,33 @@ fn merge_retries_when_issue_moves_during_finalize() {
     assert_eq!(ci, 0, "issue new failed: {ei}");
     create_approved_pr_closes(&dir, "feature", "closes PR", 1, 2);
     checkout(&dir, "feature");
-    let barrier = tmpdir("mcloses-move-window");
-    let tip_after_comment = {
-        let (cc, _, ec) = forge(&dir, &["forge", "issue", "comment", "1", "parked"]);
-        assert_eq!(cc, 0, "issue comment failed: {ec}");
-        ref_oid(&dir, "refs/forge/issues/1").unwrap()
-    };
 
+    let barrier = tmpdir("mcloses-move-window");
+    let issue_before = ref_oid(&dir, "refs/forge/issues/1").unwrap();
     let bin = env!("CARGO_BIN_EXE_git-forge");
     let child: Child = Command::new(bin)
         .args(["forge", "pr", "merge", "2"])
         .current_dir(&dir)
-        .env("GIT_FORGE_TEST_MERGE_BARRIER", &barrier)
+        .env("GIT_FORGE_TEST_MERGE_ISSUE_BARRIER", &barrier)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .unwrap();
 
     let deadline = Instant::now() + Duration::from_secs(30);
-    while !barrier.join("ready").exists() {
-        assert!(
-            Instant::now() < deadline,
-            "merge never reached the barrier window"
-        );
-        std::thread::sleep(Duration::from_millis(20));
-    }
-    // Move the issue chain while the merge is parked, so the first finalize
-    // transaction CASes against a stale issue tip and must retry.
+    // Round 0: the per-attempt close is staged at the pre-move tip; move the
+    // issue NOW, so the first transaction CASes a stale issue tip and fails,
+    // and the loop re-stages at the moved tip.
+    wait_issue_barrier_round(&barrier, 0, deadline, "first staging");
     let (cm, _, em) = forge(&dir, &["forge", "issue", "comment", "1", "while parked"]);
     assert_eq!(cm, 0, "concurrent issue comment failed: {em}");
-    let release_path = barrier.join("release");
-    {
-        use std::io::Write as _;
-        let mut f = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&release_path)
-            .expect("release sentinel must be created atomically");
-        let _ = f.write_all(b"go\n");
-    }
+    release_issue_barrier(&barrier);
+
+    // Round 1: the retry re-staged at the moved tip; release WITHOUT moving,
+    // so the second transaction succeeds.
+    wait_issue_barrier_round(&barrier, 1, deadline, "retry staging");
+    release_issue_barrier(&barrier);
+
     let output = child.wait_with_output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
@@ -2609,11 +2653,11 @@ fn merge_retries_when_issue_moves_during_finalize() {
     let (cs, os, es) = forge(&dir, &["forge", "issue", "show", "1"]);
     assert_eq!(cs, 0, "issue show failed: {es}");
     assert!(os.contains("closed"), "issue must fold closed: {os}");
-    // The pre-merge snapshot (barrier spawn) observed `tip_after_comment`;
-    // the final tip is the close commit appended onto the LAST comment.
+
     assert_ne!(
         ref_oid(&dir, "refs/forge/issues/1").unwrap(),
-        tip_after_comment
+        issue_before,
+        "the issue ref must have moved (concurrent comment + re-parented close)"
     );
 }
 /// A vanished linked-issue ref is a hard refusal, never a silent skip: the
@@ -2685,4 +2729,341 @@ fn merge_refuses_when_linked_issue_ref_disappears_during_barrier() {
         "pending result ref must be left in place"
     );
     let _ = issue_before;
+}
+/// VAL-004 (t3): a merge whose gate is RED (missing approve) while the PR
+/// declares `--closes` must never write a partial `issue.close`. The gate
+/// read fails BOTH before the finalize transaction and before any temp
+/// worktree is created: merge exits non-zero, `issue show` still reports
+/// open, the issue chain carries no `issue.close` event, the PR head chain
+/// carries no `pr.merge` event, and base/head/issue refs are unchanged.
+#[test]
+fn merge_gate_red_with_closes_keeps_issue_open() {
+    let dir = tmpdir("mcloses-gatered");
+    init_repo(&dir);
+    let (ci, _, ei) = forge(&dir, &["forge", "issue", "new", "linked bug"]);
+    assert_eq!(ci, 0, "issue new failed: {ei}");
+    // Approved? NO. The PR declares the closes relationship but is never
+    // reviewed, so the L1 gate (effective approve) is red. CI plan is present
+    // so the gate failure is NOT the CI check (t3: gate red = missing approve).
+    make_feature(&dir, "feature", "feat\n");
+    let (c, _, e) = git(&dir, &["checkout", "-q", "feature"]);
+    assert_eq!(c, 0, "checkout feature failed: {e}");
+    add_passing_ci_plan(&dir);
+    let (c, _, e) = git(&dir, &["checkout", "-q", "main"]);
+    assert_eq!(c, 0, "checkout main failed: {e}");
+    let (c, o, e) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "create",
+            "--source",
+            "feature",
+            "--base",
+            "main",
+            "gate red closes PR",
+            "--closes",
+            "1",
+        ],
+    );
+    assert_eq!(c, 0, "pr create --closes failed: {e} {o}");
+    let (c, _, e) = forge(&dir, &["forge", "ci", "run", "2"]);
+    assert_eq!(c, 0, "ci run failed: {e}");
+    checkout(&dir, "feature");
+
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let head_before = ref_oid(&dir, "refs/forge/prs/2/head").unwrap();
+    let issue_before = ref_oid(&dir, "refs/forge/issues/1").unwrap();
+    let (cm, om, em) = forge(&dir, &["forge", "pr", "merge", "2"]);
+    assert_ne!(cm, 0, "gate-red merge must fail: {om} {em}");
+    assert!(em.contains("not approved"), "stderr: {em}");
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base must not move on a gate-red failure"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/2/head").unwrap(),
+        head_before,
+        "PR head must not move on a gate-red failure"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/issues/1").unwrap(),
+        issue_before,
+        "issue ref must not move on a gate-red failure"
+    );
+    let issue_events = chain_event_jsons(&dir, "refs/forge/issues/1");
+    assert!(
+        issue_events
+            .iter()
+            .all(|j| !j.contains("\"kind\":\"issue.close\"")),
+        "no partial issue.close: {issue_events:?}"
+    );
+    let pr_events = chain_event_jsons(&dir, "refs/forge/prs/2/head");
+    assert!(
+        pr_events
+            .iter()
+            .all(|j| !j.contains("\"kind\":\"pr.merge\"")),
+        "no pr.merge event on a gate-red failure: {pr_events:?}"
+    );
+    let (cs, os, es) = forge(&dir, &["forge", "issue", "show", "1"]);
+    assert_eq!(cs, 0, "issue show failed: {es}");
+    assert!(os.contains("open"), "issue must stay open: {os}");
+    assert_no_temp_worktree_pr(&dir, 2);
+}
+
+/// VAL-004 (t3): a stale-base merge with `--closes` must refuse BEFORE
+/// touching anything — the stale check runs after the gate read but before
+/// the worktree/finalize side effects, so the linked issue folds open, the
+/// issue chain has no `issue.close`, the PR head chain has no `pr.merge`,
+/// and base/head/issue refs stay put.
+#[test]
+fn merge_stale_base_with_closes_keeps_issue_open() {
+    let dir = tmpdir("mcloses-stale");
+    init_repo(&dir);
+    let (ci, _, ei) = forge(&dir, &["forge", "issue", "new", "linked bug"]);
+    assert_eq!(ci, 0, "issue new failed: {ei}");
+    create_approved_pr_closes(&dir, "feature", "stale closes PR", 1, 2);
+    let base_snapshot = ref_oid(&dir, "refs/forge/prs/2/base").unwrap();
+    // Advance main AFTER the PR snapshot, so the merge gate passes but the
+    // stale-base check rejects.
+    let (c, _, e) = git(&dir, &["checkout", "-q", "main"]);
+    assert_eq!(c, 0, "checkout main failed: {e}");
+    std::fs::write(dir.join("later.txt"), "later\n").unwrap();
+    let (c, _, e) = git(&dir, &["add", "later.txt"]);
+    assert_eq!(c, 0, "add later.txt failed: {e}");
+    let (c, _, e) = git(&dir, &["commit", "-q", "-m", "advance base"]);
+    assert_eq!(c, 0, "commit advance failed: {e}");
+    let base_current = ref_oid(&dir, "refs/heads/main").unwrap();
+    assert_ne!(base_snapshot, base_current, "setup: base must have moved");
+    checkout(&dir, "feature");
+
+    let head_before = ref_oid(&dir, "refs/forge/prs/2/head").unwrap();
+    let issue_before = ref_oid(&dir, "refs/forge/issues/1").unwrap();
+    let (cm, om, em) = forge(&dir, &["forge", "pr", "merge", "2"]);
+    assert_ne!(cm, 0, "stale-base merge must fail: {om} {em}");
+    assert!(
+        em.contains("has moved"),
+        "stderr must name the stale base: {em}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_current,
+        "base must not change on a stale rejection"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/2/head").unwrap(),
+        head_before,
+        "PR head must not move on a stale rejection"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/issues/1").unwrap(),
+        issue_before,
+        "issue ref must not move on a stale rejection"
+    );
+    let issue_events = chain_event_jsons(&dir, "refs/forge/issues/1");
+    assert!(
+        issue_events
+            .iter()
+            .all(|j| !j.contains("\"kind\":\"issue.close\"")),
+        "no partial issue.close: {issue_events:?}"
+    );
+    let pr_events = chain_event_jsons(&dir, "refs/forge/prs/2/head");
+    assert!(
+        pr_events
+            .iter()
+            .all(|j| !j.contains("\"kind\":\"pr.merge\"")),
+        "no pr.merge event on a stale rejection: {pr_events:?}"
+    );
+    let (cs, os, es) = forge(&dir, &["forge", "issue", "show", "1"]);
+    assert_eq!(cs, 0, "issue show failed: {es}");
+    assert!(os.contains("open"), "issue must stay open: {os}");
+    assert_no_temp_worktree_pr(&dir, 2);
+}
+
+/// VAL-004 (t3): a merge conflict inside the disposable worktree with
+/// `--closes` must leave the linked issue open — the failure happens in
+/// execute_strategy, BEFORE the finalize transaction, so no `issue.close`,
+/// no `pr.merge`, no ref move, and the temp worktree is cleaned (existing
+/// invariant preserved under the closes target).
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn merge_conflict_with_closes_keeps_issue_open() {
+    let dir = tmpdir("mcloses-conflict");
+    init_repo(&dir);
+    let (ci, _, ei) = forge(&dir, &["forge", "issue", "new", "linked bug"]);
+    assert_eq!(ci, 0, "issue new failed: {ei}");
+    // Feature and base both change base.txt differently after the fork.
+    make_feature(&dir, "feature", "feat\n");
+    let (c, _, e) = git(&dir, &["checkout", "-q", "feature"]);
+    assert_eq!(c, 0, "checkout feature failed: {e}");
+    std::fs::write(dir.join("base.txt"), "feature-change\n").unwrap();
+    let (c, _, e) = git(&dir, &["add", "base.txt"]);
+    assert_eq!(c, 0, "add base.txt failed: {e}");
+    let (c, _, e) = git(&dir, &["commit", "-q", "-m", "feature conflict"]);
+    assert_eq!(c, 0, "commit conflict failed: {e}");
+    add_passing_ci_plan(&dir);
+    let (c, _, e) = git(&dir, &["checkout", "-q", "main"]);
+    assert_eq!(c, 0, "checkout main failed: {e}");
+    std::fs::write(dir.join("base.txt"), "main-change\n").unwrap();
+    let (c, _, e) = git(&dir, &["add", "base.txt"]);
+    assert_eq!(c, 0, "add base.txt failed: {e}");
+    let (c, _, e) = git(&dir, &["commit", "-q", "-m", "main conflict"]);
+    assert_eq!(c, 0, "commit conflict failed: {e}");
+    let (c, o, e) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "create",
+            "--source",
+            "feature",
+            "--base",
+            "main",
+            "conflict closes PR",
+            "--closes",
+            "1",
+        ],
+    );
+    assert_eq!(c, 0, "pr create --closes failed: {e} {o}");
+    let (c, o, e) = forge(&dir, &["forge", "ci", "run", "2"]);
+    assert_eq!(c, 0, "ci run failed: {e} {o}");
+    let (c, o, e) = forge(&dir, &["forge", "pr", "review", "2", "--approve"]);
+    assert_eq!(c, 0, "review approve failed: {e} {o}");
+    checkout(&dir, "feature");
+
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let head_before = ref_oid(&dir, "refs/forge/prs/2/head").unwrap();
+    let issue_before = ref_oid(&dir, "refs/forge/issues/1").unwrap();
+    let (cm, om, em) = forge(&dir, &["forge", "pr", "merge", "2"]);
+    assert_ne!(cm, 0, "conflict merge must fail: {om} {em}");
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base must not move on a conflict"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/2/head").unwrap(),
+        head_before,
+        "PR head must not move on a conflict"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/issues/1").unwrap(),
+        issue_before,
+        "issue ref must not move on a conflict"
+    );
+    let issue_events = chain_event_jsons(&dir, "refs/forge/issues/1");
+    assert!(
+        issue_events
+            .iter()
+            .all(|j| !j.contains("\"kind\":\"issue.close\"")),
+        "no partial issue.close: {issue_events:?}"
+    );
+    let pr_events = chain_event_jsons(&dir, "refs/forge/prs/2/head");
+    assert!(
+        pr_events
+            .iter()
+            .all(|j| !j.contains("\"kind\":\"pr.merge\"")),
+        "no pr.merge event on a conflict: {pr_events:?}"
+    );
+    let (cs, os, es) = forge(&dir, &["forge", "issue", "show", "1"]);
+    assert_eq!(cs, 0, "issue show failed: {es}");
+    assert!(os.contains("open"), "issue must stay open: {os}");
+    assert_no_temp_worktree_pr(&dir, 2);
+}
+
+/// CAS-exhaustion (t3): the linked issue keeps moving BETWEEN every
+/// per-attempt staging and its update-ref batch, so the finalize CAS retry
+/// loop exhausts its budget (initial attempt + MAX_FINALIZE_RETRIES) and
+/// refuses with no ref updates: the issue folds open, the issue chain has no
+/// issue.close event, the PR head chain has no pr.merge, base/head refs are
+/// unchanged, the pending result ref is cleaned up, and the temp worktree
+/// was already gone before the finalize phase.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn merge_issue_cas_exhaustion_keeps_issue_open() {
+    let dir = tmpdir("mcloses-cas-exhaust");
+    init_repo(&dir);
+    let (ci, _, ei) = forge(&dir, &["forge", "issue", "new", "linked bug"]);
+    assert_eq!(ci, 0, "issue new failed: {ei}");
+    create_approved_pr_closes(&dir, "feature", "closes PR", 1, 2);
+    checkout(&dir, "feature");
+    let barrier = tmpdir("mcloses-cas-exhaust-window");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let head_before = ref_oid(&dir, "refs/forge/prs/2/head").unwrap();
+    let issue_before = ref_oid(&dir, "refs/forge/issues/1").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let child: Child = Command::new(bin)
+        .args(["forge", "pr", "merge", "2"])
+        .current_dir(&dir)
+        .env("GIT_FORGE_TEST_MERGE_ISSUE_BARRIER", &barrier)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    // Initial attempt + 3 retries: move the issue inside EVERY window so the
+    // first-transaction CAS loses each time and the retry budget exhausts.
+    let deadline = Instant::now() + Duration::from_secs(30);
+    for round in 0..4u32 {
+        wait_issue_barrier_round(&barrier, round, deadline, "cas-exhaust");
+        let (cm, _, em) = forge(
+            &dir,
+            &["forge", "issue", "comment", "1", &format!("move {round}")],
+        );
+        assert_eq!(cm, 0, "concurrent issue comment failed: {em}");
+        release_issue_barrier(&barrier);
+    }
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "CAS exhaustion must fail the merge: {stderr}"
+    );
+    assert!(
+        stderr.contains("kept moving during finalization"),
+        "stderr must name the exhausted retries: {stderr}"
+    );
+    assert!(stderr.contains("refs unchanged"), "stderr: {stderr}");
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base must not move after CAS exhaustion"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/2/head").unwrap(),
+        head_before,
+        "PR head must not move after CAS exhaustion"
+    );
+
+    // The test's own comments moved the issue chain; the merge must not have
+    // appended anything on top of the LAST comment tip (no close event).
+    let tip_after_moves = ref_oid(&dir, "refs/forge/issues/1").unwrap();
+    assert_ne!(
+        tip_after_moves, issue_before,
+        "setup: comments must move the issue"
+    );
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/2/result").is_none(),
+        "pending result ref must be cleaned up on exhaustion"
+    );
+    let issue_events = chain_event_jsons(&dir, "refs/forge/issues/1");
+    assert!(
+        issue_events
+            .iter()
+            .all(|j| !j.contains("\"kind\":\"issue.close\"")),
+        "no partial issue.close: {issue_events:?}"
+    );
+    let pr_events = chain_event_jsons(&dir, "refs/forge/prs/2/head");
+    assert!(
+        pr_events
+            .iter()
+            .all(|j| !j.contains("\"kind\":\"pr.merge\"")),
+        "no pr.merge event after CAS exhaustion: {pr_events:?}"
+    );
+    let (cs, os, es) = forge(&dir, &["forge", "issue", "show", "1"]);
+    assert_eq!(cs, 0, "issue show failed: {es}");
+    assert!(os.contains("open"), "issue must stay open: {os}");
+    assert_no_temp_worktree_pr(&dir, 2);
 }

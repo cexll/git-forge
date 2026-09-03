@@ -260,6 +260,47 @@ git checkout -q feat/gf-closes2
 ck "pre-closed target merge succeeds" 0 git forge pr merge 10
 at "no second close event" 0 "[ \$(git log --format='%s' refs/forge/issues/1 | grep -c 'forge:issue.close:1') -eq 2 ]"
 at "issue still closed after pre-closed merge" 0 "git forge issue show 1 | grep -q closed"
+# ── s2 / VAL-004: a failed merge keeps the linked issue open (t3) ──
+git forge issue new "gate red target" >/dev/null
+git checkout -B feat/gf-gatered "$BASE_BRANCH"
+printf 'g\n' > gf-gatered.txt && git add gf-gatered.txt && git commit -qm "gatered"
+git checkout -q "$BASE_BRANCH"
+git forge pr create --source feat/gf-gatered --base "$BASE_BRANCH" "gate red closes" --closes 11 >/dev/null
+git checkout -q feat/gf-gatered
+ck "gate-red closes merge blocked" nonzero git forge pr merge 12
+at "gate red keeps linked issue open" 0 "git forge issue show 11 | grep -q open"
+
+git forge issue new "stale target" >/dev/null
+git checkout -B feat/gf-stale "$BASE_BRANCH"
+printf 's\n' > gf-stale.txt
+mkdir -p .forge && printf '#!/bin/sh\necho ok\n' > .forge/ci.sh   # green CI plan (t3)
+git add gf-stale.txt .forge/ci.sh && git commit -qm "stale"
+git checkout -q "$BASE_BRANCH"
+git forge pr create --source feat/gf-stale --base "$BASE_BRANCH" "stale closes" --closes 13 >/dev/null
+git forge pr review 14 --approve >/dev/null
+git forge ci run 14 >/dev/null
+printf '\n# t3 base advance\n' >> PLAN.md
+git add PLAN.md && git commit -qm "t3 base advance"
+git checkout -q feat/gf-stale
+ck "stale-base closes merge blocked" nonzero git forge pr merge 14
+at "stale base keeps linked issue open" 0 "git forge issue show 13 | grep -q open"
+
+git forge issue new "conflict target" >/dev/null
+git checkout -q "$BASE_BRANCH"
+printf 'v1\n' > gf-shared.txt && git add gf-shared.txt && git commit -qm "conflict base v1"
+git checkout -B feat/gf-conflict "$BASE_BRANCH"
+printf 'v2\n' > gf-shared.txt
+mkdir -p .forge && printf '#!/bin/sh\necho ok\n' > .forge/ci.sh   # green CI plan (t3)
+git add gf-shared.txt .forge/ci.sh && git commit -qm "conflict feature v2"
+git checkout -q "$BASE_BRANCH"
+printf 'v3\n' > gf-shared.txt && git add gf-shared.txt && git commit -qm "conflict base v3"
+git forge pr create --source feat/gf-conflict --base "$BASE_BRANCH" "conflict closes" --closes 15 >/dev/null
+git forge pr review 16 --approve >/dev/null
+git forge ci run 16 >/dev/null
+git checkout -q feat/gf-conflict
+ck "conflict closes merge blocked" nonzero git forge pr merge 16
+at "conflict keeps linked issue open" 0 "git forge issue show 15 | grep -q open"
+
 
 # ── AC-006a / VAL-015: concurrent comment CAS on an independent clone ──
 R2="$T/dogfood2"
