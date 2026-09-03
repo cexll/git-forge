@@ -232,6 +232,17 @@ git forge pr create --source feat6 --base "$BASE_BRANCH" "unapproved PR" >/dev/n
 git checkout -q feat6
 ck "unapproved merge blocked (gate)" nonzero git forge pr merge 7
 
+# ── s0 / VAL-001: pr create --closes records + shows the relationship ──
+git checkout -B feat/gf-closes "$BASE_BRANCH"
+printf 'q\n' > gf-closes.txt && git add gf-closes.txt && git commit -qm "closes c1"
+git checkout -q "$BASE_BRANCH"
+ck "pr create with closes" 0 git forge pr create --source feat/gf-closes --base "$BASE_BRANCH" "PR closes" --closes 1
+at "pr show renders closes" 0 "git forge pr show 8 | grep -q 'closes: #1'"
+at "pr.created event carries closes id" 0 "git show refs/forge/prs/8/meta:.forge/event.json | grep -q '\"closes\":1'"
+at "no closes line without --closes" 0 "! git forge pr show 2 | grep -q 'closes:'"
+ck "pr create nonexistent closes" nonzero git forge pr create --source feat/gf-closes --base "$BASE_BRANCH" T-closes --closes 99
+at "rejected closes consumes no sequence id" 0 "git forge pr create --source feat/gf-closes --base \"\$BASE_BRANCH\" after-bad >/dev/null && git forge pr show 9 | grep -q 'after-bad'"
+
 # ── AC-006a / VAL-015: concurrent comment CAS on an independent clone ──
 R2="$T/dogfood2"
 cd "$R2"

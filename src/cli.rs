@@ -123,9 +123,9 @@ fn resolve_local_branch(store: &EventStore, arg: &str) -> Result<(String, git2::
     Ok((name, oid))
 }
 
-/// `git forge pr create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]...`
+/// `git forge pr create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]... [--closes <n>]`
 fn cmd_pr_create(args: &[String]) -> Result<String, String> {
-    const USAGE: &str = "usage: git forge pr create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]...";
+    const USAGE: &str = "usage: git forge pr create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]... [--closes <n>]";
     if help_requested(args) {
         return Ok(USAGE.into());
     }
@@ -134,6 +134,7 @@ fn cmd_pr_create(args: &[String]) -> Result<String, String> {
     let mut title = None;
     let mut body = None;
     let mut labels: Vec<String> = Vec::new();
+    let mut closes = None;
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--" {
@@ -180,6 +181,14 @@ fn cmd_pr_create(args: &[String]) -> Result<String, String> {
                 }
                 labels.push(v);
             }
+            "--closes" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--closes requires an issue id".into());
+                }
+                let id = parse_entity_id(&args[i])?;
+                closes = Some(id);
+            }
             "-h" | "--help" => return Ok(USAGE.into()),
             a if a.starts_with("--") || a.starts_with('-') => {
                 return Err(format!("unknown option '{a}'"));
@@ -203,6 +212,15 @@ fn cmd_pr_create(args: &[String]) -> Result<String, String> {
     }
 
     let (store, actor) = open_mutation_store()?;
+    // `--closes` must name an EXISTING issue; the check runs BEFORE the
+    // allocation inside `create_pr`, so a rejected create consumes no counter
+    // and creates no PR refs (create remains atomic).
+    if let Some(c) = closes {
+        let r = crate::store::issue_ref(c);
+        if !store_has_ref(store.store(), &r) {
+            return Err(format!("issue #{c} does not exist"));
+        }
+    }
     let (source, source_oid) = resolve_local_branch(store.store(), &source)?;
     let (base, base_oid) = resolve_local_branch(store.store(), &base)?;
     if source == base {
@@ -224,6 +242,7 @@ fn cmd_pr_create(args: &[String]) -> Result<String, String> {
             &actor,
             body.as_deref().filter(|b| !b.is_empty()),
             &labels,
+            closes,
         )
         .map_err(|e| e.to_string())?;
     // The pending CI Check marker is published INSIDE `create_pr`'s single
@@ -291,6 +310,9 @@ fn cmd_pr_show(store: &EventStore, args: &[String]) -> Result<String, String> {
             "labels: {}\n",
             sanitize_terminal(&state.labels.join(", "))
         ));
+    }
+    if let Some(c) = &state.closes {
+        out.push_str(&format!("closes: #{}\n", c));
     }
     for c in &state.comments {
         out.push_str(&format!("comment: {}\n", sanitize_terminal(c)));
@@ -527,7 +549,7 @@ pub fn run_pr(argv: &[String]) -> Result<String, String> {
 
 fn pr_sub_usage(sub: &str) -> Option<&'static str> {
     Some(match sub {
-        "create" => "usage: git forge pr create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]...",
+        "create" => "usage: git forge pr create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]... [--closes <n>]",
         "list" => "usage: git forge pr list",
         "show" => "usage: git forge pr show <n>",
         "comment" => "usage: git forge pr comment <n> <body>",
@@ -540,7 +562,7 @@ fn pr_sub_usage(sub: &str) -> Option<&'static str> {
 fn pr_help() -> String {
     "usage: git forge pr <create|list|show|comment|review|diff|merge> ...\n\
      \nsubcommands:\n\
-     \x20 create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]...\n\
+     \x20 create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]... [--closes <n>]\n\
      \x20 list\n\
      \x20 show <n>\n\
      \x20 comment <n> <body>\n\

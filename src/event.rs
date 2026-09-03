@@ -312,6 +312,9 @@ pub struct PrState {
     pub source_head: Option<String>,
     pub base_head: Option<String>,
     pub merge_base: Option<String>,
+    /// Issue id the PR declares it closes (from the optional `closes` body
+    /// field of `pr.created`); `None` when the PR declares no relationship.
+    pub closes: Option<u64>,
     pub comments: Vec<String>,
     pub effective_decision: Option<String>,
     pub merge_result: Option<String>,
@@ -343,6 +346,7 @@ impl PrState {
                 self.source_head = str_field(&event.body, "source_head");
                 self.base_head = str_field(&event.body, "base_head");
                 self.merge_base = str_field(&event.body, "merge_base");
+                self.closes = event.body.get("closes").and_then(JsonValue::as_u64);
             }
             EventKind::PrComment => {
                 if let Some(body) = str_field(&event.body, "body") {

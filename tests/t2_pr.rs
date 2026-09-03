@@ -1043,6 +1043,114 @@ fn pr_create_supports_body_and_labels() {
     );
 }
 
+/// t1 / VAL-001: `pr create --closes <n>` records the relationship in the
+/// `pr.created` event (optional numeric `closes` body field) and `pr show`
+/// renders `closes: #<n>`.
+#[test]
+fn pr_create_closes_records_and_shows() {
+    let dir = tmpdir("closes");
+    init_repo(&dir);
+    let (ci, _, ei) = forge(&dir, &["forge", "issue", "new", "linked bug"]);
+    assert_eq!(ci, 0, "setup: issue new failed: {ei}");
+    make_feature(&dir, "feature", "feat\n");
+    let (c, o, e) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "create",
+            "--source",
+            "feature",
+            "--base",
+            "main",
+            "Fix linked bug",
+            "--closes",
+            "1",
+        ],
+    );
+    assert_eq!(c, 0, "pr create --closes failed: {e}");
+    assert!(o.contains("PR #2 created"), "create output: {o}");
+
+    let (cs, os, es) = forge(&dir, &["forge", "pr", "show", "2"]);
+    assert_eq!(cs, 0, "pr show failed: {es}");
+    assert!(
+        os.contains("closes: #1"),
+        "show must render the closes relationship: {os}"
+    );
+
+    // The pr.created event itself carries the closes id as a numeric field,
+    // so the fold/surface is not the only record of the relationship.
+    let (ct, ot, et) = git(&dir, &["show", "refs/forge/prs/2/meta:.forge/event.json"]);
+    assert_eq!(ct, 0, "meta event read failed: {et}");
+    assert!(ot.contains("\"closes\":1"), "event body: {ot}");
+}
+
+/// t1: `pr create --closes <n>` with a nonexistent issue id is rejected BEFORE
+/// any allocation: clean error, no PR refs, and no sequence id consumed (the
+/// next issue still gets #1, the next PR still gets #2 — create stays atomic).
+#[test]
+fn pr_create_closes_nonexistent_issue_is_atomic() {
+    let dir = tmpdir("closes-missing");
+    init_repo(&dir);
+    make_feature(&dir, "feature", "feat\n");
+    let (c, _o, e) = forge(
+        &dir,
+        &[
+            "forge", "pr", "create", "--source", "feature", "--base", "main", "T", "--closes", "7",
+        ],
+    );
+    assert_ne!(c, 0, "nonexistent closes must error; stdout={_o}");
+    assert!(e.contains("issue #7 does not exist"), "stderr: {e}");
+    // No partial PR state.
+    assert!(ref_oid(&dir, "refs/forge/prs/1/head").is_none());
+    assert!(ref_oid(&dir, "refs/forge/prs/1/meta").is_none());
+    assert!(ref_oid(&dir, "refs/forge/meta/counter").is_none());
+
+    // No sequence id consumed: next issue is #1, next PR is #2.
+    let (ci, _, ei) = forge(&dir, &["forge", "issue", "new", "first"]);
+    assert_eq!(ci, 0, "issue new failed: {ei}");
+    let (cs, os, _) = forge(&dir, &["forge", "issue", "show", "1"]);
+    assert_eq!(cs, 0, "issue show failed");
+    assert!(os.contains("first"), "issue #1 must be the next id: {os}");
+    let (cp, op, ep) = forge(
+        &dir,
+        &[
+            "forge", "pr", "create", "--source", "feature", "--base", "main", "second",
+        ],
+    );
+    assert_eq!(cp, 0, "pr create failed: {ep}");
+    assert!(op.contains("PR #2 created"), "next PR must be #2: {op}");
+}
+
+/// t1: `pr create` without `--closes` leaves the wire format exactly as
+/// before — the `pr.created` body carries no `closes` field and `pr show`
+/// renders no `closes:` line.
+#[test]
+fn pr_create_without_closes_has_no_closes_field() {
+    let dir = tmpdir("closes-absent");
+    init_repo(&dir);
+    make_feature(&dir, "feature", "feat\n");
+    let (c, _, e) = forge(
+        &dir,
+        &[
+            "forge", "pr", "create", "--source", "feature", "--base", "main", "T",
+        ],
+    );
+    assert_eq!(c, 0, "pr create failed: {e}");
+    let (ct, ot, et) = git(&dir, &["show", "refs/forge/prs/1/meta:.forge/event.json"]);
+    assert_eq!(ct, 0, "meta event read failed: {et}");
+    assert!(
+        !ot.contains("\"closes\""),
+        "event body must carry no closes field without --closes: {ot}"
+    );
+    let (cs, os, es) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert_eq!(cs, 0, "pr show failed: {es}");
+    assert!(
+        !os.contains("closes:"),
+        "show must render no closes line without --closes: {os}"
+    );
+}
+
 #[test]
 fn cli_arg_validation_errors_are_user_facing() {
     // One pass covering the many CLI arg-validation branches: each misuse must
@@ -1059,8 +1167,15 @@ fn cli_arg_validation_errors_are_user_facing() {
         ],
     );
     assert_eq!(cc, 0, "pr create failed: {ec}");
-    let cases: [(&[&str], &str); 11] = [
+    let cases: [(&[&str], &str); 12] = [
         (&["forge", "issue", "new"], "usage: git forge issue new"),
+        (
+            &[
+                "forge", "pr", "create", "--source", "feature", "--base", "main", "t", "--closes",
+                "abc",
+            ],
+            "invalid entity id",
+        ),
         (
             &["forge", "issue", "comment", "1"],
             "usage: git forge issue comment",

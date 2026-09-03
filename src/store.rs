@@ -779,6 +779,7 @@ impl BoundEventStore {
         actor: &str,
         description: Option<&str>,
         labels: &[String],
+        closes: Option<u64>,
     ) -> Result<u64, StoreError> {
         for _ in 0..MAX_ALLOC_RETRIES {
             let (counter_tip, counter_new, next, genesis) =
@@ -820,6 +821,9 @@ impl BoundEventStore {
             }
             if !labels.is_empty() {
                 body.insert("labels".into(), crate::event::json_string_array(labels));
+            }
+            if let Some(c) = closes {
+                body.insert("closes".into(), JsonValue::Number(c as i64));
             }
             let event = Event::new(EventKind::PrCreated, "pr", next, actor, body);
             let message = format!("forge:{}:{}", event.kind.as_str(), event.entity_id);

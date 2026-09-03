@@ -468,6 +468,7 @@ fn create_pr_creates_head_meta_source_base_atomically() {
             "a@x",
             None,
             &[],
+            None,
         )
         .unwrap();
     assert_eq!(id, 1, "first PR gets id 1");
@@ -589,6 +590,7 @@ fn create_pr_creates_head_meta_source_base_atomically() {
             "a@x",
             None,
             &[],
+            None,
         )
         .unwrap();
     assert_eq!(id2, 2, "second PR gets id 2");
@@ -627,6 +629,7 @@ fn create_pr_rejects_preexisting_ref_without_touching_counter() {
         "a@x",
         None,
         &[],
+        None,
     );
     assert!(res.is_err());
     assert!(matches!(res, Err(StoreError::RefExists(_))));
@@ -694,6 +697,7 @@ fn create_pr_failed_publication_leaves_counter_and_pr_refs_unchanged() {
         "a@x",
         None,
         &[],
+        None,
     );
     assert!(res.is_err());
     assert!(matches!(res, Err(StoreError::RefExists(_))));
@@ -964,6 +968,7 @@ fn merge_squash_refuses_pr_created_with_empty_title() {
                     "a@x",
                     None,
                     &[],
+                    None,
                 )
                 .expect("store-level create_pr accepts an empty title");
             assert_eq!(id, 1);
@@ -1035,6 +1040,7 @@ fn validate_refuses_created_event_outside_meta_commit() {
                 "a@x",
                 None,
                 &[],
+                None,
             )
             .unwrap();
         assert_eq!(id, 1);
@@ -1102,6 +1108,7 @@ fn validate_refuses_chain_with_no_created_event() {
                 "a@x",
                 None,
                 &[],
+                None,
             )
             .unwrap();
         assert_eq!(id, 1);
@@ -1293,6 +1300,7 @@ fn concurrent_create_pr_retries_and_yields_distinct_ids() {
             "a@x",
             None,
             &[],
+            None,
         )
     });
     let h2 = std::thread::spawn(move || {
@@ -1309,6 +1317,7 @@ fn concurrent_create_pr_retries_and_yields_distinct_ids() {
             "a@x",
             None,
             &[],
+            None,
         )
     });
     let r1 = h1.join().unwrap();
