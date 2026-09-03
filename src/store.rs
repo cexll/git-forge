@@ -32,7 +32,7 @@ const MAX_APPEND_RETRIES: u32 = 3;
 const MAX_ALLOC_RETRIES: u32 = 3;
 
 /// All-zero OID used by `git update-ref` to mean "ref must not exist".
-const ZERO_OID: &str = "0000000000000000000000000000000000000000";
+pub(crate) const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 
 /// Entity ref path helpers (wire contract § Ref Layout).
 pub fn issue_ref(n: u64) -> String {
@@ -180,7 +180,7 @@ impl EventStore {
     /// Run `git update-ref --stdin` with the given transaction lines.
     /// Returns Ok(()) when every command applied atomically, Err otherwise
     /// (stderr included in the error). Never swallows failures.
-    fn run_update_ref_stdin(&self, lines: &[String]) -> Result<(), StoreError> {
+    pub(crate) fn run_update_ref_stdin(&self, lines: &[String]) -> Result<(), StoreError> {
         use std::io::Write;
         let mut child = Command::new("git")
             .arg("--git-dir")
@@ -243,7 +243,7 @@ impl EventStore {
         }
     }
 
-    fn current_tip(&self, entity_ref: &str) -> Result<Option<Oid>, StoreError> {
+    pub(crate) fn current_tip(&self, entity_ref: &str) -> Result<Option<Oid>, StoreError> {
         match self.repo.find_reference(entity_ref) {
             Ok(r) => Ok(r.target()),
             Err(e) if e.code() == git2::ErrorCode::NotFound => Ok(None),
@@ -603,7 +603,7 @@ impl BoundEventStore {
         Ok(oid)
     }
 
-    fn write_event_commit(
+    pub(crate) fn write_event_commit(
         &self,
         event: &Event,
         parents: &[Oid],
@@ -867,99 +867,6 @@ impl BoundEventStore {
             }
         }
         Err(StoreError::Exhausted)
-    }
-
-    /// Atomically create the pending result ref `refs/forge/prs/<n>/result` →
-    /// `result_commit` (expected absence). It keeps the freshly-built merge
-    /// result reachable through `git gc` until the final completion
-    /// transaction (wire contract § Merge completion).
-    pub fn create_pending_result_ref(
-        &self,
-        pr_id: u64,
-        result_commit: Oid,
-    ) -> Result<(), StoreError> {
-        let r = pr_result_ref(pr_id);
-        self.inner
-            .run_update_ref_stdin(&[format!("update {r} {result_commit} {ZERO_OID}")])
-    }
-
-    /// Best-effort deletion of the pending result ref (CAS: it must hold
-    /// `result_commit`). Ok(true) deleted; Ok(false) ref was already absent
-    /// (nothing to clean); Err when the ref still exists but CAS failed.
-    pub fn delete_pending_result_ref(
-        &self,
-        pr_id: u64,
-        result_commit: Oid,
-    ) -> Result<bool, StoreError> {
-        let r = pr_result_ref(pr_id);
-        let line = format!("update {r} {ZERO_OID} {result_commit}");
-        match self.inner.run_update_ref_stdin(&[line]) {
-            Ok(()) => Ok(true),
-            Err(_) => {
-                if self.inner.current_tip(&r)?.is_none() {
-                    Ok(false) // already gone
-                } else {
-                    Err(StoreError::RefExists(r))
-                }
-            }
-        }
-    }
-
-    /// Write an unappended `pr.merge` event commit (dangling object, parent =
-    /// `head_tip`) so the PR chain can be CAS-moved to it in the same
-    /// transaction as the base branch and the pending-ref deletion. The event
-    /// is constructed ONCE by the caller and reused across CAS retries, so a
-    /// retry after a legitimate green append reparents the SAME `pr.merge`
-    /// event (retained UUID + timestamp) instead of regenerating its identity
-    /// (F-009).
-    fn write_unappended_pr_merge_commit(
-        &self,
-        event: &Event,
-        head_tip: Oid,
-    ) -> Result<Oid, StoreError> {
-        let message = format!("forge:{}:{}", event.kind.as_str(), event.entity_id);
-        self.write_event_commit(event, &[head_tip], &message)
-    }
-
-    /// Atomic merge completion (wire contract § Merge completion): write the
-    /// `pr.merge` event commit (dangling, parented to `head_expected`), then
-    /// ONE `git update-ref --stdin` transaction that (1) deletes the pending
-    /// `/result` ref, (2) CAS-updates `refs/heads/<base_ref>` from the PR's
-    /// snapshot `base_head` to `result_commit`, and (3) CAS-moves the PR
-    /// `/head` chain to the `pr.merge` event commit.
-    ///
-    /// `head_expected` is the PR-head OID the caller's gate validated — the
-    /// CAS refuses to advance the head from a tip that is no longer current.
-    /// F-007: the caller must NOT re-read and accept an arbitrary current tip
-    /// here, because a concurrent append (e.g. a `ci run` recording a failed
-    /// Check) could move the head to a tip whose gate no longer holds. On
-    /// failure nothing moved; the caller reports the leftover pending ref.
-    /// `merge_event` is the single `pr.merge` event built once by the caller
-    /// (F-009); it is re-parented to `head_expected` on each retry. `actor`
-    /// and `result_commit` are carried inside it, per the wire contract
-    /// `"actor": "<user.email>"` and the `result_commit` body field.
-    pub fn finalize_pr_merge(
-        &self,
-        pr_id: u64,
-        base_ref: &str,
-        base_expected: Oid,
-        result_commit: Oid,
-        merge_event: &Event,
-        head_expected: Oid,
-    ) -> Result<(), StoreError> {
-        let head_ref = pr_head_ref(pr_id);
-        let head_new = self.write_unappended_pr_merge_commit(merge_event, head_expected)?;
-        let result = pr_result_ref(pr_id);
-        let base_branch_ref = format!("refs/heads/{base_ref}");
-        let lines = vec![
-            // delete pending result ref (expected presence).
-            format!("update {result} {ZERO_OID} {result_commit}"),
-            // CAS base branch from snapshot base_head to result_commit.
-            format!("update {base_branch_ref} {result_commit} {base_expected}"),
-            // CAS PR head chain from the gate-validated tip to pr.merge commit.
-            format!("update {head_ref} {head_new} {head_expected}"),
-        ];
-        self.inner.run_update_ref_stdin(&lines)
     }
 }
 

@@ -76,10 +76,11 @@ git-forge/
 │   └── architecture/git-forge.md   # WIRE CONTRACT — normative
 ├── src/
 │   ├── main.rs           # `git forge` entry binary
-│   ├── lib.rs            # module root: declares ci, cli, event, fold, git, identity, issue, pr_merge, store
+│   ├── lib.rs            # module root: declares ci, cli, event, fold, git, identity, issue, merge_state, pr_merge, store
 │   ├── cli.rs            # shared CLI plumbing + pr/ci command surfaces + dispatch
 │   ├── issue.rs          # issue command surface (t1b): new/list/show/comment/close/reopen
-│   ├── pr_merge.rs       # merge-gate predicate + cmd_pr_merge orchestration, pending-result cleanup
+│   ├── merge_state.rs     # merge-gate predicate + finalize transaction construction
+│   ├── pr_merge.rs       # cmd_pr_merge orchestration (worktree lifecycle) + pending-result cleanup
 │   ├── ci.rs + ci/       # CI plan runner; ci/validate.rs = justfile fallback validator (F-012)
 │   ├── identity.rs       # actor/user.email resolution (F-028) + mutation-store open
 │   ├── event.rs          # event model + JSON schema (pure)
@@ -96,8 +97,8 @@ git-forge/
 |-------|------|-----------------|-----------------|
 | core (pure) | `src/event.rs`, `src/fold.rs` | std only | git2, I/O |
 | store | `src/store.rs` | core | — |
-| git adapter | `src/git.rs` | git2 only | core, cli (merge-gate predicate stays in pr_merge) |
-| cli | `src/cli.rs`, `src/issue.rs`, `src/pr_merge.rs`, `src/ci.rs`, `src/identity.rs`, `src/main.rs` | core, store, git | — |
+| git adapter | `src/git.rs` | git2 only | core, cli (merge-gate predicate stays in merge_state) |
+| cli | `src/cli.rs`, `src/issue.rs`, `src/merge_state.rs`, `src/pr_merge.rs`, `src/ci.rs`, `src/identity.rs`, `src/main.rs` | core, store, git | — |
 
 - `core` has zero external dependencies and no I/O — enforced by clippy? No: enforced by review; `Cargo.toml` stays dep-free for the core slice.
 - Wire contract (`docs/architecture/git-forge.md`) is normative for ref layout, event JSON schema v1, counter CAS, and merge semantics. When in doubt, the architecture doc wins.
@@ -203,7 +204,7 @@ Before submitting or accepting a review, verify:
 
 ## Critical Paths
 
-White-box review required for changes touching these (L3): `src/store.rs` (git2 ref transactions, counter CAS, immutable snapshot refs) and merge gate/merge execution (`src/pr_merge.rs` merge-gate predicate, merge strategies in `src/git.rs`, temporary worktree handling, pending-result ref). These are irreversible operations — ref writes and merges mutate the repository. Any diff touching a critical path is flagged for human review.
+White-box review required for changes touching these (L3): `src/store.rs` (git2 ref transactions, counter CAS, immutable snapshot refs) and merge gate/merge execution (`src/merge_state.rs` merge-gate predicate + finalize construction, `src/pr_merge.rs` merge orchestration, merge strategies in `src/git.rs`, temporary worktree handling, pending-result ref). These are irreversible operations — ref writes and merges mutate the repository. Any diff touching a critical path is flagged for human review.
 
 ## Agent Operating Rules
 

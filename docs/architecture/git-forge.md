@@ -23,13 +23,14 @@ Must-not-haves (L1): web UI, single-file export, GitHub bridge, accounts/permiss
 |---|---|---|---|
 | `event` (model) | `Event`, `EventKind`, `JsonValue`, `is_uuid_v4` | Event schema v1, UUID generation, kind/body validation | Deep: pure, no I/O, fully testable; deletion would scatter state logic across CLI and store |
 | `fold` (state derivation) | `fold(events) -> FoldState`, `IssueState`/`PrState`/`SeqState`, `first_allocation` | Deterministic ordering, issue/PR state derivation, effective review decision | Pure, no I/O |
-| `store` (git refs) | `EventStore`: `append_event`, `read_chain`, `create_pr`, `allocate_id` (versioned counter CAS), `create_pending_result_ref`/`delete_pending_result_ref`, `finalize_pr_merge` | Ref naming under `refs/forge/*`, commit creation, packed-ref-safe reads, counter commit chain, one-transaction merge completion | Deep: hides all git plumbing; callers never touch refs directly |
+| `store` (git refs) | `EventStore`: `append_event`, `read_chain`, `create_pr`, `allocate_id` (versioned counter CAS) | Ref naming under `refs/forge/*`, commit creation, packed-ref-safe reads, counter commit chain | Deep: hides all git plumbing; callers never touch refs directly |
 | `identity` (actor) | `resolve_identity`, `bind_identity`, `open_mutation_store` | The invoking repo's `user.email` resolved once per write via `crate::git::config_get_identity` (a safe `git config --null --get` child — never libgit2, VAL-115 stage A). Stage A (config-open fault) propagates a clean CLI error; stage B (absent/empty/non-UTF-8 email) falls back to `forge@localhost`. Signature + actor are bound before any write. | Shallow: never a libgit2 `repo.config()` read at write time (the VAL-115 SIGSEGV-on-corrupt-config path) |
-| `git` (adapter) | `worktree_add`/`worktree_remove`/`worktree_list`, `base_checked_out_elsewhere`, `execute_strategy` (merge/squash/rebase), `cleanup_failed_worktree`, `require_single_merge_base` | `git` binary shell-outs for merge execution: strategy commands, abort/reset/clean failure cleanup, merge-base --all, worktree plumbing | Deep: protocol correctness delegated to git itself; the merge-gate predicate stays in `pr_merge` |
+| `git` (adapter) | `worktree_add`/`worktree_remove`/`worktree_list`, `base_checked_out_elsewhere`, `execute_strategy` (merge/squash/rebase), `cleanup_failed_worktree`, `require_single_merge_base` | `git` binary shell-outs for merge execution: strategy commands, abort/reset/clean failure cleanup, merge-base --all, worktree plumbing | Deep: protocol correctness delegated to git itself; the merge-gate predicate stays in `merge_state` |
 | `ci` (runner) | `ci_timeout`, `snapshot_ci_plan`, `run_ci_plan` | Bounded CI plan execution in a disposable worktree: immutable-snapshot plan resolution/materialization, process-group kill+reap under a deadline, env tightening | Security-sensitive: isolates the plan subprocess (`/bin/bash` / `just`) and its environment |
-| `pr_merge` (merge gate) | `cmd_pr_merge` | Merge-gate predicate (effective approve required) + stale-base / checked-out-base guards, temp-worktree lifecycle, pending-result ref, one-transaction finalize | Deep: the gate predicate + merge atomicity live here (not `cli`); `cli` dispatches to it |
+| `merge_state` (merge gate + finalize) | `read_merge_gate`/`validate_merge_gate_at`, `finalize_pr_merge`, `run_finalize`, `create_pending_result_ref`/`delete_pending_result_ref` | Merge-gate predicate (effective approve + latest CI Check) bound to the exact validated head OID (F-007/F-008), one-transaction merge completion with CAS retry (F-009/F-010), pending-result ref lifecycle | Deep: the gate predicate + merge atomicity live here (not `cli`); `cli` dispatches to it 
+| `pr_merge` (merge commands) | `cmd_pr_merge`, `pr_merge_help` | Merge orchestration (stale-base / checked-out-base guards, temp-worktree lifecycle, pending-result cleanup); gate + finalize delegated to `merge_state` | Deep: the orchestration boundary; `cli` dispatches to it |
 | `issue` (commands) | `run_issue` dispatch; issue `cmd_*` handlers | Issue command parsing + human-readable output; all storage via `store`; shared plumbing (entity-id parsing, sanitization, store openers) from `cli` | Shallow: command surface only |
-| `cli` (entry) | `run_pr`, `run_ci` dispatch; `cmd_pr_diff` (arguments + result handling) | Command parsing; the merge-gate predicate + orchestration live in `pr_merge`; `cmd_pr_diff` delegates the subprocess to `git::git_in_ci` | Shallow by design: dispatch only, no direct subprocess spawning (diff goes through the sanitized git adapter) |
+| `cli` (entry) | `run_pr`, `run_ci` dispatch; `cmd_pr_diff` (arguments + result handling) | Command parsing; the merge-gate predicate + finalize live in `merge_state`, orchestration in `pr_merge`; `cmd_pr_diff` delegates the subprocess to `git::git_in_ci` | Shallow by design: dispatch only, no direct subprocess spawning (diff goes through the sanitized git adapter) |
 | `sync` (L2) | — | Explicit forge refspec push, additive fetch refspec, per-entity DAG merge convergence | Not built in L1; no `src/sync.rs` yet |
 | `hooks` (L2) | — | Pre-receive/post-receive hooks, refspec validation | Not built in L1; no `src/hooks.rs` yet |
 
@@ -40,6 +41,7 @@ cli → store → event/fold
 cli → git
 cli → ci
 cli → pr_merge → store → event/fold
+cli → merge_state → store → event/fold
 cli → identity
 ci → git2 (plan materialization; no core, no store)
 git → git2 (no core, no store)
@@ -48,8 +50,8 @@ event/fold: zero external dependencies (no git, no I/O)
 
 - `event`/`fold` never import git2 or perform I/O; tests run with no infrastructure.
 - `store` depends on `event`/`fold` types only.
-- `cli` is the only module that parses user input; the merge-gate predicate lives in `pr_merge`.
-- `pr_merge` owns the merge-gate predicate + merge orchestration; `cli` dispatches to it. `identity` resolves the actor/signature once per write.
+- `cli` is the only module that parses user input; the merge-gate predicate + finalize construction live in `merge_state`; merge orchestration lives in `pr_merge`.
+- `merge_state` owns the merge-gate predicate + finalize transaction construction; `pr_merge` owns the merge orchestration; `cli` dispatches to it. `identity` resolves the actor/signature once per write.
 - `git` is the only module that shells out for merge execution; it does not import `cli` or `store`.
 - `ci` is the only module that executes the CI plan subprocess (`/bin/bash` for `.forge/ci.sh`, `just` for the `just check` fallback) and performs process-group signalling via a direct `kill(2)` syscall (`libc`, no spawned `/bin/kill`); it imports git2 for plan materialization but never `core`/`store`.
 - `sync` (L2) will depend on `store`, `event`/`fold`, and `git`; it is not wired in L1.
