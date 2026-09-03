@@ -32,6 +32,8 @@
 
 **CI Check** — a Forge Event recording the outcome of a CI Run on a pull request (`status`: pending/success/failed). The Merge Gate requires the latest CI Check to be green (shipped in L1). _Avoid_: pipeline, CI gate, job.
 
+**Abandoned PR** — a PR in the terminal state set by a `pr.abandoned` event, carrying the required abandonment `reason`. No mutator opens it again: merge, review, and CI run refuse it, naming the reason, and a second abandon refuses with the original reason; there is no reopen — a reopened PR is a new entity. _Avoid_: cancelled PR, dropped PR, closed PR.
+
 **System of Record** — the surface where an entity's authoritative state lives. For this repository's work tracking, the forge's own `refs/forge/*`; GitHub is a code-distribution mirror only. _Avoid_: tracker, source of truth.
 
 **Spec of Record** — the committed, digest-pinned plan artifacts (spec.md, tickets/, features.json, validation-contract.json) that a mission verifies against. Distinct from **Mission Runtime**. _Avoid_: docs, plan file.
