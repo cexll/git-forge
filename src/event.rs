@@ -42,6 +42,7 @@ pub enum EventKind {
     PrComment,
     PrReview,
     PrMerge,
+    PrAbandoned,
     CiCheck,
 }
 
@@ -56,6 +57,7 @@ impl EventKind {
             EventKind::PrComment => "pr.comment",
             EventKind::PrReview => "pr.review",
             EventKind::PrMerge => "pr.merge",
+            EventKind::PrAbandoned => "pr.abandoned",
             EventKind::CiCheck => "ci.check",
         }
     }
@@ -74,6 +76,7 @@ impl std::str::FromStr for EventKind {
             "pr.comment" => Self::PrComment,
             "pr.review" => Self::PrReview,
             "pr.merge" => Self::PrMerge,
+            "pr.abandoned" => Self::PrAbandoned,
             "ci.check" => Self::CiCheck,
             _ => return Err(()),
         })
@@ -318,6 +321,10 @@ pub struct PrState {
     pub comments: Vec<String>,
     pub effective_decision: Option<String>,
     pub merge_result: Option<String>,
+    /// Abandon reason from the latest `pr.abandoned` event (`None` = live PR).
+    /// An abandoned PR is terminal: merge/review/ci run refuse it, and no
+    /// reopen exists — a reopened PR is a new entity.
+    pub abandoned: Option<String>,
     /// Latest CI Check status (success/failed/pending) — the fold keeps the
     /// most recently appended `ci.check` event, so the merge gate can read a
     /// single latest status. `None` when no CI Check has been recorded yet.
@@ -360,6 +367,9 @@ impl PrState {
             }
             EventKind::PrMerge => {
                 self.merge_result = str_field(&event.body, "result_commit");
+            }
+            EventKind::PrAbandoned => {
+                self.abandoned = str_field(&event.body, "reason");
             }
             EventKind::CiCheck => {
                 // The fold keeps the LATEST CI Check: each event overwrites the

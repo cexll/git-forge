@@ -39,9 +39,9 @@ if [ "$RC" -ne 0 ]; then
   echo "gf-dogfood-main-default: dogfood exited $RC (RED — gf-dogfood.sh cannot handle a main-default source)" >&2
   exit 1
 fi
-if ! printf '%s\n' "$OUT" | grep -Eq 'DOGFOOD SUMMARY pass=63 fail=0'; then
-  echo "gf-dogfood-main-default: dogfood exited 0 but the summary is not pass=63 fail=0:" >&2
+if ! printf '%s\n' "$OUT" | grep -Eq 'DOGFOOD SUMMARY pass=73 fail=0'; then
+  echo "gf-dogfood-main-default: dogfood exited 0 but the summary is not pass=73 fail=0:" >&2
   printf '%s\n' "$OUT" | grep 'DOGFOOD SUMMARY' >&2 || true
   exit 1
 fi
-echo "gf-dogfood-main-default: PASS — main-default dogfood 63/63"
+echo "gf-dogfood-main-default: PASS — main-default dogfood 73/73"

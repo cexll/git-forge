@@ -964,7 +964,7 @@ fn pr_help_lists_every_subcommand() {
     let (c, o, e) = forge(&dir, &["forge", "pr", "--help"]);
     assert_eq!(c, 0, "pr --help failed: {e}");
     for sub in [
-        "create", "list", "show", "comment", "review", "diff", "merge",
+        "create", "list", "show", "comment", "review", "diff", "merge", "abandon",
     ] {
         assert!(o.contains(sub), "pr help missing '{sub}': {o}");
     }
@@ -4875,4 +4875,226 @@ fn merge_refuses_criss_cross_multiple_merge_bases() {
         base_before,
         "base ref must be unchanged"
     );
+}
+
+// ── t4 / VAL-005: `pr abandon <n> --reason <text>` terminal state ──
+
+/// A successful abandon appends a single `pr.abandoned` event (reason in the
+/// body) to the PR head chain; `pr show` renders `abandoned: <reason>`.
+#[test]
+fn pr_abandon_appends_event_and_show_displays_reason() {
+    let dir = tmpdir("abandon-ok");
+    init_repo(&dir);
+    make_feature(&dir, "feature", "feat\n");
+    assert_eq!(
+        forge(
+            &dir,
+            &[
+                "forge",
+                "pr",
+                "create",
+                "--source",
+                "feature",
+                "--base",
+                "main",
+                "doomed PR"
+            ],
+        )
+        .0,
+        0
+    );
+    let head_before = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+    let (c, o, e) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "abandon",
+            "1",
+            "--reason",
+            "no longer needed",
+        ],
+    );
+    assert_eq!(c, 0, "abandon failed: {e} {o}");
+    assert!(o.contains("abandoned"), "abandon output: {o}");
+    let head_after = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+    assert_ne!(head_after, head_before, "abandon must append an event");
+    let ev = head_event(&dir, 1);
+    assert!(ev.contains("\"pr.abandoned\""), "head event kind: {ev}");
+    assert!(
+        ev.contains("\"reason\":\"no longer needed\""),
+        "head event reason: {ev}"
+    );
+    let (cs, os, es) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert_eq!(cs, 0, "show failed: {es}");
+    assert!(
+        os.contains("abandoned: no longer needed"),
+        "show output: {os}"
+    );
+}
+
+/// Missing / empty / whitespace-only `--reason` is rejected BEFORE any write:
+/// the PR head chain must not gain an event.
+#[test]
+fn pr_abandon_reason_missing_or_empty_rejected_no_event() {
+    let dir = tmpdir("abandon-reason");
+    init_repo(&dir);
+    make_feature(&dir, "feature", "feat\n");
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR"],
+        )
+        .0,
+        0
+    );
+    let head_before = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+    for args in [
+        vec!["forge", "pr", "abandon", "1"],
+        vec!["forge", "pr", "abandon", "1", "--reason", ""],
+        vec!["forge", "pr", "abandon", "1", "--reason", "   "],
+    ] {
+        let (c, _o, e) = forge(&dir, &args);
+        assert_ne!(c, 0, "args {args:?} must fail");
+        assert!(e.contains("--reason"), "args {args:?} stderr: {e}");
+    }
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        head_before,
+        "no event may be appended on a reason rejection"
+    );
+}
+
+/// Unknown PR id: exit non-zero, and the counter moves nowhere (abandon never
+/// allocates a sequence id).
+#[test]
+fn pr_abandon_nonexistent_pr_refused_no_counter_change() {
+    let dir = tmpdir("abandon-nopr");
+    init_repo(&dir);
+    make_feature(&dir, "feature", "feat\n");
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR"],
+        )
+        .0,
+        0
+    );
+    let counter_before = ref_oid(&dir, "refs/forge/meta/counter");
+    let (c, _o, e) = forge(&dir, &["forge", "pr", "abandon", "99", "--reason", "x"]);
+    assert_ne!(c, 0, "unknown PR must refuse abandon");
+    assert!(e.contains("#99"), "stderr must name the PR: {e}");
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/meta/counter"),
+        counter_before,
+        "counter must not move on an unknown-PR abandon"
+    );
+}
+
+/// An already-merged PR refuses abandon and appends nothing to the chain.
+#[test]
+fn pr_abandon_merged_pr_refused_no_event() {
+    let dir = tmpdir("abandon-merged");
+    make_passing_ci_pr(&dir);
+    assert_eq!(
+        forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
+        0
+    );
+    assert_eq!(forge(&dir, &["forge", "ci", "run", "1"]).0, 0);
+    git(&dir, &["checkout", "-q", "feature"]);
+    let (cm, om, em) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_eq!(cm, 0, "merge must succeed: {em} {om}");
+    let head_before = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+    let (c, _o, e) = forge(&dir, &["forge", "pr", "abandon", "1", "--reason", "late"]);
+    assert_ne!(c, 0, "a merged PR must refuse abandon: {e}");
+    assert!(
+        e.contains("already merged"),
+        "refusal must name the merged state: {e}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        head_before,
+        "no event may be appended to a merged PR"
+    );
+}
+
+/// A second abandon refuses without writing a second event; the refusal names
+/// the ORIGINAL reason and `pr show` keeps displaying it.
+#[test]
+fn pr_abandon_twice_refused_keeps_original_reason() {
+    let dir = tmpdir("abandon-twice");
+    init_repo(&dir);
+    make_feature(&dir, "feature", "feat\n");
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR"],
+        )
+        .0,
+        0
+    );
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "abandon", "1", "--reason", "original reason"],
+        )
+        .0,
+        0
+    );
+    let head_after_first = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+    let (c, _o, e) = forge(
+        &dir,
+        &["forge", "pr", "abandon", "1", "--reason", "second reason"],
+    );
+    assert_ne!(c, 0, "second abandon must refuse");
+    assert!(
+        e.contains("original reason"),
+        "refusal must name the ORIGINAL reason: {e}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        head_after_first,
+        "no second pr.abandoned event"
+    );
+    let (_cs, os, _es) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert!(os.contains("abandoned: original reason"), "show: {os}");
+    assert!(
+        !os.contains("second reason"),
+        "show must keep the first reason: {os}"
+    );
+}
+
+/// Flag/shape errors are clean user-facing failures; help flags succeed and
+/// print the usage even outside a git repository.
+#[test]
+fn pr_abandon_flag_and_help_errors_are_clean() {
+    let dir = tmpdir("abandon-flags");
+    init_repo(&dir);
+    make_feature(&dir, "feature", "feat\n");
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "PR"],
+        )
+        .0,
+        0
+    );
+    let (c, _o, e) = forge(&dir, &["forge", "pr", "abandon", "1", "--reason"]);
+    assert_ne!(c, 0, "--reason without a value must fail");
+    assert!(e.contains("--reason requires"), "stderr: {e}");
+    let (c, _o, e) = forge(&dir, &["forge", "pr", "abandon", "1", "--recursive", "x"]);
+    assert_ne!(c, 0, "unknown option must fail");
+    assert!(e.contains("unknown option"), "stderr: {e}");
+    let (c, _o, e) = forge(
+        &dir,
+        &["forge", "pr", "abandon", "1", "--reason", "r", "extra"],
+    );
+    assert_ne!(c, 0, "stray positional must fail");
+    assert!(e.contains("unexpected"), "stderr: {e}");
+    let dir2 = tmpdir("abandon-help");
+    for flag in ["--help", "-h"] {
+        let (c, o, e) = forge(&dir2, &["forge", "pr", "abandon", flag]);
+        assert_eq!(c, 0, "pr abandon {flag} failed: {e}");
+        assert!(o.contains("usage: git forge pr abandon"), "help: {o}");
+    }
 }

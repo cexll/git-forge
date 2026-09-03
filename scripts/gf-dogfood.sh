@@ -301,6 +301,21 @@ git checkout -q feat/gf-conflict
 ck "conflict closes merge blocked" nonzero git forge pr merge 16
 at "conflict keeps linked issue open" 0 "git forge issue show 15 | grep -q open"
 
+# ── VAL-005/006 / t4: pr abandon terminal state ──
+git checkout -B feat/gf-abandon "$BASE_BRANCH"
+printf 'w\n' > gf-abandon.txt && git add gf-abandon.txt && git commit -qm "abandon c1"
+git checkout -q "$BASE_BRANCH"
+git forge pr create --source feat/gf-abandon --base "$BASE_BRANCH" "abandon PR" >/dev/null
+ck "abandon missing reason rejected" nonzero git forge pr abandon 17
+ck "abandon empty reason rejected" nonzero git forge pr abandon 17 --reason "   "
+ck "pr abandon with reason" 0 git forge pr abandon 17 --reason "not needed anymore"
+at "pr show renders abandoned reason" 0 "git forge pr show 17 | grep -q 'abandoned: not needed anymore'"
+ck "merge refuses abandoned PR" nonzero git forge pr merge 17
+at "merge error names abandon reason" 0 "git forge pr merge 17 2>&1 | grep -q 'not needed anymore'"
+ck "second abandon refused" nonzero git forge pr abandon 17 --reason again
+at "single pr.abandoned event on chain" 0 "[ \$(git log --format='%s' refs/forge/prs/17/head | grep -c 'forge:pr.abandoned:17') -eq 1 ]"
+ck "abandon merged PR refused" nonzero git forge pr abandon 2 --reason late
+ck "abandon unknown PR refused" nonzero git forge pr abandon 99 --reason x
 
 # ── AC-006a / VAL-015: concurrent comment CAS on an independent clone ──
 R2="$T/dogfood2"

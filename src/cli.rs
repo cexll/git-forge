@@ -278,6 +278,9 @@ fn cmd_pr_show(store: &EventStore, args: &[String]) -> Result<String, String> {
     if let Some(r) = &state.merge_result {
         out.push_str(&format!("merged: {}\n", sanitize_terminal(r)));
     }
+    if let Some(reason) = &state.abandoned {
+        out.push_str(&format!("abandoned: {}\n", sanitize_terminal(reason)));
+    }
     // The latest CI Check (fold) is surfaced so the run's outcome is readable.
     if let Some(s) = &state.ci_status {
         match &state.ci_plan {
@@ -461,6 +464,68 @@ fn cmd_pr_review(args: &[String]) -> Result<String, String> {
     Ok(format!("reviewed PR #{id} ({decision})"))
 }
 
+/// `git forge pr abandon <n> --reason <text>` — abandon is terminal: appends a
+/// single `pr.abandoned` event (body `{"reason": <text>}`) to the PR `/head`
+/// chain. Refuses an already-merged PR, a second abandon, and an unknown PR;
+/// every refusal writes nothing. The reason is required and must survive
+/// trimming (whitespace-only is rejected before any write). No reopen: a
+/// reopened PR is a new entity.
+fn cmd_pr_abandon(args: &[String]) -> Result<String, String> {
+    const USAGE: &str = "usage: git forge pr abandon <n> --reason <text>";
+    let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
+    let mut reason: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--reason" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err("--reason requires a text".into());
+                }
+                reason = Some(args[i].clone());
+            }
+            "-h" | "--help" => return Ok(USAGE.into()),
+            a if a.starts_with('-') => return Err(format!("unknown option '{a}'")),
+            other => {
+                return Err(format!(
+                    "unexpected argument '{other}'; usage: git forge pr abandon <n> --reason <text>"
+                ))
+            }
+        }
+        i += 1;
+    }
+    let reason = reason.ok_or_else(|| USAGE.to_string())?;
+    if reason.trim().is_empty() {
+        return Err("--reason is required and must be non-empty".into());
+    }
+    // Read-only path first: PR existence and terminality are validated WITHOUT
+    // resolving the mutable identity, so every refusal resolves nothing and
+    // writes nothing. The append below reopens the store bound to the actor.
+    let store = open_store()?;
+    let r = crate::store::pr_head_ref(id);
+    if !store_has_ref(&store, &r) {
+        return Err(format!("PR #{id} does not exist"));
+    }
+    let chain = store.read_chain(&r).map_err(|e| e.to_string())?;
+    let state = crate::event::fold(&chain).pr;
+    if state.merge_result.is_some() {
+        return Err(format!("PR #{id} is already merged"));
+    }
+    if let Some(original) = &state.abandoned {
+        return Err(format!("PR #{id} is already abandoned: {original}"));
+    }
+    let (store, actor) = open_mutation_store()?;
+    let ev = Event::new(
+        EventKind::PrAbandoned,
+        "pr",
+        id,
+        &actor,
+        body_obj(&[("reason", json_str(&reason))]),
+    );
+    store.append_event(&r, &ev).map_err(|e| e.to_string())?;
+    Ok(format!("PR #{id} abandoned: {reason}"))
+}
+
 /// `git forge pr diff <n>` — three-dot diff from the immutable snapshot refs.
 fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String, String> {
     let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
@@ -539,6 +604,7 @@ pub fn run_pr(argv: &[String]) -> Result<String, String> {
         "show" => cmd_pr_show(&open_store()?, &argv[1..]),
         "comment" => cmd_pr_comment(&argv[1..]),
         "review" => cmd_pr_review(&argv[1..]),
+        "abandon" => cmd_pr_abandon(&argv[1..]),
         "diff" => cmd_pr_diff(&open_store()?, &argv[1..]),
         "merge" => crate::pr_merge::cmd_pr_merge(open_store()?, &argv[1..]),
         "help" | "-h" | "--help" => Ok(pr_help()),
@@ -554,13 +620,14 @@ fn pr_sub_usage(sub: &str) -> Option<&'static str> {
         "show" => "usage: git forge pr show <n>",
         "comment" => "usage: git forge pr comment <n> <body>",
         "review" => "usage: git forge pr review <n> --approve|--reject [--file <f> --line <l> --commit <c>]",
+        "abandon" => "usage: git forge pr abandon <n> --reason <text>",
         "diff" => "usage: git forge pr diff <n>",
         _ => return None,
     })
 }
 
 fn pr_help() -> String {
-    "usage: git forge pr <create|list|show|comment|review|diff|merge> ...\n\
+    "usage: git forge pr <create|list|show|comment|review|diff|merge|abandon> ...\n\
      \nsubcommands:\n\
      \x20 create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]... [--closes <n>]\n\
      \x20 list\n\
@@ -568,7 +635,8 @@ fn pr_help() -> String {
      \x20 comment <n> <body>\n\
      \x20 review <n> --approve|--reject [--file <f> --line <l> --commit <c>]\n\
      \x20 diff <n>\n\
-     \x20 merge [<n>] [--squash|--rebase]"
+     \x20 merge [<n>] [--squash|--rebase]\n\
+     \x20 abandon <n> --reason <text>"
         .to_string()
 }
 

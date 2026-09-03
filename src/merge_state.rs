@@ -74,6 +74,14 @@ pub(crate) fn validate_merge_gate_at(
         ));
     }
 
+    // Abandoned PRs are terminal (pr.abandoned): refuse BEFORE the approve/CI
+    // gates and name the abandon reason, so an abandoned PR never falls
+    // through to a gate diagnostic. The exact tip folded here is the tip the
+    // completion transaction CASes from (F-007), so an abandon appended after
+    // this gate refuses the finalize via the CAS retry re-validation.
+    if let Some(reason) = &state.abandoned {
+        return Err(format!("PR #{id} is abandoned: {reason}"));
+    }
     // Gate: effective approve required (last reachable pr.review).
     if state.effective_decision.as_deref() != Some("approve") {
         return Err(format!(

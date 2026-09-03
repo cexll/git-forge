@@ -78,12 +78,14 @@ fn event_kind_string_roundtrip_all_kinds() {
         EventKind::PrComment,
         EventKind::PrReview,
         EventKind::PrMerge,
+        EventKind::PrAbandoned,
         EventKind::CiCheck,
     ] {
         assert_eq!(kind.as_str().parse::<EventKind>().unwrap(), kind);
     }
     assert!("ci.check".parse::<EventKind>().is_ok());
     assert!("pr.merge".parse::<EventKind>().is_ok());
+    assert!("pr.abandoned".parse::<EventKind>().is_ok());
     assert!("issue.bogus".parse::<EventKind>().is_err());
     assert!("".parse::<EventKind>().is_err());
 }
@@ -522,4 +524,29 @@ fn json_parser_rejects_truncated_surrogate_hex_escape() {
     assert_eq!(parse_json_value(r#""\uD83D\u12""#), None);
     assert_eq!(parse_json_value(r#""\uD83D\u""#), None);
     assert_eq!(parse_json_value(r#""\u""#), None);
+}
+/// The fold exposes the abandon reason of the latest `pr.abandoned` event:
+/// terminal-state projection, last-wins like the CI Check status.
+#[test]
+fn fold_carries_latest_pr_abandon_reason() {
+    let mk = |seq: u64, reason: &str| {
+        Event::new_with_id(
+            &format!("55555555-5555-4555-8555-{seq:012x}"),
+            EventKind::PrAbandoned,
+            "pr",
+            4,
+            "dev@example.com",
+            body_with(vec![("reason", JsonValue::String(reason.to_string()))]),
+        )
+        .unwrap()
+    };
+    // A single abandon event projects the reason into PrState::abandoned.
+    let st = fold(&[mk(1, "priorities changed")]);
+    assert_eq!(st.pr.abandoned.as_deref(), Some("priorities changed"));
+    // Last abandoned event wins (no history of reasons).
+    let st2 = fold(&[mk(2, "first"), mk(3, "second")]);
+    assert_eq!(st2.pr.abandoned.as_deref(), Some("second"));
+    // No abandoned event → live PR (None).
+    let st3 = fold(&[]);
+    assert_eq!(st3.pr.abandoned, None);
 }

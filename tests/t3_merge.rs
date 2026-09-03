@@ -3067,3 +3067,127 @@ fn merge_issue_cas_exhaustion_keeps_issue_open() {
     assert!(os.contains("open"), "issue must stay open: {os}");
     assert_no_temp_worktree_pr(&dir, 2);
 }
+
+// ── t4 / VAL-006: merge refuses an abandoned PR, naming the reason ──
+
+/// An abandoned PR whose gate would otherwise refuse with "not approved" must
+/// be refused with the ABANDON reason instead: the abandoned check precedes
+/// the merge-gate predicate. No ref moves, no `pr.merge` event, no worktree.
+#[test]
+fn merge_refuses_abandoned_pr_naming_reason_before_gate() {
+    let dir = tmpdir("abandon-gate-precedence");
+    init_repo(&dir);
+    make_feature(&dir, "feature", "feat\n");
+    assert_eq!(
+        forge(
+            &dir,
+            &[
+                "forge",
+                "pr",
+                "create",
+                "--source",
+                "feature",
+                "--base",
+                "main",
+                "abandoned PR"
+            ],
+        )
+        .0,
+        0
+    );
+    // No approve, no ci run: the gate alone would refuse "not approved". The
+    // abandonment check must fire FIRST and name the abandon reason.
+    assert_eq!(
+        forge(
+            &dir,
+            &[
+                "forge",
+                "pr",
+                "abandon",
+                "1",
+                "--reason",
+                "dropped by owner"
+            ]
+        )
+        .0,
+        0
+    );
+    checkout(&dir, "feature");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let head_before = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+    let (c, _o, e) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_ne!(c, 0, "merge on an abandoned PR must refuse: {e}");
+    assert!(
+        e.contains("dropped by owner"),
+        "stderr must name the abandon reason: {e}"
+    );
+    assert!(
+        !e.contains("not approved"),
+        "the abandoned check must precede the gate predicate: {e}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base must not move"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        head_before,
+        "PR head must not move"
+    );
+    let events = chain_event_jsons(&dir, "refs/forge/prs/1/head");
+    assert!(
+        events.iter().all(|j| !j.contains("\"kind\":\"pr.merge\"")),
+        "no pr.merge event: {events:?}"
+    );
+    assert_no_temp_worktree_pr(&dir, 1);
+}
+
+/// An approved + green-CI PR that is then abandoned must refuse the merge with
+/// the reason, even though the gate itself would have let it through.
+#[test]
+fn merge_refuses_abandoned_approved_pr_without_ref_changes() {
+    let dir = tmpdir("abandon-approved");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "approved then abandoned");
+    assert_eq!(
+        forge(
+            &dir,
+            &[
+                "forge",
+                "pr",
+                "abandon",
+                "1",
+                "--reason",
+                "owner changed mind"
+            ],
+        )
+        .0,
+        0
+    );
+    checkout(&dir, "feature");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let head_before = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+    let (c, _o, e) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_ne!(c, 0, "merge on an abandoned PR must refuse: {e}");
+    assert!(
+        e.contains("owner changed mind"),
+        "stderr must name the abandon reason: {e}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base must not move"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        head_before,
+        "PR head must not move"
+    );
+    let events = chain_event_jsons(&dir, "refs/forge/prs/1/head");
+    assert!(
+        events.iter().all(|j| !j.contains("\"kind\":\"pr.merge\"")),
+        "no pr.merge event: {events:?}"
+    );
+    assert_no_temp_worktree_pr(&dir, 1);
+}
