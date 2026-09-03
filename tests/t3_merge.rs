@@ -3191,3 +3191,88 @@ fn merge_refuses_abandoned_approved_pr_without_ref_changes() {
     );
     assert_no_temp_worktree_pr(&dir, 1);
 }
+// ── t6 / VAL-009+VAL-010: the abandon boundary matrix, one scenario ──
+
+/// The whole terminal-state matrix against ONE abandoned PR: every mutator —
+/// merge, review, ci run and a second abandon — refuses with a non-zero exit
+/// and names the SAME (original) reason text; each refusal writes nothing
+/// (PR head chain and base ref unchanged, exactly one pr.abandoned event),
+/// and `pr show` keeps displaying the original reason.
+#[test]
+fn all_mutators_refuse_abandoned_pr_with_same_reason_and_no_refs_move() {
+    let dir = tmpdir("abandon-matrix");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "matrix PR");
+    let reason = "matrix: dropped by owner";
+    let (c, _o, e) = forge(&dir, &["forge", "pr", "abandon", "1", "--reason", reason]);
+    assert_eq!(c, 0, "abandon must succeed: {e}");
+    checkout(&dir, "feature");
+    let head_before = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    // merge: same wording as the other mutators, names the reason.
+    let (c, _o, e) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_ne!(c, 0, "merge must refuse an abandoned PR: {e}");
+    assert!(
+        e.contains("PR #1 is abandoned: matrix: dropped by owner"),
+        "merge refusal must use the shared wording: {e}"
+    );
+    // review: same wording.
+    let (c, _o, e) = forge(&dir, &["forge", "pr", "review", "1", "--approve"]);
+    assert_ne!(c, 0, "review must refuse an abandoned PR: {e}");
+    assert!(
+        e.contains("PR #1 is abandoned: matrix: dropped by owner"),
+        "review refusal must use the shared wording: {e}"
+    );
+    // ci run: same wording.
+    let (c, _o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_ne!(c, 0, "ci run must refuse an abandoned PR: {e}");
+    assert!(
+        e.contains("PR #1 is abandoned: matrix: dropped by owner"),
+        "ci run refusal must use the shared wording: {e}"
+    );
+    // second abandon: names the ORIGINAL reason, never the new one.
+    let (c, _o, e) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "abandon",
+            "1",
+            "--reason",
+            "different reason",
+        ],
+    );
+    assert_ne!(c, 0, "second abandon must refuse: {e}");
+    assert!(
+        e.contains("PR #1 is already abandoned: matrix: dropped by owner")
+            && !e.contains("different reason"),
+        "second abandon must name the ORIGINAL reason: {e}"
+    );
+    // No refusal moved anything.
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        head_before,
+        "no refusal may append an event to the PR chain"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "no refusal may move the base ref"
+    );
+    let events = chain_event_jsons(&dir, "refs/forge/prs/1/head");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|j| j.contains("\"kind\":\"pr.abandoned\""))
+            .count(),
+        1,
+        "exactly one pr.abandoned event: {events:?}"
+    );
+    // show displays the original reason only.
+    let (_cs, os, _es) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert!(
+        os.contains("abandoned: matrix: dropped by owner"),
+        "show: {os}"
+    );
+    assert!(!os.contains("different reason"), "show: {os}");
+}

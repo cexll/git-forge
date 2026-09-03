@@ -314,7 +314,10 @@ ck "merge refuses abandoned PR" nonzero git forge pr merge 17
 at "merge error names abandon reason" 0 "git forge pr merge 17 2>&1 | grep -q 'not needed anymore'"
 ck "second abandon refused" nonzero git forge pr abandon 17 --reason again
 at "single pr.abandoned event on chain" 0 "[ \$(git log --format='%s' refs/forge/prs/17/head | grep -c 'forge:pr.abandoned:17') -eq 1 ]"
+at "second abandon error names original reason" 0 "git forge pr abandon 17 --reason again 2>&1 | grep -q 'not needed anymore'"
+at "show keeps original reason after second abandon" 0 "git forge pr show 17 | grep -q 'abandoned: not needed anymore' && ! git forge pr show 17 | grep -q 'abandoned: again'"
 ck "abandon merged PR refused" nonzero git forge pr abandon 2 --reason late
+at "merged PR abandon appends no event" 0 "[ \$(git log --format='%s' refs/forge/prs/2/head | grep -c 'forge:pr.abandoned:2') -eq 0 ]"
 ck "abandon unknown PR refused" nonzero git forge pr abandon 99 --reason x
 # ── VAL-007/008 / t5: review and ci run refuse an abandoned PR ──
 ck "review refuses abandoned PR" nonzero git forge pr review 17 --approve
