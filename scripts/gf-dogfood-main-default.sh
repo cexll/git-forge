@@ -4,8 +4,8 @@
 #
 # Builds a throwaway MAIN-default source repo (`git init -b main`, one base
 # commit holding PLAN.md), exports GDOGFOOD_SRC at it, then runs the FULL real
-# dogfood flow (scripts/gf-dogfood.sh — the same script `just dogfood` runs)
-# and asserts the DOGFOOD SUMMARY reports pass=51 fail=0.
+# dogfood flow (scripts/gf-dogfood.sh — the same script `just dogfood` runs) and asserts
+# the DOGFOOD SUMMARY reports pass=57 fail=0.
 #
 # RED against a gf-dogfood.sh that still hardcodes master (the run aborts at
 # the first `git checkout -B ... master`); GREEN after the default-branch fix.
@@ -39,9 +39,9 @@ if [ "$RC" -ne 0 ]; then
   echo "gf-dogfood-main-default: dogfood exited $RC (RED — gf-dogfood.sh cannot handle a main-default source)" >&2
   exit 1
 fi
-if ! printf '%s\n' "$OUT" | grep -Eq 'DOGFOOD SUMMARY pass=51 fail=0'; then
-  echo "gf-dogfood-main-default: dogfood exited 0 but the summary is not pass=51 fail=0:" >&2
+if ! printf '%s\n' "$OUT" | grep -Eq 'DOGFOOD SUMMARY pass=57 fail=0'; then
+  echo "gf-dogfood-main-default: dogfood exited 0 but the summary is not pass=57 fail=0:" >&2
   printf '%s\n' "$OUT" | grep 'DOGFOOD SUMMARY' >&2 || true
   exit 1
 fi
-echo "gf-dogfood-main-default: PASS — main-default dogfood 51/51"
+echo "gf-dogfood-main-default: PASS — main-default dogfood 57/57"

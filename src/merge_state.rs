@@ -11,7 +11,9 @@ use git2::Oid;
 use std::collections::HashMap;
 
 use crate::event::{Event, EventKind, JsonValue};
-use crate::store::{pr_head_ref, pr_result_ref, BoundEventStore, EventStore, StoreError, ZERO_OID};
+use crate::store::{
+    issue_ref, pr_head_ref, pr_result_ref, BoundEventStore, EventStore, StoreError, ZERO_OID,
+};
 
 /// Read the PR head ref tip and validate the merge gate against that EXACT tip
 /// (F-007, F-008): the folded [`crate::event::PrState`] is returned together
@@ -172,20 +174,20 @@ pub(crate) fn delete_pending_result_ref(
     }
 }
 
-/// Write an unappended `pr.merge` event commit (dangling object, parent =
-/// `head_tip`) so the PR chain can be CAS-moved to it in the same
-/// transaction as the base branch and the pending-ref deletion. The event
-/// is constructed ONCE by the caller and reused across CAS retries, so a
-/// retry after a legitimate green append reparents the SAME `pr.merge`
-/// event (retained UUID + timestamp) instead of regenerating its identity
-/// (F-009).
-pub(crate) fn write_unappended_pr_merge_commit(
+/// Write an unappended event commit (dangling object, sole parent `parent_tip`)
+/// so an entity ref can be CAS-moved to it in a later ref transaction — used
+/// for both the `pr.merge` event (parent = PR head tip) and the linked-issue
+/// `issue.close` event (parent = issue chain tip). The event is constructed
+/// ONCE by the caller and reused across CAS retries, so a retry reparents the
+/// SAME event (retained UUID + timestamp) instead of regenerating its
+/// identity (F-009).
+pub(crate) fn write_unappended_event_commit(
     store: &BoundEventStore,
     event: &Event,
-    head_tip: Oid,
+    parent_tip: Oid,
 ) -> Result<Oid, StoreError> {
     let message = format!("forge:{}:{}", event.kind.as_str(), event.entity_id);
-    store.write_event_commit(event, &[head_tip], &message)
+    store.write_event_commit(event, &[parent_tip], &message)
 }
 
 /// Atomic merge completion transaction construction (wire contract § Merge
@@ -206,27 +208,41 @@ pub(crate) fn write_unappended_pr_merge_commit(
 /// (F-009); it is re-parented to `head_expected` on each retry. `actor`
 /// and `result_commit` are carried inside it, per the wire contract
 /// `"actor": "<user.email>"` and the `result_commit` body field.
+///
+/// When the PR declares a `--closes` target, `issue_close` carries
+/// `(issue_id, close_commit, issue_expected)` — the freshly-written
+/// `issue.close` event commit and the issue-chain tip it was parented to —
+/// and the ATOMIC batch gains a fourth CAS: `refs/forge/issues/<n>` from
+/// `issue_expected` to `close_commit`. One transaction, all-or-nothing: if
+/// any CAS fails, nothing applies (issue, base and PR refs all unchanged).
 pub(crate) fn finalize_pr_merge(
     store: &BoundEventStore,
-    pr_id: u64,
-    base_ref: &str,
-    base_expected: Oid,
-    result_commit: Oid,
+    spec: &MergeFinalizeSpec<'_>,
     merge_event: &Event,
     head_expected: Oid,
+    issue_close: Option<(u64, Oid, Oid)>,
 ) -> Result<(), StoreError> {
-    let head_ref = pr_head_ref(pr_id);
-    let head_new = write_unappended_pr_merge_commit(store, merge_event, head_expected)?;
-    let result = pr_result_ref(pr_id);
-    let base_branch_ref = format!("refs/heads/{base_ref}");
-    let lines = vec![
+    let head_ref = pr_head_ref(spec.id);
+    let head_new = write_unappended_event_commit(store, merge_event, head_expected)?;
+    let result = pr_result_ref(spec.id);
+    let base_branch_ref = format!("refs/heads/{}", spec.base_ref);
+    let mut lines = vec![
         // delete pending result ref (expected presence).
-        format!("update {result} {ZERO_OID} {result_commit}"),
+        format!("update {result} {ZERO_OID} {}", spec.result_commit),
         // CAS base branch from snapshot base_head to result_commit.
-        format!("update {base_branch_ref} {result_commit} {base_expected}"),
+        format!(
+            "update {base_branch_ref} {} {}",
+            spec.result_commit, spec.base_oid
+        ),
         // CAS PR head chain from the gate-validated tip to pr.merge commit.
         format!("update {head_ref} {head_new} {head_expected}"),
     ];
+    if let Some((issue_id, close_oid, issue_expected)) = issue_close {
+        lines.push(format!(
+            "update {} {close_oid} {issue_expected}",
+            issue_ref(issue_id)
+        ));
+    }
     store.store().run_update_ref_stdin(&lines)
 }
 
@@ -240,11 +256,52 @@ pub(crate) struct MergeFinalizeSpec<'a> {
     pub actor: &'a str,
     pub strategy: &'a str,
     pub gate_head: Oid,
+    /// Issue id the PR declares it closes (`pr.created` body `closes` field),
+    /// captured at the same gate read as `gate_head`; `None` when the PR
+    /// declares no relationship. When present, the completion transaction
+    /// gains a fourth CAS: `refs/forge/issues/<n>` onto an `issue.close`
+    /// event commit, in the SAME batch as base + PR-head + pending delete.
+    pub closes_issue: Option<u64>,
+}
+/// Stage the linked-issue close for ONE finalize attempt (t2): fold the
+/// issue chain at its CURRENT tip and decide whether the transaction needs
+/// an `issue.close` at all. Returns `Some((issue_id, close_commit,
+/// expected_tip))` when the issue is open — the close commit is written NOW
+/// (dangling, sole parent = the expected tip, so the transaction's CAS can
+/// pin it) — or `None` when the issue is already closed (idempotent no-op:
+/// no second close event; the merge proceeds with base+PR actions only).
+/// An absent issue ref is a hard refusal: the close cannot be anchored to a
+/// real chain, and silently skipping an owed close would mask tampering.
+fn stage_issue_close(
+    store: &BoundEventStore,
+    issue_event: &Event,
+) -> Result<Option<(u64, Oid, Oid)>, String> {
+    let eref = issue_ref(issue_event.entity_id);
+    let tip = store
+        .store()
+        .current_tip(&eref)
+        .map_err(|e| format!("linked issue ref read failed: {e}"))?
+        .ok_or_else(|| format!("linked issue #{} ref is gone", issue_event.entity_id))?;
+    let chain = store
+        .read_chain(&eref)
+        .map_err(|e| format!("linked issue chain read failed: {e}"))?;
+    if !crate::event::fold(&chain).issue.open {
+        // Already closed: the fold's `open: false` is the single source of
+        // truth (last close/reopen on the chain), so no second close event.
+        return Ok(None);
+    }
+    let close_oid =
+        write_unappended_event_commit(store, issue_event, tip).map_err(|e| e.to_string())?;
+    Ok(Some((issue_event.entity_id, close_oid, tip)))
 }
 
 /// Build the `pr.merge` event ONCE (F-009) and run the atomic completion
 /// transaction with CAS retry: the transaction deletes the pending ref, CASes
 /// the base branch and CASes the PR head chain from the GATE-VALIDATED OID.
+/// When the PR declares a `--closes` target, the same transaction also CASes
+/// `refs/forge/issues/<n>` onto an `issue.close` event commit (t2) — staged
+/// fresh per attempt, skipped when the issue is already closed, and absent if
+/// the issue ref vanished (hard refusal, never a silent skip).
 /// The head ref is CAS'd from `head_expected`, never re-read and accepted: if
 /// a concurrent `ci run` moved the head during the pending window, the head
 /// CAS fails and nothing moves. We then re-read/refold and retry ONLY when the
@@ -257,6 +314,9 @@ pub(crate) struct MergeFinalizeSpec<'a> {
 /// tip whose gate no longer holds, or the head did not move and the
 /// failure is genuine) we refuse without advancing the base, preserving the
 /// pending result ref for genuine/sabotage failures (F-007, F-008, F-010).
+/// The one head-unchanged exception: the linked issue may have moved between
+/// staging and the transaction — that is a retryable concurrent write, and
+/// the loop rebuilds the issue stage (fresh fold + tip) and retries.
 pub(crate) fn run_finalize(
     store: &BoundEventStore,
     spec: MergeFinalizeSpec<'_>,
@@ -273,20 +333,42 @@ pub(crate) fn run_finalize(
         JsonValue::String(spec.result_commit.to_string()),
     );
     let merge_event = Event::new(EventKind::PrMerge, "pr", spec.id, spec.actor, merge_body);
+    // Single `issue.close` event constructed ONCE (F-009 analogue): every
+    // finalize attempt re-parents the SAME event to the then-current issue
+    // tip, so retries never regenerate the event identity, and its empty
+    // body / actor come from the same identity resolution the whole merge
+    // used (`spec.actor`) — no second identity path.
+    let issue_event: Option<Event> = spec.closes_issue.map(|cid| {
+        Event::new(
+            EventKind::IssueClose,
+            "issue",
+            cid,
+            spec.actor,
+            HashMap::new(),
+        )
+    });
     let head = pr_head_ref(spec.id);
     let mut head_expected = spec.gate_head;
     let mut attempts = 0u32;
     const MAX_FINALIZE_RETRIES: u32 = 3;
     loop {
-        match finalize_pr_merge(
-            store,
-            spec.id,
-            spec.base_ref,
-            spec.base_oid,
-            spec.result_commit,
-            &merge_event,
-            head_expected,
-        ) {
+        // Stage the issue close for THIS attempt (fresh fold + fresh tip):
+        // the CAS retry loop rebuilds the parent/expected tip every attempt
+        // (t2), so an attempt that fails because the issue moved concurrently
+        // retries against the new tip, and a retry after a head-move CAS
+        // failure drops the previous attempt's stale staging entirely.
+        let issue_stage: Option<(u64, Oid, Oid)> = match &issue_event {
+            Some(ev) => stage_issue_close(store, ev).map_err(|cause| {
+                format!(
+                    "merge execution finished but {cause}; refs unchanged, \
+                     pending result ref refs/forge/prs/{}/result left in place",
+                    spec.id
+                )
+            })?,
+            None => None,
+        };
+        let issue_expected = issue_stage.map(|(_, _, exp)| exp);
+        match finalize_pr_merge(store, &spec, &merge_event, head_expected, issue_stage) {
             Ok(()) => break,
             Err(e) => {
                 // F-008: read the EXACT current head tip ONCE. The candidate we
@@ -309,10 +391,43 @@ pub(crate) fn run_finalize(
                         spec.id
                     ));
                 };
-                // Head did not move: the failure is genuine (base / pending-ref
-                // / git error). Refuse with refs unchanged and the pending ref
-                // left in place.
+                // Head did not move. The failure can still be the linked-issue
+                // CAS (t2): a concurrent issue write between this attempt's
+                // staging and the transaction moved the issue tip, so the
+                // whole batch failed and nothing applied. Retry with a
+                // rebuilt issue stage (fresh fold + tip); otherwise the
+                // failure is genuine (base / pending-ref / git error) and we
+                // refuse with refs unchanged and the pending ref left in
+                // place.
                 if tip == head_expected {
+                    let issue_moved = match (spec.closes_issue, issue_expected) {
+                        (Some(cid), Some(expected)) => store
+                            .store()
+                            .current_tip(&issue_ref(cid))
+                            .ok()
+                            .flatten()
+                            .map(|now| now != expected)
+                            .unwrap_or(false),
+                        _ => false,
+                    };
+                    if issue_moved {
+                        attempts += 1;
+                        if attempts > MAX_FINALIZE_RETRIES {
+                            let pending = cleanup_pending_result(
+                                store,
+                                spec.id,
+                                spec.result_commit,
+                                lock_handle,
+                                tmp,
+                            );
+                            return Err(format!(
+                                "merge execution finished but the merge inputs \
+                                 kept moving during finalization ({e}); refs \
+                                 unchanged{pending}"
+                            ));
+                        }
+                        continue;
+                    }
                     return Err(format!(
                         "merge execution finished but final transaction failed \
                          ({e}); refs unchanged, pending result ref \
@@ -389,8 +504,8 @@ pub(crate) fn run_finalize(
                         tmp,
                     );
                     return Err(format!(
-                        "merge execution finished but the PR head kept moving \
-                         during finalization ({e}); refs unchanged{pending}"
+                        "merge execution finished but the merge inputs kept \
+                         moving during finalization ({e}); refs unchanged{pending}"
                     ));
                 }
             }

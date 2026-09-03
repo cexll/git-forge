@@ -242,6 +242,24 @@ at "pr.created event carries closes id" 0 "git show refs/forge/prs/8/meta:.forge
 at "no closes line without --closes" 0 "! git forge pr show 2 | grep -q 'closes:'"
 ck "pr create nonexistent closes" nonzero git forge pr create --source feat/gf-closes --base "$BASE_BRANCH" T-closes --closes 99
 at "rejected closes consumes no sequence id" 0 "git forge pr create --source feat/gf-closes --base \"\$BASE_BRANCH\" after-bad >/dev/null && git forge pr show 9 | grep -q 'after-bad'"
+# ── s1 / VAL-002/003: merge with --closes closes the linked issue in the SAME
+# finalize transaction; an already-closed target is a no-op (no second close) ──
+git forge pr review 8 --approve >/dev/null
+git forge ci run 8 >/dev/null
+git checkout -q feat/gf-closes
+ck "merge with closes succeeds" 0 git forge pr merge 8
+at "merge closes linked issue" 0 "git forge issue show 1 | grep -q closed"
+at "two close events on issue chain" 0 "[ \$(git log --format='%s' refs/forge/issues/1 | grep -c 'forge:issue.close:1') -eq 2 ]"
+git checkout -B feat/gf-closes2 "$BASE_BRANCH"
+printf 'r\n' > gf-closes2.txt && git add gf-closes2.txt && git commit -qm "closes2 c1"
+git checkout -q "$BASE_BRANCH"
+git forge pr create --source feat/gf-closes2 --base "$BASE_BRANCH" "closes PR 2" --closes 1 >/dev/null
+git forge pr review 10 --approve >/dev/null
+git forge ci run 10 >/dev/null
+git checkout -q feat/gf-closes2
+ck "pre-closed target merge succeeds" 0 git forge pr merge 10
+at "no second close event" 0 "[ \$(git log --format='%s' refs/forge/issues/1 | grep -c 'forge:issue.close:1') -eq 2 ]"
+at "issue still closed after pre-closed merge" 0 "git forge issue show 1 | grep -q closed"
 
 # ── AC-006a / VAL-015: concurrent comment CAS on an independent clone ──
 R2="$T/dogfood2"
