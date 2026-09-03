@@ -4,7 +4,7 @@
 
 ### Entities
 
-**Issue** — a tracked request, defect, or discussion item on the repository. Its state is derived by replaying its event chain. _Avoid_: ticket, bug, task.
+**Issue** — a tracked request, defect, or discussion item on the repository. Its state is derived by replaying its event chain. A devflow **Ticket** is not an Issue: the Ticket is the authored vertical slice, and an Issue is the tracking projection filed against it. _Avoid_: bug, task.
 
 **Pull Request (PR)** — a proposal to merge a set of commits from a source ref into a base ref, carrying review events and merge state. Its state is derived by replaying its event chain. _Avoid_: merge request.
 
@@ -31,5 +31,13 @@
 **CI Run** — an on-demand execution of a configured shell plan whose result is written back as a Forge Event. No server or daemon is involved. _Avoid_: pipeline, job service.
 
 **CI Check** — a Forge Event recording the outcome of a CI Run on a pull request (`status`: pending/success/failed). The Merge Gate requires the latest CI Check to be green (shipped in L1). _Avoid_: pipeline, CI gate, job.
+
+**System of Record** — the surface where an entity's authoritative state lives. For this repository's work tracking, the forge's own `refs/forge/*`; GitHub is a code-distribution mirror only. _Avoid_: tracker, source of truth.
+
+**Spec of Record** — the committed, digest-pinned plan artifacts (spec.md, tickets/, features.json, validation-contract.json) that a mission verifies against. Distinct from **Mission Runtime**. _Avoid_: docs, plan file.
+
+**Mission Runtime** — the scheduler-owned execution state of one run (state, progress log, handoffs, reviews, evidence). Derived, not authoritative, and never committed. _Avoid_: Spec of Record, artifacts.
+
+**Orchestration Ceremony** — a forge event written by the pipeline on a machine where all roles share one identity, evidencing that a step ran rather than that a distinct person judged it. An L1 **Review** approve is one. _Avoid_: human approval, sign-off.
 
 **On-demand Web** — a transient web interface (`git forge web`) started only while a user is browsing and stopped when done, analogous to `fossil ui`. _Avoid_: web server, daemon.

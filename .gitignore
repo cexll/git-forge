@@ -2,5 +2,7 @@
 .DS_Store
 # Python bytecode cache from the repo's tracked gate scripts (scripts/*.py)
 __pycache__/
-# devflow plans/validation state — local-only, never committed or pushed
-/.specs/
+# devflow plans are the committed plan of record; only the mission runtime and
+# validator evidence are ignored (see docs/decisions/implemented/process/spec-artifacts-tracked-missions-ignored.md)
+/.specs/*/missions/
+/.specs/*/evidence/

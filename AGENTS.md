@@ -87,7 +87,7 @@ git-forge/
 │   ├── git.rs            # git binary adapter: merge-execution shell-outs (worktree, strategies, cleanup, merge-base)
 │   └── store.rs          # refs read/write via git2
 ├── tests/                # t0_core, t1a_store, t1b_issue, t2_pr, t3_merge
-└── .specs/               # local devflow plans + validation evidence (untracked — gitignored, never committed)
+└── .specs/               # devflow plan of record (spec.md, tickets/, features.json, validation-contract.json — committed); */missions/ and */evidence/ runtime stay gitignored
 ```
 
 ### Module boundaries
@@ -208,7 +208,7 @@ White-box review required for changes touching these (L3): `src/store.rs` (git2 
 ## Agent Operating Rules
 
 - **Read this file, `CONTEXT.md`, and `docs/architecture/git-forge.md` before working.**
-- Devflow mission state is scheduler-owned: never edit `.specs/*/missions/` files (`state.json`, `features.json`, `progress_log.jsonl`, `validation-state.json`, handoffs) directly. State changes go only through `devflow.cjs` subcommands (`end-feature`, `record-verdicts`, `reconcile`, …).
+- Devflow mission state is scheduler-owned: never edit `.specs/*/missions/` files (`state.json`, `runtime.json`, `progress_log.jsonl`, `validation-state.json`, handoffs) directly. The plan-of-record `features.json` lives at `.specs/<session>/features.json` and is planDigest-pinned — committed plan, not mission state. State changes go only through `devflow.cjs` subcommands (`end-feature`, `record-verdicts`, `reconcile`, …).
 - Never submit a receipt that is not backed by real work: a success receipt requires a real commit with a non-empty diff; a validation receipt requires per-assertion evidence. Faking a receipt is a trust violation.
 - Before reporting failure, revert your own edits — the scheduler refuses to spawn into a dirty worktree.
 - Evidence: verification claims require fresh evidence from the current session (command + exit code + output). No "I ran it before" claims.

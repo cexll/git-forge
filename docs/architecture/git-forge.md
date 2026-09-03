@@ -242,6 +242,7 @@ Recorded in `docs/adr/`:
 ## Known Limitations
 
 - The L1 merge gate is command-level only; direct `git merge` bypasses it. Bare-remote pre-receive enforcement is L2 (ADR-0003).
+- In L1 single-user operation the Review actor is the repository's own `user.email`, so an `approve` records that the pipeline's review step passed — it does not attest independent human review. See `docs/decisions/implemented/process/forge-review-approval-is-orchestration-ceremony.md`.
 - L1 PRs are one-shot immutable snapshots; there is no `pr.update` to amend a PR's commit set (ADR-0006).
 - Stale-base rejection is L1: if `refs/heads/<base>` moves after `pr.created`, the merge refuses and the PR must be recreated (live-base merge is L2).
 - Identity is resolved through the `git` binary before any write, never a libgit2 `repo.config()` read — that path can SIGSEGV on a config corrupted after `Repository::open` (VAL-115). The trade-off is git-binary spawn cost per write.
