@@ -410,11 +410,22 @@ fn cmd_pr_review(args: &[String]) -> Result<String, String> {
         i += 1;
     }
     let decision = decision.ok_or_else(|| USAGE.to_string())?;
-    let (store, actor) = open_mutation_store()?;
+    // Read-only path first: PR existence and terminality are validated WITHOUT
+    // resolving the mutable identity, so every refusal resolves nothing and
+    // writes nothing. The append below reopens the store bound to the actor.
+    let store = open_store()?;
     let r = crate::store::pr_head_ref(id);
-    if !store_has_ref(store.store(), &r) {
+    if !store_has_ref(&store, &r) {
         return Err(format!("PR #{id} does not exist"));
     }
+    let chain = store.read_chain(&r).map_err(|e| e.to_string())?;
+    let state = crate::event::fold(&chain).pr;
+    // Abandoned PRs are terminal (pr.abandoned): refuse BEFORE any write and
+    // name the abandon reason, so an abandoned PR never gains a review event.
+    if let Some(reason) = &state.abandoned {
+        return Err(format!("PR #{id} is abandoned: {reason}"));
+    }
+    let (store, actor) = open_mutation_store()?;
     // FR-005: inline review comments anchor to a commit hash. --file/--line
     // are only meaningful as inline comments, so they require the anchor;
     // an unanchored inline review would not reference anything immutable.
@@ -681,11 +692,23 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
         ));
     }
     let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
-    let (store, actor) = open_mutation_store()?;
+    // Read-only path first: PR existence and terminality are validated WITHOUT
+    // resolving the mutable identity, so every refusal resolves nothing and
+    // writes nothing. The run below reopens the store bound to the actor.
+    let store = open_store()?;
     let head = crate::store::pr_head_ref(id);
-    if !store_has_ref(store.store(), &head) {
+    if !store_has_ref(&store, &head) {
         return Err(format!("PR #{id} does not exist"));
     }
+    let chain = store.read_chain(&head).map_err(|e| e.to_string())?;
+    let state = crate::event::fold(&chain).pr;
+    // Abandoned PRs are terminal (pr.abandoned): refuse BEFORE the plan is
+    // materialized or any worktree is created — no ci.check is appended and
+    // the plan never executes, so the PR's existing CI state stays as is.
+    if let Some(reason) = &state.abandoned {
+        return Err(format!("PR #{id} is abandoned: {reason}"));
+    }
+    let (store, actor) = open_mutation_store()?;
     // The plan runs against the PR's immutable source snapshot (its own
     // commits), never the developer's working tree.
     let source_oid = store

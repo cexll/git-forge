@@ -5098,3 +5098,107 @@ fn pr_abandon_flag_and_help_errors_are_clean() {
         assert!(o.contains("usage: git forge pr abandon"), "help: {o}");
     }
 }
+
+// ── t5 / VAL-007: `pr review` refuses an abandoned PR, appending nothing ──
+
+/// VAL-007: an abandoned PR refuses `pr review --approve` BEFORE any write —
+/// exit non-zero, stderr names the abandon reason (same wording as the merge
+/// gate), the head chain gains no `pr.review` event, and `pr show` still
+/// reports `no review yet` (review chain unchanged).
+#[test]
+fn review_refuses_abandoned_pr_without_appending_event() {
+    let dir = tmpdir("review-abandoned");
+    init_repo(&dir);
+    make_feature(&dir, "feature", "feat\n");
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "create", "--source", "feature", "--base", "main", "doomed"],
+        )
+        .0,
+        0
+    );
+    assert_eq!(
+        forge(
+            &dir,
+            &[
+                "forge",
+                "pr",
+                "abandon",
+                "1",
+                "--reason",
+                "dropped by owner"
+            ],
+        )
+        .0,
+        0
+    );
+    let head_before = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+    let (c, o, e) = forge(&dir, &["forge", "pr", "review", "1", "--approve"]);
+    assert_ne!(c, 0, "review on an abandoned PR must refuse: {e} {o}");
+    assert!(
+        e.contains("dropped by owner"),
+        "stderr must name the abandon reason: {e}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        head_before,
+        "no event may be appended to an abandoned PR"
+    );
+    let (cs, os, es) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert_eq!(cs, 0, "show failed: {es}");
+    assert!(
+        os.contains("no review yet"),
+        "review chain unchanged (no new decision): {os}"
+    );
+    assert!(
+        !os.contains("decision: approve"),
+        "no new decision shown: {os}"
+    );
+}
+
+// ── t5 / VAL-008: `ci run` refuses an abandoned PR, appending nothing ──
+
+/// VAL-008: an abandoned PR refuses `ci run` BEFORE the plan is materialized —
+/// exit non-zero, stderr names the abandon reason, the head chain gains no
+/// `ci.check` (the pending marker from create stays the only one), `pr show`
+/// still reports `ci: pending`, and no temp worktree is created.
+#[test]
+fn ci_run_refuses_abandoned_pr_without_appending_check() {
+    let dir = tmpdir("ci-abandoned");
+    make_passing_ci_pr(&dir);
+    assert_eq!(
+        forge(
+            &dir,
+            &[
+                "forge",
+                "pr",
+                "abandon",
+                "1",
+                "--reason",
+                "owner changed mind"
+            ],
+        )
+        .0,
+        0
+    );
+    let head_before = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+    let (c, o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_ne!(c, 0, "ci run on an abandoned PR must refuse: {e} {o}");
+    assert!(
+        e.contains("owner changed mind"),
+        "stderr must name the abandon reason: {e}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        head_before,
+        "no ci.check event may be appended to an abandoned PR"
+    );
+    let (cs, os, es) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert_eq!(cs, 0, "show failed: {es}");
+    assert!(
+        os.contains("ci: pending"),
+        "CI state must stay pending (from create): {os}"
+    );
+    assert_no_ci_worktree(&dir);
+}

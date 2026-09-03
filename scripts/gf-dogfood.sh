@@ -316,6 +316,14 @@ ck "second abandon refused" nonzero git forge pr abandon 17 --reason again
 at "single pr.abandoned event on chain" 0 "[ \$(git log --format='%s' refs/forge/prs/17/head | grep -c 'forge:pr.abandoned:17') -eq 1 ]"
 ck "abandon merged PR refused" nonzero git forge pr abandon 2 --reason late
 ck "abandon unknown PR refused" nonzero git forge pr abandon 99 --reason x
+# ── VAL-007/008 / t5: review and ci run refuse an abandoned PR ──
+ck "review refuses abandoned PR" nonzero git forge pr review 17 --approve
+at "review error names abandon reason" 0 "git forge pr review 17 --approve 2>&1 | grep -q 'not needed anymore'"
+at "abandoned PR still unreviewed after refusal" 0 "git forge pr show 17 | grep -q 'no review yet'"
+ck "ci run refuses abandoned PR" nonzero git forge ci run 17
+at "ci run error names abandon reason" 0 "git forge ci run 17 2>&1 | grep -q 'not needed anymore'"
+at "abandoned PR CI state still pending after refusal" 0 "git forge pr show 17 | grep -q 'ci: pending'"
+at "no new ci.check after refused ci run" 0 "[ \$(git log --format='%s' refs/forge/prs/17/head | grep -c 'forge:ci.check:17') -eq 1 ]"
 
 # ── AC-006a / VAL-015: concurrent comment CAS on an independent clone ──
 R2="$T/dogfood2"
