@@ -15,13 +15,14 @@ Requests tabs stay unused. A web view is deferred L2 roadmap.
 
 ## What it does
 
-- **Issues**: sequential ids via an atomic counter CAS, comments, close/reopen.
+- **Issues**: sequential ids via an atomic counter CAS, comments, close/reopen. `pr create --closes <n>` links a PR to an Issue, and a successful merge closes it in the same ref transaction as the branch advance.
 - **Pull requests**: immutable snapshots (`source_ref`/`base_ref`/`source_head`/
   `base_head`/`merge_base`), list/show/three-dot diff, whole-PR and
   commit-anchored inline reviews (`--approve`/`--reject`).
 - **Merge gate**: `pr merge` refuses until the last reachable review is an
   `approve` AND the latest CI Check is green; approve → reject transitions are
-  honored.
+  honored. `pr abandon --reason <text>` makes a PR terminal: merge, review and CI
+  all refuse it, naming the reason; no reopen (a new attempt is a new PR).
 - **CI**: `git forge ci run <pr>` executes the repo CI plan against the PR's
   immutable snapshot and records the outcome as a `ci.check` Forge Event. A
   regular `.forge/ci.sh` runs; the `just check` fallback runs only when
