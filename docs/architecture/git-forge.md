@@ -168,7 +168,7 @@ Kinds and body fields:
 | `issue.comment` | issue | `{body}` |
 | `issue.close` | issue | `{}` |
 | `issue.reopen` | issue | `{}` |
-| `pr.created` | pr | `{title, description?, labels?, source_ref, base_ref, source_head, base_head, merge_base}` |
+| `pr.created` | pr | `{title, description?, labels?, source_ref, base_ref, source_head, base_head, merge_base, closes?}` |
 | `pr.comment` | pr | `{body}` |
 | `pr.review` | pr | `{decision: "approve"|"reject", body?, file?, line?, commit?}` |
 | `pr.merge` | pr | `{strategy: "merge"|"squash"|"rebase", result_commit}` |
@@ -219,7 +219,7 @@ Kinds and body fields:
 
 - Writes: CLI → store → git refs (append-only commits).
 - Reads: CLI → store → fold (core) → display.
-- Merge: gate checks folded PR state, then merges in a temporary worktree detached at the immutable `/base` OID via the `git` binary (merge-commit default; `--squash`/`--rebase` flags), pins `result_commit` under `refs/forge/prs/<n>/result`, cleans the worktree, then atomically deletes that pending ref and CAS-updates `refs/heads/<base>` and the PR chain ref.
+- Merge: gate checks folded PR state, then merges in a temporary worktree detached at the immutable `/base` OID via the `git` binary (merge-commit default; `--squash`/`--rebase` flags), pins `result_commit` under `refs/forge/prs/<n>/result`, cleans the worktree, then completes in ONE `git update-ref --stdin` transaction: (1) delete the pending `/result` ref, (2) CAS `refs/heads/<base>` from the snapshot `base_head` to `result_commit`, (3) CAS the PR `/head` chain to the `pr.merge` event commit, and (4) when the PR declares `--closes <n>`, CAS `refs/forge/issues/<n>` onto the `issue.close` event commit in the same batch — skipped as an idempotent no-op when the target issue is already closed (an issue ref that vanished is a hard refusal, never a silent skip). All-or-nothing: if any CAS fails, nothing applies — base, PR, and linked-issue refs all unchanged.
 - Sync (L2): `git forge push` sends `refs/forge/*:refs/forge/*` explicitly; `git fetch`/`git pull` receive forge refs into the remote-tracking namespace via the additive fetch refspec installed by `git forge clone/init`; `git forge pull` then converges local `refs/forge/*` per entity.
 
 ## Decisions
