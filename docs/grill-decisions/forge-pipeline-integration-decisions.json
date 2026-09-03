@@ -1,0 +1,78 @@
+{
+  "topic": "git-forge as the issue/PR/CI/merge substrate for the to-spec + devflow pipeline (grill session 2026-09-03)",
+  "confirmedRequirements": [
+    "流程目标：to-spec 的 spec/tickets 投影为 git-forge Issue（Issue 是人类看板投影，features.json 仍是唯一机器权威，不做反向解析）；实施在 per-feature Worktree 的分支上；完成后 pr create（source=worktree 的分支，PR origin 是分支不是 worktree 路径）；ci run 记 CI Check；review approve 后 merge 到集成分支；merge 后回收该 worktree。",
+    "spec 政策翻转：`.specs/<session>/` 的 spec.md、tickets/、features.json、validation-contract.json 提交进 git；`.specs/*/missions/` 与 `.specs/*/evidence/` 保持 gitignore（决策记录 implemented/process/spec-artifacts-tracked-missions-ignored.md）。",
+    "权威边界：git-forge refs 是工单/PR/Review/CI 的唯一 System of Record；GitHub 只接收合并后的代码与 release，其 Issues/PR tabs 不用（implemented/architecture/forge-is-system-of-record.md）。",
+    "CI plan：第一阶段零新文件，走 justfile `just check` fallback（已验证通过 F-012 自包含校验）；coverage 94% 升阻断、e2e 45/45 入 plan 都是以后的独立决策（constraints.yaml:24 的升级触发器暂不兑现）。",
+    "CI 溯源政策：diff 触及 .forge/ci.sh 或 check recipe 而 ticket 的 Touches 未声明 = blocking review finding；forge 侧不做 base-pinned plan（implemented/process/ci-plan-changes-are-blocking-review-findings.md）。",
+    "approve 定性：L1 单用户下 forge approve 是 Orchestration Ceremony，权威 review 记录是 mission 的 finding 账本；wire contract Known Limitations 已写明；actor 角色区分单开 issue #8（implemented/process/forge-review-approval-is-orchestration-ceremony.md）。",
+    "reportOnly 票（VALIDATION/ACCEPTANCE）不开 PR：issue comment 贴证据指针 + close；有代码的活才有 PR（implemented/process/report-only-work-closes-issue-without-pr.md）。",
+    "issue 失败终态：close + abandon 说明 comment 即可；issue abandon 新终态记为 non-goal。",
+    "切换点：#3+#4+#5+#9 全部落地前旧路径（orchestrator 手工 ff-only）；落地后切 forge 流程，#1/#2 由新流程自己实施；--forge 是 mission 级 flag，未开启 mission 走旧语义到完成，不合成 PR（implemented/process/pipeline-switchover-at-guard-and-recycle.md）。",
+    "adapter 内嵌 devflow.cjs（propose --forge）：只有 orchestrator/scheduler 写 forge 状态，worker 禁止碰 git forge；prId 存 runtime.json；PR 在 merge-gate 时创建（mission review 通过 + gate 验证后），不在 worker 收据时；forge 失败按类别映射进现有 pause 分类（见 contract clause 6：ci red→gate_failed、stale→重建非 pause、bridge→forge_bridge_failed、recycle→worktree_partial_removal）（implemented/architecture/forge-pipeline-adapter-contract.md）。",
+    "标签词汇表固定三前缀：type:(afk|hitl|validation|acceptance|prefactor)、milestone:<名>、session:<spec会话>；issue 与 PR 同用；ticket 身份在正文首行 Ticket: <fid>，不在标签。",
+    "开票时机：propose 按活跃 tickets 开、amend 追加时开、注入 validator 在注入时开、重试不开新票；幂等查重 = session:<s> 标签 + 首行 Ticket: <fid> 正文键。",
+    "PR 重建审计：progress log 镜像 forge_pr_created/forge_pr_superseded/forge_merged 事件（含 old/new prId），#1 落地前的重建窗口崩溃后可重建。",
+    "worker git 身份不自建第二条路：角色区分统一等 issue #8 的正式机制（不用 extensions.worktreeConfig 抢跑）。",
+    "缺口清单即 issues #1–#9：pr.update / live-base / base-refresh guard / recycle-worktree / --closes / abandon-PR / machine interface(--json,version) / actor 区分 / merge --ff。",
+    "崩溃恢复：merge 成功后 adapter 以持久化 prId 为键跑幂等 resume probe（forge refs=事实、progress log=记录、runtime.json=由 probe 重建），从不盲目重跑 pr merge（implemented/architecture/forge-pipeline-adapter-contract.md）。",
+    "PR abandon 终态：abandoned 对 pr merge / pr review / ci run 全部终态拒绝（报 abandon 原因）；L1 无 reopen——同样的工作再次提出=新 PR；abandon 拒绝已合并 PR、拒绝二次 abandon，每次拒绝 refs 不变（implemented/feature/pr-abandon-terminal-state.md）。",
+    "issue 关闭进 finalize 事务：--closes 时 issue.close 与 base CAS + PR-head CAS + pending-ref 删除同一 update-ref 批次；issue-head CAS 期望 tip、移动则重验重试；已关闭目标=成功 no-op（不二次 close）；finalize retry 复用同一对 UUID（implemented/feature/issue-close-in-finalize-transaction.md）。"
+  ],
+  "nonGoals": [
+    "milestones/assignees/issue 依赖图入 forge（L1 must-not-have；调度语义留在 features.json）。",
+    "issue abandon 终态（触发器：需要按终态过滤 issue 视图）。",
+    "GitHub Issues 双写（触发器：出现只看 GitHub 的第二协作者）。",
+    "forge 侧 CI plan pin 到 base（触发器：出现不可信贡献者）。",
+    "post-merge 自动 hook（触发器：多编排器共享同一 forge 需要强制清理）。",
+    "`.specs/*/evidence/` 进 git（触发器：需要离线重验历史轮次证据）。"
+  ],
+  "constraints": [
+    "size-gate：src/*.rs 每文件 code lines ≤800（store.rs 769、event.rs 679 余量最小——#1/#2/#5 必须新增模块，如 src/pr_update.rs）。",
+    "lint_allow 债务：cmd_pr_merge 豁免着 too_many_lines，removal_trigger=拆到 150 行以下；#2/#3 的改动前应先还此债。",
+    "critical path 人审：store.rs 与 pr_merge.rs 的改动按 AGENTS.md 属白盒人审面。",
+    "dogfood oracle 反转：#2/#3/#4/#9 各自翻转或新增 gf-dogfood.sh 断言，两套 45/45 oracle 需重造重验。",
+    "id 来自共享 Counter Ref：适配器必须 parse create 输出取号，禁止硬编码（#7 提供机器接口前只能 parse prose）。",
+    "docs/adr/ 冻结；新决策一律走 docs/decisions/ 四区生命周期。",
+    "skill 镜像同步义务：git-forge/.agents/skills/git-forge 与 ~/.agents/skills/git-forge 的 wire-contract/glossary mirror 随本批文档变更需 re-sync。",
+    "legacy 标签豁免：issues #1–#9 保留旧标签（其 id 被决策集引用、L1 无 relabel 操作），三前缀词汇表自 switchover 起的 adapter 投影生效。"
+  ],
+  "assumptions": [
+    "L2 sync（forge-sync-single-remote, proposed）按现状推进；切换窗口内 forge 状态只存在于本机 clone。",
+    "devflow adapter 是新增薄层（propose 探测 + merge-gate 时 pr create + merge gate 改调 forge），不改 to-spec 的编译规则。",
+    "worker 与 reviewer subagent 默认共享 user.email；角色区分等 #8，不在切换前自行发明。"
+  ],
+  "openQuestions": [
+    "#1 的代际语义：/source ref 代际命名与 approve/check 按代失效的具体 wire schema（写入 #1 spec 时定）。",
+    "#5/#6 的 wire-schema 编码（事件 body 字段、issue-head CAS 元组、abandon fold 终态规则）——决策见 feature/issue-close-in-finalize-transaction.md 与 feature/pr-abandon-terminal-state.md，schema 写入各 issue spec 时定。"
+  ],
+  "domainTerms": [
+    "System of Record (added) — forge refs 权威，GitHub 仅代码分发镜像。",
+    "Spec of Record (added) — 提交的、digest 锁定的计划工件；区别于 Mission Runtime。",
+    "Mission Runtime (added) — scheduler 拥有的执行态，派生、永不提交。",
+    "Orchestration Ceremony (added) — 单一身份机器上由流水线写下的 forge 事件，证明步骤跑过而非人审过。",
+    "Ticket ≠ Issue (disambiguated in Issue entry) — Ticket 是 authored vertical slice，Issue 是其 forge 投影。",
+    "Issue Projection (added) — a Ticket 的 forge 投影，每 session 至多一个，按 session: 标签 + 首行 Ticket: <fid> 幂等查重。",
+    "Forge Mode (added) — Mission 集成交给 forge PR 生命周期（create→CI→review→merge）的模式。"
+  ],
+  "adrReferences": [
+    "docs/decisions/implemented/process/spec-artifacts-tracked-missions-ignored.md",
+    "docs/decisions/implemented/architecture/forge-is-system-of-record.md",
+    "docs/decisions/implemented/process/forge-review-approval-is-orchestration-ceremony.md",
+    "docs/decisions/implemented/process/ci-plan-changes-are-blocking-review-findings.md",
+    "docs/decisions/implemented/process/report-only-work-closes-issue-without-pr.md",
+    "docs/decisions/implemented/process/pipeline-switchover-at-guard-and-recycle.md",
+    "docs/decisions/proposed/architecture/forge-sync-single-remote.md (L2 path assumed)",
+    "docs/decisions/implemented/architecture/forge-pipeline-adapter-contract.md",
+    "docs/decisions/implemented/testing/initial-ci-plan-is-just-check-fallback.md",
+    "docs/decisions/implemented/feature/issue-close-in-finalize-transaction.md",
+    "docs/decisions/implemented/feature/pr-abandon-terminal-state.md"
+  ],
+  "sourceDocuments": [
+    "docs/architecture/git-forge.md (Known Limitations +1 ceremony line)",
+    "CONTEXT.md (+4 terms, Issue entry amended)",
+    "AGENTS.md Directory Map (.specs line)",
+    ".gitignore (specs split)"
+  ]
+}
