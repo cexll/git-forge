@@ -645,6 +645,79 @@ fn refresh_failure_rolls_refs_back_and_reports_leftover() {
 }
 
 #[test]
+fn refresh_failure_with_closes_rolls_all_refs_back() {
+    // VAL-107 sibling (F-001): with a `--closes` PR, the refresh-failure
+    // rollback must ALSO re-anchor the linked issue ref, CAS'd from the
+    // issue.close commit the finalize transaction just applied (the ref's
+    // ACTUAL current value) — never from `gate_head` (a PR-head OID the
+    // issue ref never held; the wrong oldvalue aborts the whole
+    // update-ref batch and leaves every ref advanced against a stale base
+    // worktree, the never-split violation).
+    let dir = tmpdir("refreshfail-closes");
+    init_repo(&dir);
+    let (ci, _, ei) = forge(&dir, &["forge", "issue", "new", "linked bug"]);
+    assert_eq!(ci, 0, "issue new failed: {ei}");
+    create_approved_pr_closes(&dir, "feature", "refresh fail closes PR", 1, 2);
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let head_before = ref_oid(&dir, "refs/forge/prs/2/head").unwrap();
+    let issue_before = ref_oid(&dir, "refs/forge/issues/1").unwrap();
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let out = Command::new(bin)
+        .args(["forge", "pr", "merge", "2"])
+        .current_dir(&dir)
+        .env("GIT_FORGE_TEST_FAIL_BASE_REFRESH", "1")
+        .output()
+        .unwrap();
+    let code = out.status.code().unwrap_or(-1);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(code, 0, "refresh failure must fail the merge");
+    assert!(
+        stderr.contains("base worktree refresh failed"),
+        "stderr must name the refresh failure: {stderr}"
+    );
+    assert!(
+        stderr.contains("worktree left at"),
+        "stderr must report the worktree as a leftover: {stderr}"
+    );
+    assert!(
+        !stderr.contains("ROLLBACK FAILED"),
+        "the atomic rollback must succeed (never-split): {stderr}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base must roll back to the pre-merge tip"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/2/head").unwrap(),
+        head_before,
+        "PR head chain must be restored"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/issues/1").unwrap(),
+        issue_before,
+        "linked issue ref must be re-anchored to its pre-close tip"
+    );
+    let (cs, os, es) = forge(&dir, &["forge", "issue", "show", "1"]);
+    assert_eq!(cs, 0, "issue show failed: {es}");
+    assert!(
+        os.contains("open"),
+        "issue must fold open after rollback: {os}"
+    );
+    let (_, head, _) = git(&dir, &["rev-parse", "HEAD"]);
+    assert_eq!(head, base_before, "worktree HEAD agrees with the base ref");
+    let content = std::fs::read_to_string(dir.join("feature.txt"));
+    assert!(
+        content.is_err(),
+        "worktree tree is unchanged (feature file absent)"
+    );
+    let (ps, pos, _) = forge(&dir, &["forge", "pr", "show", "2"]);
+    assert!(ps == 0, "pr show must succeed after refresh failure");
+    assert!(!pos.contains("merged:"), "no pr.merge recorded: {pos}");
+    assert_no_temp_worktree_pr(&dir, 2);
+}
+
+#[test]
 fn conflict_aborts_cleans_and_leaves_refs_unchanged() {
     let dir = tmpdir("conflict");
     init_repo(&dir);
@@ -4059,5 +4132,124 @@ fn recycle_partial_leftover_on_removal_failure_base_untouched() {
     assert_eq!(
         head, source_before,
         "base worktree HEAD must be the result commit"
+    );
+}
+
+/// Phase-2 TOCTOU injection: a shim that appends real dirt to the source
+/// worktree on the SECOND `git -C <target> status --porcelain` call. Call #1
+/// is the phase-1 pre-merge validation (sees the clean tree); call #2 is the
+/// phase-2 removal re-check (F-003) — the dirt appears exactly in the
+/// validate→remove window the re-check exists to close.
+fn make_dirty_on_second_status_shim() -> PathBuf {
+    make_git_shim(
+        "p2dirty-shim",
+        "if [ \"$1\" = \"-C\" ] && [ \"$2\" = \"$GF_TARGET\" ] && \
+         [ \"$3\" = \"status\" ] && [ \"$4\" = \"--porcelain\" ]; then\n\
+         n=$(cat \"$GF_ST_COUNT\" 2>/dev/null || echo 0)\n\
+         n=$((n+1))\n\
+         echo \"$n\" > \"$GF_ST_COUNT\"\n\
+         if [ \"$n\" -ge 2 ]; then\n\
+         echo dirt >> \"$GF_TARGET/feature.txt\"\n\
+         fi\n\
+         fi",
+    )
+}
+
+#[test]
+fn recycle_phase2_dirty_refuses_without_force() {
+    // F-003: dirt appearing between the phase-1 validation and the phase-2
+    // removal must NOT be silently destroyed by the unconditional
+    // `worktree remove --force`. The phase-2 re-check refuses with
+    // refused-dirty, the worktree and its branch stay intact with the dirt
+    // preserved, and the already-terminal merge is not undone.
+    let (dir, wt) = recycle_setup("recyclep2dirty");
+    let wts = wt.to_str().unwrap();
+    let source_before = ref_oid(&dir, "refs/heads/feature").unwrap();
+    let shim = make_dirty_on_second_status_shim();
+    let counter = shim.join("count");
+    std::fs::write(&counter, "0").unwrap();
+    let (cm, om, em) = run_forge(
+        &dir,
+        Some(&shim),
+        &[
+            ("GF_TARGET", wts),
+            ("GF_ST_COUNT", counter.to_str().unwrap()),
+        ],
+        &[
+            "forge",
+            "pr",
+            "merge",
+            "1",
+            "--ff",
+            "--recycle-worktree",
+            wts,
+        ],
+    );
+    assert_ne!(cm, 0, "phase-2 dirty recycle must exit non-zero: {om} {em}");
+    let both = format!("{om} {em}");
+    assert!(
+        both.contains("refused-dirty") && both.contains(wts),
+        "outcome must be refused-dirty naming the worktree path: {both}"
+    );
+    // The merge itself is terminal (recycle refusal never undoes it).
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        source_before,
+        "base advanced to the merged source head"
+    );
+    // The worktree survives, still registered, with the uncommitted dirt.
+    assert!(wt.exists(), "refused recycle leaves the worktree in place");
+    let (_, list, _) = git(&dir, &["worktree", "list", "--porcelain"]);
+    assert!(list.contains(wts), "worktree stays registered: {list}");
+    let content = std::fs::read_to_string(wt.join("feature.txt")).unwrap();
+    assert!(
+        content.contains("dirt"),
+        "the uncommitted changes must survive the refusal: {content:?}"
+    );
+    assert!(
+        ref_oid(&dir, "refs/heads/feature").is_some(),
+        "the source branch is kept"
+    );
+}
+
+#[test]
+fn recycle_phase2_dirty_force_proceeds() {
+    // F-003 companion: with --force the phase-2 re-check does not refuse and
+    // the recycle removes the (now dirty) worktree and deletes the branch.
+    let (dir, wt) = recycle_setup("recyclep2force");
+    let wts = wt.to_str().unwrap();
+    let shim = make_dirty_on_second_status_shim();
+    let counter = shim.join("count");
+    std::fs::write(&counter, "0").unwrap();
+    let (cm, om, em) = run_forge(
+        &dir,
+        Some(&shim),
+        &[
+            ("GF_TARGET", wts),
+            ("GF_ST_COUNT", counter.to_str().unwrap()),
+        ],
+        &[
+            "forge",
+            "pr",
+            "merge",
+            "1",
+            "--ff",
+            "--force",
+            "--recycle-worktree",
+            wts,
+        ],
+    );
+    assert_eq!(cm, 0, "--force must unlock the phase-2 re-check: {em} {om}");
+    assert!(om.contains("removed"), "--force recycle must remove: {om}");
+    assert!(
+        om.contains("branch-deleted"),
+        "ff recycle deletes the merged branch: {om}"
+    );
+    assert!(!wt.exists(), "--force recycle removes the dirty worktree");
+    let (_, list, _) = git(&dir, &["worktree", "list", "--porcelain"]);
+    assert!(!list.contains(wts), "worktree unregistered: {list}");
+    assert!(
+        ref_oid(&dir, "refs/heads/feature").is_none(),
+        "branch deleted after --force recycle"
     );
 }

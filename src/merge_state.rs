@@ -356,12 +356,20 @@ fn refresh_base_worktrees(
                 .map_err(|e| format!("head ref unreadable during rollback: {e}"))?
                 .ok_or_else(|| "head ref vanished during rollback".to_string())?;
             rollback.push(format!("update {head_ref} {head_applied} {head_tip}"));
-            if let Some((issue_id, _close_oid, issue_expected)) = applied_issue {
+            if let Some((issue_id, close_oid, issue_expected)) = applied_issue {
+                // F-001: the transaction moved the issue ref ONTO close_oid
+                // (`update {issue_ref} {close_oid} {issue_expected}`), so the
+                // re-anchor must CAS FROM close_oid — the ref's actual current
+                // value — back to the pre-close tip. The old `spec.gate_head`
+                // oldvalue is a PR-head OID the issue ref never held: the CAS
+                // refused, the whole batch aborted mid-way, and every
+                // `--closes` merge left refs advanced against a stale base
+                // worktree (never-split violation).
                 rollback.push(format!(
                     "update {} {} {}",
                     issue_ref(issue_id),
                     issue_expected,
-                    spec.gate_head
+                    close_oid
                 ));
             }
             let rolled = store.store().run_update_ref_stdin(&rollback);
@@ -639,7 +647,7 @@ fn finish_merge_output(
         "merged PR #{} into {} ({})",
         spec.id, spec.base_ref, spec.result_commit
     );
-    let Some((target, _force)) = spec.recycle else {
+    let Some((target, force)) = spec.recycle else {
         return Ok(merged);
     };
     let source_ref = spec
@@ -657,6 +665,7 @@ fn finish_merge_output(
         &spec.result_commit.to_string(),
         target,
         spec.strategy,
+        force,
     )
     .map(|outcome| format!("{merged}; {outcome}"))
 }
@@ -709,9 +718,12 @@ pub(crate) fn validate_recycle_target(
 /// happens BEFORE this call (adapter contract clause 8). The outcome line
 /// is the forge→adapter contract; the adapter consumes it verbatim and
 /// persists it before clearing feature.worktree/branch. Vocabulary,
-/// exactly: `removed | partial-leftover(<path>) | branch-deleted |
-/// branch-kept(<reason>)` (the refused-* states can no longer occur here —
-/// they are phase-1 pre-merge refusals).
+/// exactly: `removed | refused-dirty | partial-leftover(<path>) |
+/// branch-deleted | branch-kept(<reason>)` — `refused-dirty` here is the
+/// phase-2 TOCTOU re-check (F-003): dirt that appeared between the phase-1
+/// validation and this removal refuses the removal (the merge stays
+/// terminal) unless --force was passed. `refused-not-contained` remains
+/// phase-1 only.
 ///
 /// Branch deletion (VAL-111) needs BOTH: (a) the live branch tip still
 /// points at the PR's snapshot source_head — a moved branch holds unmerged
@@ -728,8 +740,22 @@ pub(crate) fn recycle_source_worktree(
     result_commit: &str,
     target: &str,
     strategy: &str,
+    force: bool,
 ) -> Result<String, String> {
     let target_path = std::path::Path::new(target);
+    // F-003: re-run the dirty check immediately before the destructive
+    // removal. Phase-1 validated a clean tree, but dirt may appear in the
+    // validate→remove window (TOCTOU) — an unconditional `--force` remove
+    // would silently destroy uncommitted work. Refuse (refused-dirty)
+    // unless the caller passed --force; a refusal does NOT undo the merge
+    // (the PR is terminal), the outcome names what stayed.
+    if crate::git::worktree_dirty(target_path)? && !force {
+        return Err(format!(
+            "recycle refused (refused-dirty): worktree '{target}' has uncommitted \
+             changes (dirt appeared after the pre-merge validation); the worktree \
+             is untouched, commit/stash/clean it or pass --force to recycle anyway"
+        ));
+    }
     // Debug-only test seam (VAL-112): GIT_FORGE_TEST_FAIL_RECYCLE_REMOVE=<path>
     // locks THAT worktree so `git worktree remove --force` fails
     // deterministically, exercising the partial-leftover outcome. Inert in
