@@ -1,0 +1,21 @@
+# forge-p1 operational manifest — authored by orchestrator from worker opsFindings
+# Replaces the auto-deduplicated brief list for this mission. Verify any command before trust.
+
+- fact: "Homebrew cargo at /opt/homebrew/bin/cargo SIGABRTs (dyld vs LLVM 23.1.0) and `cargo fmt --check` exits 0 while printing the crash — a false green. Every cargo/commit invocation must use the rustup toolchain: `export PATH=\"$HOME/.cargo/bin:$PATH\" RUSTUP_TOOLCHAIN=1.93.0-aarch64-apple-darwin` first."
+  command: "export PATH=\"$HOME/.cargo/bin:$PATH\" RUSTUP_TOOLCHAIN=1.93.0-aarch64-apple-darwin && cargo --version"
+- fact: "The size gate's tokei needs HOME/XDG_CONFIG_HOME pointed at a fresh empty dir plus --no-ignore against the absolute src/ path, or user tokei.toml skews counts. Current max: cli.rs 726 code lines (cap 800); merge_state.rs ~690 after t1."
+  command: "T=$(mktemp -d); HOME=\"$T\" XDG_CONFIG_HOME=\"$T\" tokei --no-ignore --output json \"$PWD/src/\""
+- fact: "e2e gate is `just e2e` = dogfood-main-default + dogfood-eval-regression + dogfood (master-default); all three must exit 0."
+  command: "just e2e"
+- fact: "gf-dogfood.sh `at()` helper eval-expands its argument twice — escape `$( )`/`$VAR` in assertion strings (`\\$(...)` / `\\$VAR`)."
+  command: "awk '/^(ck|at) /{c++} END{print c}' scripts/gf-dogfood.sh"
+- fact: "The DOGFOOD SUMMARY pass=N literal lives in 3 places of scripts/gf-dogfood-main-default.sh (header comment, grep -Eq assertion, final echo). Additions to gf-dogfood.sh MUST sync all three or `just e2e` fails. t1 baseline: 108 call sites (ck 57/at 51), pass=100 fail=0."
+  command: "bash scripts/gf-dogfood-main-default.sh"
+- fact: "PR ids in the dogfood clone come from a shared lazy counter; the ff/live-base blocks consumed #18/#19/#20.. — take the next free ids from the tail of the abandon section (PR #17 region) and assert against EXACT ids, never hardcode beyond them."
+  command: "bash scripts/gf-dogfood-main-default.sh"
+- fact: "run_finalize in src/merge_state.rs sits at the 150-line clippy::too_many_lines edge; merge-path additions must extract helpers (build_merge_event, refresh_base_worktrees) OR add a constraints.yaml lint_allow entry — never silently grow the function."
+  command: "cargo clippy --all-targets -- -D warnings -D clippy::too_many_lines"
+- fact: "The dirty-guard's git status runs via git_in in the BASE worktree; PATH-shim tests that intercept specific git subcommands pass through — key shims on `$3` subcommand (status/reset) for refresh-path failure injection."
+  command: "cargo test --test t3_merge refresh_failure_rolls_refs_back_and_reports_leftover"
+- fact: "merge-state logic lives in src/merge_state.rs (P0 t0 split); the finalize transaction (base CAS + PR-head CAS + pending-ref delete + issue close) is there, NOT in store.rs. pr_merge.rs owns the CLI-level gating."
+  command: "cargo test"
