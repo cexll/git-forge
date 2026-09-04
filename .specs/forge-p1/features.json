@@ -326,6 +326,54 @@
         "kind": "review",
         "itemId": "F-001"
       }
+    },
+    {
+      "dependsOn": [
+        "t3"
+      ],
+      "touches": [
+        "~/.agents/skills/implement/scripts/devflow.cjs",
+        "~/.agents/skills/implement/tests/devflow/",
+        "~/.agents/skills/implement/fixtures/",
+        "~/.agents/skills/implement/references/roles/worker.md",
+        "~/.agents/skills/implement/SKILL.md",
+        ".specs/forge-p1/adapter/"
+      ],
+      "fulfills": [],
+      "expectedBehavior": [
+        "F-002: recycle refusal (refused-dirty/refused-not-contained/partial-leftover) maps to worktree_partial_removal pause, not forge_bridge_failed; recycleDirty fixture test covers it",
+        "F-003: proof-close evidence pointer is the report path, not the first command string",
+        "F-004: worker brief/role docs state workers must not run git forge write commands",
+        "F-005: partial-leftover completion path records milestone completions/injects validators/seals milestone",
+        "F-006: ci-run failure-to-execute is distinguished from ci red",
+        "F-007: pr review --approve failure persists the pause and mirrors the event",
+        "F-008: filing scan adopts only OPEN issues",
+        "F-009: fixture gains the real forge ff precondition so notOnTop branch is tested",
+        "F-010: node matrix wired into a standing gate"
+      ],
+      "addressesItemId": [
+        "F-002",
+        "F-003",
+        "F-004",
+        "F-005",
+        "F-006",
+        "F-007",
+        "F-008",
+        "F-009",
+        "F-010"
+      ],
+      "id": "t5-fix-adapter",
+      "description": "Fix F-002 (blocking): adapter phase-1 recycle refusals (refused-dirty/refused-not-contained) and phase-2 TOCTOU refused-dirty fall into the catch-all pause forge_bridge_failed with a looping re-run remedy instead of worktree_partial_removal per clause 6; add recycleRefused regex + pause branch + recycleDirty fixture test. Also fix F-003 (proof-close evidence pointer falls to first command string), F-004 (worker brief never states 'forbid git forge' — single-owner not observable), F-005 (partial-leftover completion skips milestone seal), F-006 (ci-run failure-to-execute conflated with ci red), F-007 (pr review --approve failure neither persists pause nor mirrors), F-008 (filing scan adopts CLOSED issues), F-009 (fixture lacks ff precondition), F-010 (node matrix wired into no standing gate).",
+      "milestone": "adapter",
+      "proves": [
+        "VAL-114"
+      ],
+      "skillName": "tdd",
+      "origin": "amend",
+      "cause": {
+        "kind": "review",
+        "itemId": "F-002"
+      }
     }
   ]
 }
