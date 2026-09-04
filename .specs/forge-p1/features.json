@@ -291,6 +291,41 @@
       ],
       "origin": "plan",
       "addressesItemId": []
+    },
+    {
+      "dependsOn": [
+        "t2"
+      ],
+      "touches": [
+        "src/merge_state.rs",
+        "tests/t3_merge.rs",
+        "scripts/gf-dogfood.sh",
+        "docs/architecture/git-forge.md"
+      ],
+      "fulfills": [],
+      "expectedBehavior": [
+        "F-001: rollback issue re-anchor binds the discarded close_oid and uses it as the CAS oldvalue; a --closes PR with refresh-failure injection rolls back atomically (base/PR/issue refs unchanged, worktree consistent)",
+        "F-002: the receipt commitId is re-pointed to 5f40af4 (or the rebase mapping recorded) so receipt verification survives gc",
+        "F-003: phase-2 recycle re-runs worktree_dirty before unconditional --force remove and refuses with refused-dirty unless --force was passed",
+        "New VAL-107 sibling test covers a --closes PR through the refresh-failure path"
+      ],
+      "addressesItemId": [
+        "F-001",
+        "F-002",
+        "F-003"
+      ],
+      "id": "t4-fix-rollback",
+      "description": "Fix F-001 (blocking): refresh rollback issue re-anchor CAS uses spec.gate_head instead of the issue.close commit as expected oldvalue, so every --closes PR whose base-worktree refresh fails breaks its atomic rollback (never-split violation VAL-107). Also fix F-002 (receipt commitId re-pointing after rebase) and F-003 (phase-2 recycle removal should re-check dirty before unconditional --force remove).",
+      "milestone": "merge-core",
+      "proves": [
+        "VAL-107"
+      ],
+      "skillName": "tdd",
+      "origin": "amend",
+      "cause": {
+        "kind": "review",
+        "itemId": "F-001"
+      }
     }
   ]
 }
