@@ -41,7 +41,7 @@ function forgePathEntry() {
  * the mission is proposed with --forge and every command gets the fake forge
  * on PATH plus a private FORGE_FAKE_STATE dir and a DEVFLOW_FORGE_CALLER name.
  */
-function makeArm(name, { forge = false } = {}) {
+function makeArm(name, { forge = false, validators = false } = {}) {
   const repo = path.join(tmp, name);
   fs.mkdirSync(repo);
   const g = (args, must = true) => {
@@ -55,7 +55,6 @@ function makeArm(name, { forge = false } = {}) {
   fs.writeFileSync(path.join(repo, 'README.md'), '# matrix\n');
   fs.mkdirSync(path.join(repo, SPEC), { recursive: true });
   fs.writeFileSync(path.join(repo, SPEC, 'validation-contract.json'), JSON.stringify({
-    contract_version: '1', authority: 'matrix contract',
     assertions: [
       { id: 'VAL-001', title: 'first', behavior: 'the first marker file exists', tool: 'cli', evidence: 'stdout', status: 'pending' },
       { id: 'VAL-002', title: 'second', behavior: 'the second marker file exists', tool: 'cli', evidence: 'stdout', status: 'pending' },
@@ -84,10 +83,11 @@ function makeArm(name, { forge = false } = {}) {
   // missionDirFor: the passed --mission-dir is the ROOT; propose appends
   // <session>/missions. The gitignore must cover the nested runtime dir.
   const forgeArgs = forge ? ['--forge'] : [];
+  const validatorArgs = validators ? ['--validators'] : [];
   const r = run(['propose', '--session', name, '--working-directory', repo,
     '--features', path.join(repo, SPEC, 'features.json'),
     '--contract', path.join(repo, SPEC, 'validation-contract.json'),
-    '--mission-dir', path.join(repo, SPEC), ...forgeArgs], armEnv(name));
+    '--mission-dir', path.join(repo, SPEC), ...forgeArgs, ...validatorArgs], armEnv(name));
   assert.equal(r.status, 0, r.stderr);
   const missionDir = path.join(repo, SPEC, name, 'missions');
   const arm = { name, repo, missionDir, forge, g, env: armEnv(name) };
@@ -207,6 +207,64 @@ function driveFeature(arm, featureId, worker, round = 0, onBeforeSettle = null) 
   assert.equal(settle.status, 0, settle.stderr);
   return { sid, claim, settle };
 }
+
+/**
+ * Drive one report-only validator the way a real one arrives: it writes its
+ * report to reports/<id>.json and submits a receipt with NO commitId (a
+ * report-only receipt must omit it). next-feature settles it and the
+ * adapter's auto-close runs.
+ */
+function driveReportValidator(arm, featureId) {
+  const claimOut = run(['claim', '--mission-dir', arm.missionDir, '--feature', featureId, '--json'], arm.env);
+  assert.equal(claimOut.status, 0, `claim failed: ${claimOut.stderr}`);
+  const claim = JSON.parse(claimOut.stdout);
+  const validator = path.join(tmp, 'validator.cjs');
+  fs.writeFileSync(validator, `
+'use strict';
+const { spawnSync } = require('node:child_process');
+const fs = require('node:fs'), path = require('node:path');
+const cli = process.env.DEVFLOW_CLI;
+const report = {
+  assertions: (process.env.ASSERTION_IDS || '').split(',').filter(Boolean).map((id) => ({ id, status: 'pass', evidence: 'evidence/' + id + '.txt' })),
+};
+fs.mkdirSync(path.join(process.env.MISSION_DIR, 'reports'), { recursive: true });
+fs.writeFileSync(path.join(process.env.MISSION_DIR, 'reports', process.env.FEATURE_ID + '.json'), JSON.stringify(report, null, 2));
+const receipt = {
+  successState: 'success', validatorsPassed: true,
+  handoff: {
+    salientSummary: 'validated', whatWasImplemented: 'report', whatWasLeftUndone: '',
+    verification: { commandsRun: [{ command: 'node --test tests/devflow/matrix.test.cjs', exitCode: 0 }] },
+    tests: { added: [] }, discoveredIssues: [],
+  },
+};
+const res = spawnSync(process.execPath, [cli, 'end-feature', '--mission-dir', process.env.MISSION_DIR,
+  '--feature', process.env.FEATURE_ID, '--worker-session', process.env.WORKER_SESSION_ID],
+  { input: JSON.stringify(receipt), env: process.env, encoding: 'utf8' });
+process.stderr.write(res.stderr || '');
+process.exit(res.status === 0 ? 0 : 1);
+`);
+  fs.chmodSync(validator, 0o755);
+  const env = { ...claim.env, DEVFLOW_CLI: CLI, ASSERTION_IDS: (claim.feature.assertions.proves || []).map((a) => a.id).join(',') };
+  delete env.DEVFLOW_FORGE_CALLER;
+  const wr = spawnSync(process.execPath, [validator], { env, encoding: 'utf8' });
+  assert.equal(wr.status, 0, `validator failed: ${wr.stderr}`);
+  const settle = run(['next-feature', '--mission-dir', arm.missionDir], arm.env);
+  assert.equal(settle.status, 0, settle.stderr);
+}
+
+test('F-004: a forge-mission worker brief forbids git forge — single-owner said in the brief, not just in code', () => {
+  const arm = makeArm('f004-brief', { forge: true });
+  const c = run(['claim', '--mission-dir', arm.missionDir, '--feature', 't1', '--json', '--brief'], arm.env);
+  assert.equal(c.status, 0, c.stderr);
+  const brief = JSON.parse(c.stdout).brief;
+  assert.match(brief, /never run `git forge`|never run "git forge"/i, 'the brief states the prohibition');
+  assert.match(brief, /orchestrator's adapter|adapter owns/i, 'the brief says who owns forge writes');
+  // The legacy path (no --forge) stays quiet: the prohibition names a mode the mission is not in.
+  const legacy = makeArm('f004-legacy');
+  const c2 = run(['claim', '--mission-dir', legacy.missionDir, '--feature', 't1', '--json', '--brief'], legacy.env);
+  assert.equal(c2.status, 0, c2.stderr);
+  assert.ok(!/git forge/.test(JSON.parse(c2.stdout).brief), 'a non-forge mission brief carries no forge prohibition');
+});
 
 before(() => {
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'devflow-forge-'));
@@ -352,6 +410,40 @@ test('VAL-115: proof ticket closes via a single issue comment + close; the call 
   const writes = s2.calls.filter((c) => ['new', 'comment', 'close', 'create', 'merge', 'review', 'run', 'abandon'].includes(c.argv[1]));
   assert.ok(writes.length > 0, 'the matrix produced forge writes');
   for (const w of writes) assert.equal(w.caller, 'adapter', `forge write ${JSON.stringify(w.argv)} came from the adapter, not a validator`);
+});
+
+test('F-003: the receipt-settle auto-close records the REPORT pointer as the evidence, not the first command string', () => {
+  const arm = makeArm('f003-autoclose', { forge: true });
+  // Inject a report-only validation feature: a proof ticket exists and the
+  // validator writes its report to reports/<id>.json (reportDestinationBlock).
+  const amend = {
+    id: 'v-p1', description: 'validate the matrix contract', dependsOn: ['t1'],
+    milestone: 'ms1', validatorKind: 'assertions', fulfills: [], proves: [],
+    skillName: 'user-validate-flow', expectedBehavior: ['report exists'], reportOnly: true,
+    cause: { kind: 'review', itemId: 'F-901' },
+  };
+  const amendPath = path.join(tmp, 'amend-f003.json');
+  fs.writeFileSync(amendPath, JSON.stringify(amend, null, 2));
+  const r = run(['amend', '--mission-dir', arm.missionDir, '--add-feature', amendPath], arm.env);
+  assert.equal(r.status, 0, `amend failed: ${r.stderr}`);
+  // amend wrote the plan; the scheduler refuses a dirty tree, so commit the
+  // growth (the amend is committed plan history, as amend demands).
+  arm.g(['add', '-A']);
+  arm.g(['commit', '-m', 'amend: inject proof ticket v-p1']);
+  // Drive t1 to completion; the validator v-p1 is then claimed and its
+  // receipt settles — applyReceipt auto-closes the ticket.
+  const worker = writeWorker();
+  // A validator writes its report; a REAL validator receipt carries NO commitId
+  // (report-only receipts must omit it), so drive v-p1 with a report-only worker.
+  driveFeature(arm, 't1', worker);
+  driveReportValidator(arm, 'v-p1');
+  const s = forgeState(arm);
+  const vIssue = s.issues.issues.find((i) => i.body.startsWith('Ticket: v-p1'));
+  assert.ok(vIssue, 'the proof ticket exists');
+  assert.equal(vIssue.open, false, 'the receipt settle auto-closed the proof ticket');
+  const comment = vIssue.comments.find((c) => c.startsWith('forge-proof-close: v-p1'));
+  assert.ok(comment, 'exactly-one-comment marker present');
+  assert.ok(!/evidence: true\b|evidence: node --test/.test(comment), 'the evidence is never a command string');
 });
 
 // ---------------------------------------------------------------------------
@@ -536,4 +628,133 @@ test('recycle ownership: merged + recycle removes the worktree, deletes the bran
   assert.ok(ev.some((e) => e.event === 'forge_merged' && e.prId), 'forge_merged mirrored');
   const st = forgeState(arm);
   assert.ok(st.prs.prs[0].merged, 'the PR is merged');
+});
+
+test('F-005: a partial-leftover completion still records milestone_completed, injects validators and seals', () => {
+  const arm = makeArm('f005-partial', { forge: true, validators: true });
+  const worker = writeWorker();
+  // The milestone stalls only when its LAST feature ends partial-leftover:
+  // t1 completes cleanly, then t2 — the final ms1 feature — goes partial.
+  driveFeature(arm, 't1', worker);
+  driveFeature(arm, 't2', worker, 0, () => armScenario(arm, { partialRecycle: true }));
+  const ev = events(arm.missionDir);
+  const rt = runtime(arm.missionDir);
+  assert.equal(rt.features.t2.status, 'completed', 'the partial-leftover completion stands');
+  assert.ok(ev.some((e) => e.event === 'milestone_completed' && e.milestone === 'ms1'), 'milestone_completed is logged on the partial path');
+  assert.ok(ev.some((e) => e.event === 'milestone_validation_triggered' && e.milestone === 'ms1'), 'validators are injected on the partial path');
+  // The injected validator ids are on the record.
+  const injected = ev.filter((e) => e.event === 'milestone_validation_triggered');
+  assert.equal(injected.length, 1, 'injection ran exactly once');
+  assert.ok(injected[0].featureIds.includes('scrutiny-ms1') || injected[0].featureIds.includes('assertions-ms1'), 'the injected validator ids are on the record');
+});
+
+test('F-006: ci-run failure-to-execute pauses forge_bridge_failed, never a charged gate_failed', () => {
+  const arm = makeArm('f006-ci-bridge', { forge: true });
+  const worker = writeWorker();
+  driveFeature(arm, 't1', worker, 0, () => armScenario(arm, { ciExecuteFail: true }));
+  const ev = events(arm.missionDir);
+  assert.ok(!ev.some((e) => e.pauseReason === 'gate_failed' || e.code === 'gate_failed'), 'failure-to-execute is never gate_failed — nothing was measured, no fix round is owed');
+  assert.ok(ev.some((e) => e.event === 'merge_blocked' && e.code === 'forge_bridge_failed'), 'merge_blocked names the bridge failure');
+  assert.ok(ev.some((e) => e.event === 'forge_bridge_failed'), 'the bridge failure is mirrored');
+  const rt = runtime(arm.missionDir);
+  assert.equal(rt.features.t1.status, 'in_review', 'the feature stays in_review (no work to redo, budget-neutral)');
+  assert.equal(forgeState(arm).prs.prs[0].ci, 'pending', 'no check was recorded');
+  // Self-clearing: without the injection the re-run records a green check and merges.
+  const merged = run(['merge-feature', '--mission-dir', arm.missionDir, '--feature', 't1'], arm.env);
+  assert.equal(merged.status, 0, `re-run self-clears: ${merged.stderr}`);
+  assert.ok(forgeState(arm).prs.prs[0].merged, 'the PR merged on the re-run');
+});
+
+test('F-007: pr review --approve failure persists the pause and mirrors the event like every bridge path', () => {
+  const arm = makeArm('f007-review', { forge: true });
+  const worker = writeWorker();
+  driveFeature(arm, 't1', worker, 0, () => armScenario(arm, { reviewFail: true }));
+  const ev = events(arm.missionDir);
+  assert.ok(ev.some((e) => e.event === 'merge_blocked' && e.code === 'forge_bridge_failed'), 'merge_blocked carries the code');
+  assert.ok(ev.some((e) => e.event === 'forge_bridge_failed'), 'the bridge failure is mirrored');
+  assert.ok(!ev.some((e) => e.pauseReason === 'gate_failed' || e.code === 'gate_failed'), 'never misread as a red gate');
+  assert.equal(forgeState(arm).prs.prs[0].decision, null, 'no approval was recorded');
+  const rt = runtime(arm.missionDir);
+  assert.equal(rt.features.t1.status, 'in_review', 'the feature stays in_review');
+  const merged = run(['merge-feature', '--mission-dir', arm.missionDir, '--feature', 't1'], arm.env);
+  assert.equal(merged.status, 0, `re-run self-clears: ${merged.stderr}`);
+  assert.ok(forgeState(arm).prs.prs[0].merged, 'the PR merged on the re-run');
+});
+
+// ---------------------------------------------------------------------------
+// t5-fix-adapter: scrutiny-adapter findings (F-002..F-010)
+// ---------------------------------------------------------------------------
+
+test('F-002: phase-1 recycle refusal (refused-dirty) pauses worktree_partial_removal, never the forge_bridge_failed re-run loop', () => {
+  const arm = makeArm('f002-refused', { forge: true });
+  const worker = writeWorker();
+  driveFeature(arm, 't1', worker, 0, () => armScenario(arm, { recycleDirty: true }));
+  const ev = events(arm.missionDir);
+  assert.equal(state(arm.missionDir).pauseReason, 'worktree_partial_removal', 'the refusal pauses worktree_partial_removal');
+  assert.ok(ev.some((e) => e.event === 'merge_blocked' && e.code === 'worktree_partial_removal'), 'merge_blocked names the recycle-refusal class');
+  assert.ok(ev.some((e) => e.event === 'worktree_recycle_refused'), 'the refusal is on the record');
+  assert.ok(!ev.some((e) => e.pauseReason === 'forge_bridge_failed' || e.code === 'forge_bridge_failed'), 'the refusal never lands in the catch-all');
+  const rt = runtime(arm.missionDir);
+  assert.ok(rt.features.t1.worktree, 'feature.worktree is kept as the recovery record');
+  // Recovery: the injection was consumed and the worktree is actually clean, so the re-run merges.
+  const merged = run(['merge-feature', '--mission-dir', arm.missionDir, '--feature', 't1'], arm.env);
+  assert.equal(merged.status, 0, `re-run after clearing self-heals: ${merged.stderr}`);
+  assert.ok(forgeState(arm).prs.prs[0].merged, 'the PR merged on the re-run');
+});
+
+test('F-002: phase-2 TOCTOU refused-dirty keeps the terminal merge and pauses worktree_partial_removal', () => {
+  const arm = makeArm('f002-toctou', { forge: true });
+  const worker = writeWorker();
+  driveFeature(arm, 't1', worker, 0, () => armScenario(arm, { recycleDirtyToctou: true }));
+  const rt = runtime(arm.missionDir);
+  assert.equal(rt.features.t1.status, 'completed', 'the merge is terminal — it stands');
+  const ev = events(arm.missionDir);
+  assert.ok(ev.some((e) => e.event === 'forge_merged' && e.prId), 'the terminal merge is mirrored');
+  assert.equal(state(arm.missionDir).pauseReason, 'worktree_partial_removal', 'the refusal pauses worktree_partial_removal');
+  const partial = ev.find((e) => e.event === 'worktree_recycle_partial');
+  assert.ok(partial && partial.keptWorktree, 'the refused worktree is recorded as kept before any sweep');
+});
+
+test('F-008: a lost-issueId refile never adopts a CLOSED issue — it files a fresh open one', () => {
+  const arm = makeArm('f008-open-only', { forge: true });
+  // Crash-simulate the refile state: t1's issue exists forge-side but CLOSED
+  // (e.g. a proof close/abandon landed), and the runtime lost the pointer.
+  const issuesPath = path.join(arm.env.FORGE_FAKE_STATE, 'issues.json');
+  const doc = JSON.parse(fs.readFileSync(issuesPath, 'utf8'));
+  doc.issues.find((i) => i.body.startsWith('Ticket: t1')).open = false;
+  fs.writeFileSync(issuesPath, JSON.stringify(doc, null, 2) + '\n');
+  const rt = runtime(arm.missionDir);
+  const lostId = rt.features.t1.issueId;
+  assert.ok(lostId, 't1 had an issueId before the crash simulation');
+  rt.features.t1.issueId = null;
+  fs.writeFileSync(path.join(arm.missionDir, 'runtime.json'), JSON.stringify(rt, null, 2) + '\n');
+  const probe = run(['reconcile-forge', '--mission-dir', arm.missionDir], arm.env);
+  assert.equal(probe.status, 0, `reconcile-forge failed: ${probe.stderr}`);
+  const s2 = forgeState(arm);
+  const adopted = s2.issues.issues.find((i) => i.body.startsWith('Ticket: t1') && i.id === (runtime(arm.missionDir).features.t1.issueId || -1));
+  assert.ok(adopted, 't1 carries an issueId again');
+  assert.ok(adopted.open, 'the adopted projection is OPEN (clause 3), not the closed one');
+  assert.ok(adopted.id !== lostId, 'the closed issue was never re-adopted');
+});
+
+test('F-009: the fixture enforces the real forge ff precondition — a non-ff snapshot refuses as not_fast_forward', () => {
+  const arm = makeArm('f009-ff', { forge: true });
+  const worker = writeWorker();
+  // The worker's branch was cut from main at claim; advancing main before the
+  // gate leaves the snapshot source NOT sitting directly on the snapshot base —
+  // exactly what the real forge's merge_base != base_head precondition refuses.
+  driveFeature(arm, 't1', worker, 0, () => arm.g(['commit', '--allow-empty', '-m', 'unrelated advance on main']));
+  const rt = runtime(arm.missionDir);
+  assert.equal(rt.features.t1.status, 'in_review', 'notOnTop leaves the feature awaiting a rebase, never merged');
+  assert.ok(!events(arm.missionDir).some((e) => e.event === 'forge_merged'), 'a non-ff snapshot is never merged');
+  assert.equal(forgeState(arm).prs.prs.length, 1, 'notOnTop is not stale-base: no recreate loop');
+  assert.equal(forgeState(arm).prs.prs[0].merged, null, 'the PR is not merged');
+  assert.ok(!events(arm.missionDir).some((e) => e.pauseReason === 'forge_bridge_failed' || e.code === 'forge_bridge_failed'), 'notOnTop is its own taxonomy class, not a bridge failure');
+});
+
+test('F-010: the node matrix is wired into a standing gate — one justfile entry runs the forge adapter matrix', () => {
+  const justfile = fs.readFileSync(path.join(ROOT, 'justfile'), 'utf8');
+  assert.match(justfile, /forge-matrix:/, 'the standing gate entry exists');
+  assert.match(justfile, /forge-adapter\.test\.cjs/, 'it runs the forge adapter matrix');
+  assert.match(justfile, /dual-path-parity\.test\.cjs/, 'it runs dual-path parity');
 });

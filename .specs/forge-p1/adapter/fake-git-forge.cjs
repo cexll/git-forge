@@ -19,11 +19,13 @@
 //   issueNewFail     issue new exits 1 (bridge failure; filing retry must not duplicate)
 //   prCreateFail     pr create exits 1 (bridge failure)
 //   prCreateGarbage  pr create exits 0 with unparseable output (parse failure)
-//   ciFail           ci run exits 1 and records the check failed (ci red)
+//   ciExecuteFail    ci run exits 1 WITHOUT recording a check (failure to execute)
 //   staleBase        pr merge refuses with the moved-base message (recreate path)
-//   casConflict      pr merge refuses with a finalize-CAS conflict message
+//   reviewFail       pr review --approve exits 1 (bridge failure)
 //   mergeFail        pr merge refuses with a generic bridge error
 //   partialRecycle   merge succeeds but the recycle reports partial-leftover and keeps the worktree
+//   recycleDirtyToctou merge succeeds but phase-2 recycle refuses with the TOCTOU refused-dirty
+//             wording (merge terminal, worktree stays)
 //   recycleDirty     the recycled worktree is reported dirty even when clean (refused-dirty)
 const fs = require('node:fs');
 const path = require('node:path');
@@ -225,6 +227,7 @@ if (group === 'pr') {
     const id = Number(positionals[0]);
     const p = prs.prs.find((x) => x.id === id);
     if (!p) finish(1, '', `PR #${id} does not exist`);
+    if (take('reviewFail')) finish(1, '', 'fake-forge: bridge down (reviewFail)');
     p.decision = flags.approve ? 'approve' : flags.reject ? 'reject' : null;
     finish(0, `review recorded on PR #${id}: ${p.decision}`);
   } else if (sub === 'comment') {
@@ -278,6 +281,12 @@ if (group === 'pr') {
         finish(1, '', `recycle refused (refused-dirty): worktree '${recyclePath}' has uncommitted changes; commit, stash or clean it, or pass --force to recycle anyway`);
       }
     }
+    // ff precondition (real forge pr_merge.rs): the snapshot source must sit
+    // DIRECTLY on top of the snapshot base (merge_base == base_head), before
+    // any CAS. A source cut from an older base refuses with its own remedy.
+    if (p.merge_base && p.merge_base !== p.base_head) {
+      finish(1, '', `PR #${id} cannot fast-forward: the source does not sit directly on top of the snapshot base (merge_base != base_head); use \`pr merge --rebase\` to replay the source or recreate the PR`);
+    }
     // --ff merge: CAS the base ref from the snapshot base_head to the snapshot source_head.
     const cas = git(['update-ref', `refs/heads/${p.base}`, p.source_head, p.base_head]);
     if (!cas.ok) {
@@ -301,6 +310,12 @@ if (group === 'pr') {
       if (issue) issue.open = false;
     }
     // recycle phase 2 (#4): remove the worktree, delete the branch per the ancestry rule.
+    // Phase-2 TOCTOU (merge_state.rs): dirt appears between the pre-merge
+    // validation and the removal. The merge is TERMINAL (the output carries the
+    // merged line) but the exit is non-zero and the worktree stays.
+    if (recyclePath && take('recycleDirtyToctou')) {
+      finish(1, '', `merged PR #${id} into ${p.base} (${p.source_head}); recycle refused (refused-dirty): worktree '${recyclePath}' has uncommitted changes (dirt appeared after the pre-merge validation); the worktree is untouched, commit/stash/clean it or pass --force to recycle anyway`);
+    }
     if (recyclePath && take('partialRecycle')) {
       finish(1, '', `merged PR #${id} into ${p.base} (${p.source_head}); recycle outcome: partial-leftover(${recyclePath}): worktree still present after removal`);
     }
@@ -335,6 +350,11 @@ if (group === 'ci') {
   if (take('ciFail')) {
     p.ci = 'failed';
     finish(1, '', `ci run recorded: failed on PR #${id}`);
+  }
+  if (take('ciExecuteFail')) {
+    // Failure to EXECUTE (spawn failure / forge crash): no Check is recorded,
+    // the PR's CI state is untouched, and the error names no recorded outcome.
+    finish(1, '', 'fake-forge: bridge down (ciExecuteFail)');
   }
   p.ci = 'success';
   finish(0, `ci run recorded: success on PR #${id}`);

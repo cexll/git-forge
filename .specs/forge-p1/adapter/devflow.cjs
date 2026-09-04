@@ -1863,6 +1863,13 @@ const FORGE_RE = {
   movedBase: /has moved since PR #\d+ was created/,
   notOnTop: /not directly on top of the snapshot base|merge_base != base_head/,
   ciGate: /is not mergeable/,
+  // ci RED: the forge RAN the plan and recorded a failed Check (its own words).
+  // Anything else from `ci run` is failure-to-execute — a bridge failure.
+  ciRed: /ci run (recorded: failed|for PR #\d+ failed)|CI run for PR #\d+ failed/,
+  // Recycle refusal (clause 6 → worktree_partial_removal), both phases: the
+  // pre-merge validation (merge NOT executed) and the phase-2 TOCTOU re-check
+  // (merge terminal, worktree stays). Matched on the forge's own refusal word.
+  recycleRefused: /recycle refused \((refused-dirty|refused-not-contained)\)/,
 };
 
 /** Run one `git forge` command from the repo root. The caller env names the caller; only the adapter sets it. */
@@ -1929,6 +1936,10 @@ function forgeEnsureTicketIssue(missionDir, state, feature) {
     if (!labels.includes(`session:${state.sessionId}`)) continue;
     const bodyFirst = ((show.stdout.match(/^description: (.*)$/m) || [])[1] || '').trim();
     if (bodyFirst !== `Ticket: ${feature.id}`) continue;
+    // Clause 3: look for an OPEN Issue. `issue list` returns closed ones too
+    // (a lost-issueId refile after a proof close/abandon), and a PR --closes
+    // aimed at a closed issue would close nothing.
+    if (!/^#\d+ .* — open$/m.test(show.stdout)) continue;
     return id; // found the projection: reuse, never re-file
   }
   const labels = forgeIssueLabels(state, feature);
@@ -2100,22 +2111,48 @@ function forgeMergeFeature(missionDir, state, featuresDoc, feature) {
     // CI is on-demand (L1): the gate needs a fresh green check for this snapshot.
     const ci = forgeRun(state, ['ci', 'run', String(prId)]);
     if (!ci.ok) {
-      // ci red → existing gate_failed: a fix/rebase round follows, budget as today.
-      feature.status = 'paused';
+      const ciOut = `${ci.stdout}\n${ci.stderr}`;
+      // ci RED — the forge RAN the plan and recorded a failed Check (its own
+      // wording, never inferred): a fix/rebase round follows, budget as today.
+      if (FORGE_RE.ciRed.test(ciOut)) {
+        feature.status = 'paused';
+        state.state = 'paused';
+        state.pauseReason = 'gate_failed';
+        writeState(missionDir, state);
+        logEvent(missionDir, 'forge_ci_failed', { featureId: feature.id, prId, detail: (ci.stderr || ci.stdout).slice(0, 300) });
+        logEvent(missionDir, 'feature_paused', { featureId: feature.id, pauseReason: 'gate_failed' });
+        writeFeaturesDoc(missionDir, featuresDoc);
+        return { ok: false, code: 'gate_failed', message: `PR #${prId} CI is red for '${feature.id}': a fix round follows (gate_failed)` };
+      }
+      // Failure to EXECUTE (spawn failure, unknown PR, forge crash): no Check
+      // was recorded, nothing was measured, no fix round is owed. Budget-neutral
+      // bridge failure, same pause shape as every other forge path.
+      const err = forgeBridgeError(`git forge ci run failed: ${ciOut.slice(0, 300)}`);
       state.state = 'paused';
-      state.pauseReason = 'gate_failed';
+      state.pauseReason = 'forge_bridge_failed';
       writeState(missionDir, state);
-      logEvent(missionDir, 'forge_ci_failed', { featureId: feature.id, prId, detail: (ci.stderr || ci.stdout).slice(0, 300) });
-      logEvent(missionDir, 'feature_paused', { featureId: feature.id, pauseReason: 'gate_failed' });
+      logEvent(missionDir, 'merge_blocked', { featureId: feature.id, code: 'forge_bridge_failed' });
+      logEvent(missionDir, 'forge_bridge_failed', { featureId: feature.id, pauseReason: 'forge_bridge_failed', error: String(err.message).slice(0, 300) });
       writeFeaturesDoc(missionDir, featuresDoc);
-      return { ok: false, code: 'gate_failed', message: `PR #${prId} CI is red for '${feature.id}': a fix round follows (gate_failed)` };
+      return { ok: false, code: 'forge_bridge_failed', message: err.message };
     }
     // The ceremony approve mirrors the mission review that already passed to reach
     // this gate (reviewGate verdicts were checked above the forge path).
     const review = forgeRun(state, ['pr', 'review', String(prId), '--approve', '--body', `mission review passed for ${feature.id} (session ${state.sessionId})`]);
     if (!review.ok) {
-      return { ok: false, code: 'forge_bridge_failed', message: forgeBridgeError(`git forge pr review failed: ${review.stderr || review.stdout}`).message };
+      // A bridge failure like every other: persist the RECOVERABLE pause and
+      // mirror the event — an unrecorded return left nothing on the record
+      // naming the remedy (F-007).
+      const err = forgeBridgeError(`git forge pr review failed: ${(review.stderr || review.stdout).slice(0, 300)}`);
+      state.state = 'paused';
+      state.pauseReason = 'forge_bridge_failed';
+      writeState(missionDir, state);
+      logEvent(missionDir, 'merge_blocked', { featureId: feature.id, code: 'forge_bridge_failed' });
+      logEvent(missionDir, 'forge_bridge_failed', { featureId: feature.id, pauseReason: 'forge_bridge_failed', error: String(err.message).slice(0, 300) });
+      writeFeaturesDoc(missionDir, featuresDoc);
+      return { ok: false, code: 'forge_bridge_failed', message: err.message };
     }
+    // The ceremony approve mirrors the mission review that already passed to reach
     const merged = forgeRun(state, ['pr', 'merge', String(prId), '--ff', '--recycle-worktree', feature.worktree]);
     const out = `${merged.stdout}\n${merged.stderr}`;
     // A partial-leftover recycle is reported AFTER a successful merge with a
@@ -2136,9 +2173,57 @@ function forgeMergeFeature(missionDir, state, featuresDoc, feature) {
       state.pauseReason = 'worktree_partial_removal';
       writeState(missionDir, state);
       writeFeaturesDoc(missionDir, featuresDoc);
+      // Same trio the clean completion path runs (F-005): the probe skips
+      // completed features, so this is the only chance the milestone gets.
+      recordMilestoneCompletions(missionDir, featuresDoc.features);
+      injectMilestoneValidators(missionDir, featuresDoc, state);
+      sealCompletedMilestones(missionDir, featuresDoc.features, state);
+      writeFeaturesDoc(missionDir, featuresDoc);
       return { ok: false, code: 'worktree_partial_removal', message: `PR #${prId} merged; recycle outcome: ${partialOutcome[1]} — feature.worktree kept as the recovery record (worktree_partial_removal)`, partial: true };
     }
+    // Phase-2 TOCTOU refused-dirty: the merge IS terminal (the merged line is in
+    // the output) but the recycle refused, so the exit is non-zero and the
+    // worktree stays. Same semantics as partial-leftover: the merge stands,
+    // feature.worktree is kept as the recovery record, pause
+    // worktree_partial_removal — never the catch-all re-run loop.
+    if (!merged.ok && mergedLine && FORGE_RE.recycleRefused.test(out)) {
+      const commitId = mergedLine[3];
+      const refusal = out.match(FORGE_RE.recycleRefused)[0];
+      logEvent(missionDir, 'forge_merged', { featureId: feature.id, prId, commitId });
+      logEvent(missionDir, 'feature_merged', { featureId: feature.id, branch, commitId, prId });
+      feature.status = 'completed';
+      feature.currentWorkerSessionId = null;
+      logEvent(missionDir, 'forge_recycle_outcome', { featureId: feature.id, prId, outcome: refusal, worktree: feature.worktree });
+      logEvent(missionDir, 'worktree_recycle_partial', { featureId: feature.id, prId, outcome: refusal, keptWorktree: feature.worktree });
+      state.state = 'paused';
+      state.pauseReason = 'worktree_partial_removal';
+      writeState(missionDir, state);
+      writeFeaturesDoc(missionDir, featuresDoc);
+      // A completion is a completion: the milestone trio runs here exactly as it
+      // does on the clean path — the probe skips completed features forever, so
+      // a skipped trio here stalls the milestone with no eligible work (F-005).
+      recordMilestoneCompletions(missionDir, featuresDoc.features);
+      injectMilestoneValidators(missionDir, featuresDoc, state);
+      sealCompletedMilestones(missionDir, featuresDoc.features, state);
+      writeFeaturesDoc(missionDir, featuresDoc);
+      return { ok: false, code: 'worktree_partial_removal', message: `PR #${prId} merged; recycle refused: ${refusal} — feature.worktree kept as the recovery record (worktree_partial_removal)`, partial: true };
+    }
     if (!merged.ok) {
+      // Recycle refusal (clause 6, phase 1): the forge refused BEFORE any merge
+      // side effect — the PR is unmerged, the worktree is untouched, and the
+      // work itself is done (in_review). Pause worktree_partial_removal with
+      // feature.worktree kept as the recovery record, never the catch-all
+      // re-run loop: the remedy is worktree-side (commit/stash/clean), not
+      // "re-run the round".
+      if (FORGE_RE.recycleRefused.test(out)) {
+        state.state = 'paused';
+        state.pauseReason = 'worktree_partial_removal';
+        writeState(missionDir, state);
+        logEvent(missionDir, 'worktree_recycle_refused', { featureId: feature.id, prId, error: out.slice(0, 300) });
+        logEvent(missionDir, 'merge_blocked', { featureId: feature.id, code: 'worktree_partial_removal' });
+        writeFeaturesDoc(missionDir, featuresDoc);
+        return { ok: false, code: 'worktree_partial_removal', message: `PR #${prId} NOT merged: ${(merged.stderr || merged.stdout).slice(0, 300)} — feature.worktree kept as the recovery record (worktree_partial_removal)` };
+      }
       if (FORGE_RE.movedBase.test(out)) {
         logEvent(missionDir, 'forge_stale_base', { featureId: feature.id, prId });
         forgeRun(state, ['pr', 'abandon', String(prId), '--reason', 'superseded: base moved; recreating the snapshot']);
@@ -2198,6 +2283,12 @@ function forgeMergeFeature(missionDir, state, featuresDoc, feature) {
       state.state = 'paused';
       state.pauseReason = 'worktree_partial_removal';
       writeState(missionDir, state);
+      // Same trio the clean completion path runs (F-005): the probe skips
+      // completed features, so this is the only chance the milestone gets.
+      recordMilestoneCompletions(missionDir, featuresDoc.features);
+      injectMilestoneValidators(missionDir, featuresDoc, state);
+      sealCompletedMilestones(missionDir, featuresDoc.features, state);
+      writeFeaturesDoc(missionDir, featuresDoc);
       return { ok: true, commitId, outcome, partial: true };
     }
     logEvent(missionDir, 'forge_recycle_outcome', { featureId: feature.id, prId, outcome: outcome || 'not-requested' });
@@ -2237,22 +2328,21 @@ function forgeCloseTicketIssue(missionDir, state, feature, { marker, body }) {
   logEvent(missionDir, 'forge_ticket_closed', { featureId: feature.id, issueId: feature.issueId, marker });
 }
 
-/** Proof (report-only) tickets: one comment (evidence pointer + status) + close. */
+/** Proof (report-only) tickets: one comment (evidence pointer + status) + close.
+ * The evidence is the validator's REPORT pointer — the artifact the receipt's
+ * handoff points at — never the first verification command string, and never a
+ * commitId (a report-only receipt must not carry one). The report path is the
+ * same one reportDestinationBlock names: reports/<featureId>.json for
+ * validation/acceptance, reviews/<featureId>.json for review. */
 function forgeCloseProofTicket(missionDir, state, feature, receipt) {
-  const verification = receipt && receipt.handoff && receipt.handoff.verification;
-  const run = verification && Array.isArray(verification.commandsRun) ? verification.commandsRun[0] : null;
-  const evidence = (receipt && receipt.commitId) || (run && run.command) || 'receipt';
+  const kind = featureKind(feature);
+  const reportPath = kind === 'review'
+    ? path.join(missionDir, 'reviews', `${feature.id}.json`)
+    : path.join(missionDir, 'reports', `${feature.id}.json`);
+  const evidence = fs.existsSync(reportPath) ? reportPath : 'receipt';
   forgeCloseTicketIssue(missionDir, state, feature, {
     marker: `forge-proof-close: ${feature.id}`,
     body: `status: ${(receipt && receipt.successState) || 'success'}; evidence: ${evidence}`,
-  });
-}
-
-/** Failed/cancelled tickets close with an abandon-reason comment (clause 2). */
-function forgeAbandonTicketIssue(missionDir, state, feature, reason) {
-  forgeCloseTicketIssue(missionDir, state, feature, {
-    marker: `forge-abandon: ${feature.id}`,
-    body: `abandoned: ${reason || 'no reason recorded'}`,
   });
 }
 /**
@@ -4622,6 +4712,12 @@ function renderBrief(missionDir, state, feature, claim) {
   } else {
     L.push(`- Repository: \`${state.workingDirectory}\` (branch \`${state.expectedBranch}\`)`);
     L.push('- This feature commits nothing, so it has no worktree and no branch of its own.');
+  }
+  if (state.forge === true) {
+    // Clause 1: one owner. The adapter holds DEVFLOW_FORGE_CALLER; a forge command from this
+    // session logs caller 'external' — an unattributed write on the forge's single-owner record.
+    // Stating it here is what makes the attribution guarantee observable to the worker.
+    L.push(`- **Forge mode: never run \`git forge\`.** Every forge write — issue filing, PR create, CI, review, merge, ticket close — belongs to the orchestrator's adapter; a forge command from your session lands as an unattributed external write.`);
   }
   if ((feature.touches || []).length) {
     L.push(`- You own these paths and only these: ${feature.touches.map((t) => `\`${t}\``).join(', ')} — another worker may hold the rest right now`);
