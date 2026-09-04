@@ -1,0 +1,168 @@
+{
+  "contract_version": "1",
+  "authority": "machine contract for forge-p1; spec.md Validation Plan is the human-readable view, this JSON is the machine grammar consumed by devflow.cjs validate",
+  "assertions": [
+    {
+      "id": "VAL-101",
+      "title": "`pr merge --ff` 在源严格位于 base 之上时合并成功且 result commit 即验证过的 source_head(无新提交、单亲链保持)",
+      "behavior": "`pr merge --ff` 在源严格位于 base 之上时合并成功且 result commit 即验证过的 source_head(无新提交、单亲链保持)",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "merge exit 0;`pr show` 展示 result_commit==source_head;目标分支 tip 的 parent 即原 base tip",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-102",
+      "title": "非 ff 的 PR(merge_base ≠ base_head)用 `--ff` 拒绝且错误命名 rebase/recreate 补救,refs 不变",
+      "behavior": "非 ff 的 PR(merge_base ≠ base_head)用 `--ff` 拒绝且错误命名 rebase/recreate 补救,refs 不变",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "merge exit 非零;stderr 含补救词;`pr show` 仍为未合并",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-103",
+      "title": "#2 落地前,当前 base ref 已前移(≠ 快照 base_head)时 `--ff` 拒绝并命名 recreate-or-rebase-and-recheck",
+      "behavior": "#2 落地前,当前 base ref 已前移(≠ 快照 base_head)时 `--ff` 拒绝并命名 recreate-or-rebase-and-recheck",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "前移 base 后 merge exit 非零;stderr 含 recreate-or-rebase-and-recheck;base/PR refs 不变",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-104",
+      "title": "`--ff` 的 finalize 走 exact-base CAS:base 在 CAS 期望值之后被并发前移时合并失败、无部分写入",
+      "behavior": "`--ff` 的 finalize 走 exact-base CAS:base 在 CAS 期望值之后被并发前移时合并失败、无部分写入",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "注入 CAS 冲突后 merge exit 非零;base/PR/issue refs 均不变",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-105",
+      "title": "base_ref 检出在主工作树且 clean 时 `pr merge` 成功,合并后工作树文件与 result commit 一致",
+      "behavior": "base_ref 检出在主工作树且 clean 时 `pr merge` 成功,合并后工作树文件与 result commit 一致",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "merge exit 0;工作树 `git status --porcelain` 为空且内容匹配 result commit",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-106",
+      "title": "base 工作树脏(含 UNTRACKED 文件)时 `pr merge` 拒绝且 refs 不变(ignored 不触发拒绝)",
+      "behavior": "base 工作树脏(含 UNTRACKED 文件)时 `pr merge` 拒绝且 refs 不变(ignored 不触发拒绝)",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "构造 untracked 文件后 merge exit 非零;base ref 值不变;ignored-only 文件不触发拒绝",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-107",
+      "title": "刷新失败注入下合并 exit 非零、refs 与工作树状态一致(never split),报告 worktree 为 leftover",
+      "behavior": "刷新失败注入下合并 exit 非零、refs 与工作树状态一致(never split),报告 worktree 为 leftover",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "注入刷新失败后 merge exit 非零;base ref 与工作树 HEAD 一致(未部分前移);输出含 leftover",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-108",
+      "title": "sparse-checkout/submodule 的 base 工作树在 L1 的行为有文档声明(不静默)",
+      "behavior": "sparse-checkout/submodule 的 base 工作树在 L1 的行为有文档声明(不静默)",
+      "surface": "docs",
+      "tool": "cli",
+      "evidence": "`docs/architecture/git-forge.md` Known Limitations 命名 sparse-checkout 与 submodules 为 L1 范围外",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-109",
+      "title": "`--recycle-worktree` 对已注册且检出分支==source_ref 的 clean worktree 执行回收并输出 `removed`(+分支包含时 `branch-deleted`)",
+      "behavior": "`--recycle-worktree` 对已注册且检出分支==source_ref 的 clean worktree 执行回收并输出 `removed`(+分支包含时 `branch-deleted`)",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "merge exit 0;输出行含 removed;worktree 目录不存在;`git worktree list` 无该项",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-110",
+      "title": "回收拒绝面:未注册/错误分支的 path 拒绝且 refs 不变;脏树无 `--force` 拒绝(`refused-dirty`)",
+      "behavior": "回收拒绝面:未注册/错误分支的 path 拒绝且 refs 不变;脏树无 `--force` 拒绝(`refused-dirty`)",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "三次调用 exit 非零;输出行分别为 refused-not-contained/refused-dirty;PR 未合并、base ref 不变",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-111",
+      "title": "分支删除仅当源 tip 是集成后 base tip 的祖先:`--ff`/`--merge` 删分支,`--squash`/`--rebase` 保留并报告原因(`branch-kept`)",
+      "behavior": "分支删除仅当源 tip 是集成后 base tip 的祖先:`--ff`/`--merge` 删分支,`--squash`/`--rebase` 保留并报告原因(`branch-kept`)",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "--ff 后 `git rev-parse <source_ref>` 失败;--squash 后分支仍在且输出 branch-kept(<reason>)",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-112",
+      "title": "回收结果行覆盖六态枚举且 `partial-leftover(<path>)` 在移除部分失败时报告路径;recycle 永不触碰 base 工作树",
+      "behavior": "回收结果行覆盖六态枚举且 `partial-leftover(<path>)` 在移除部分失败时报告路径;recycle 永不触碰 base 工作树",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "注入移除失败输出含 partial-leftover;合并后 base 工作树 `git status --porcelain` 为空且 HEAD==result commit",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-113",
+      "title": "`propose --forge` 在 merge-gate 时创建 PR:runtime.json 获 prId/issueId;重复 propose 不重开 Issue(`session:<s>` label + body 首行 `Ticket: <fid>` 命中即复用)",
+      "behavior": "`propose --forge` 在 merge-gate 时创建 PR:runtime.json 获 prId/issueId;重复 propose 不重开 Issue(`session:<s>` label + body 首行 `Ticket: <fid>` 命中即复用)",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "fake git-forge fixture 下 propose exit 0;第二次 propose 输出复用(forge 侧 issue 数不变)",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-114",
+      "title": "失败分类按 clause 6:ci red→gate_failed;stale/superseded→adapter 重建(forge_pr_superseded,非 pause);bridge/parse 失败→RECOVERABLE forge_bridge_failed",
+      "behavior": "失败分类按 clause 6:ci red→gate_failed;stale/superseded→adapter 重建(forge_pr_superseded,非 pause);bridge/parse 失败→RECOVERABLE forge_bridge_failed",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "fixture 注入三类失败,devflow 停点/pause reason 逐类匹配,绝不 blanket gate_failed",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-115",
+      "title": "proof ticket 经 adapter 以单条 issue comment + close 关闭;validator/orchestrator 不运行 git forge 写命令",
+      "behavior": "proof ticket 经 adapter 以单条 issue comment + close 关闭;validator/orchestrator 不运行 git forge 写命令",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "fixture 记录 write 调用仅来自 adapter;close 前 comment 恰一条",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-116",
+      "title": "crash reconcile/resume probe:merge 成功后崩溃恢复,按 prId 探测 forge refs 权威重建(三态收敛),任何分支不重调 `pr merge`",
+      "behavior": "crash reconcile/resume probe:merge 成功后崩溃恢复,按 prId 探测 forge refs 权威重建(三态收敛),任何分支不重调 `pr merge`",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "三种中断态注入后 probe 收敛;fixture 中 `pr merge` 调用次数不增",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-117",
+      "title": "双路径 parity:同一 feature 旧路径与 --forge 新路径各走一遍,progress-log 镜像事件可重建 recreate 窗口;fake git-forge fixture 支撑测试矩阵",
+      "behavior": "双路径 parity:同一 feature 旧路径与 --forge 新路径各走一遍,progress-log 镜像事件可重建 recreate 窗口;fake git-forge fixture 支撑测试矩阵",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "双路径各跑一遍 exit 0;progress log 含 forge_pr_created/forge_pr_superseded/forge_merged;测试矩阵绿",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-118",
+      "title": "切换次序契约:#9→#3→#4 以旧路径落地(无 forge PR),adapter(#10)先于 #1/#2 的新流程 PR 存在",
+      "behavior": "切换次序契约:#9→#3→#4 以旧路径落地(无 forge PR),adapter(#10)先于 #1/#2 的新流程 PR 存在",
+      "surface": "docs",
+      "tool": "cli",
+      "evidence": "switchover ADR 声明 + 验收时 #1/#2 的 PR 走 `pr create --closes`→merge 新流程(recreate 行为属 #10 已证路径)",
+      "status": "pending"
+    }
+  ]
+}

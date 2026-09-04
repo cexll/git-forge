@@ -1,0 +1,296 @@
+{
+  "mission": "forge-p1",
+  "generatedBy": "devflow.cjs compile",
+  "generatedAt": "2026-09-04",
+  "statusNote": "This is the plan and holds no status. Live status is in <spec-dir>/missions/runtime.json (gitignored, written only by devflow). Read it with: devflow.cjs brief --mission-dir <spec-dir>/missions — that answers \"is it done\", read-only. Never edit this file by hand: append with 'devflow.cjs amend --add-feature', and drop work with 'devflow.cjs cancel'.",
+  "features": [
+    {
+      "id": "t0",
+      "description": "`git forge pr merge --ff` executes a fast-forward: result_commit == source_head (no new commit, single-parent chain preserved); precondition merge_base == base_head; before #2 lands, a moved base refuses naming recreate-or-rebase-and-recheck; after #2, the ff gate revalidates against the live-base result.",
+      "dependsOn": [],
+      "milestone": "merge-core",
+      "touches": [
+        "src/pr_merge.rs",
+        "src/merge_state.rs",
+        "src/store.rs",
+        "src/cli.rs",
+        "src/git.rs",
+        "tests/t3_merge.rs",
+        "scripts/gf-dogfood.sh"
+      ],
+      "fulfills": [
+        "VAL-101",
+        "VAL-102",
+        "VAL-103",
+        "VAL-104"
+      ],
+      "verification": {
+        "mode": "steps",
+        "steps": [
+          {
+            "id": "check",
+            "command": "cargo test",
+            "expectedExit": "zero"
+          }
+        ]
+      },
+      "skillName": "tdd",
+      "expectedBehavior": [
+        "`pr merge --ff` on a strictly-on-top source exits zero; `pr show` displays result_commit == source_head; the integrated base tip's parent is the prior base tip (no merge commit)",
+        "Non-ffable PR + `--ff`: exits non-zero with a distinct error naming the rebase remedy; no ref change; PR remains unmerged",
+        "Moved base (current base != snapshot base_head, pre-#2): refuses naming recreate-or-rebase-and-recheck; base/PR refs unchanged",
+        "CAS clash injected (base advanced between expectation check and finalize): merge fails, no partial write (base/PR/issue refs all unchanged) — exact-base CAS holds",
+        "Existing merge strategies unchanged: merge-commit/squash/rebase paths byte-identical in behavior",
+        "gf-dogfood.sh gains --ff assertions (success + non-ff refusal)"
+      ],
+      "origin": "plan",
+      "addressesItemId": []
+    },
+    {
+      "id": "t1",
+      "description": "Relax the checked-out base guard: `pr merge` succeeds while base_ref is checked out in a non-temporary worktree, provided that worktree is clean; after the base CAS, the base worktree is refreshed to the result commit. Refresh failure exits non-zero with refs unchanged (no partial move) and reports the worktree as a leftover.",
+      "dependsOn": [
+        "t0"
+      ],
+      "milestone": "merge-core",
+      "touches": [
+        "src/pr_merge.rs",
+        "src/merge_state.rs",
+        "src/store.rs",
+        "src/git.rs",
+        "docs/architecture/git-forge.md",
+        "tests/t3_merge.rs",
+        "scripts/gf-dogfood.sh"
+      ],
+      "fulfills": [
+        "VAL-105",
+        "VAL-106",
+        "VAL-107",
+        "VAL-108"
+      ],
+      "verification": {
+        "mode": "steps",
+        "steps": [
+          {
+            "id": "check",
+            "command": "cargo test",
+            "expectedExit": "zero"
+          }
+        ]
+      },
+      "skillName": "tdd",
+      "expectedBehavior": [
+        "Clean main-tree base (base_ref checked out, `git status --porcelain` empty): merge exits zero; after merge the worktree files match the result commit and the tree is clean",
+        "Dirty base (modified tracked file AND untracked file cases): merge exits non-zero, base ref value unchanged; untracked counts as dirty",
+        "Ignored-only dirt: merge proceeds (ignored does NOT count as dirty)",
+        "Refresh-failure injection: merge exits non-zero, base ref and worktree HEAD agree (no partial move), output reports the worktree as a leftover",
+        "docs/architecture/git-forge.md: guard section updated; Known Limitations names sparse-checkout and submodules as out of L1 scope",
+        "gf-dogfood.sh: refusal-on-checked-out-base assertions reversed; clean-merge/dirty-refusal assertions added"
+      ],
+      "origin": "plan",
+      "addressesItemId": []
+    },
+    {
+      "id": "t2",
+      "description": "`git forge pr merge <n> --recycle-worktree <path>` removes the merged source worktree and conditionally deletes its branch, returning a structured outcome line for orchestrators. Runs after base refresh (#3) and finalization; never touches the base worktree; salvage renaming of unmerged branches is pipeline-side and happens BEFORE this call.",
+      "dependsOn": [
+        "t1"
+      ],
+      "milestone": "merge-core",
+      "touches": [
+        "src/pr_merge.rs",
+        "src/merge_state.rs",
+        "src/cli.rs",
+        "src/git.rs",
+        "docs/architecture/git-forge.md",
+        "tests/t3_merge.rs",
+        "scripts/gf-dogfood.sh"
+      ],
+      "fulfills": [
+        "VAL-109",
+        "VAL-110",
+        "VAL-111",
+        "VAL-112",
+        "VAL-118"
+      ],
+      "verification": {
+        "mode": "steps",
+        "steps": [
+          {
+            "id": "check",
+            "command": "cargo test",
+            "expectedExit": "zero"
+          }
+        ]
+      },
+      "skillName": "tdd",
+      "expectedBehavior": [
+        "Clean registered source worktree, checked-out branch == PR source_ref, `--ff` merge: worktree removed (absent from `git worktree list`), branch deleted, outcome `removed` + `branch-deleted`",
+        "Unregistered path or worktree not on the PR source_ref: exits non-zero, outcome `refused-not-contained`, refs unchanged, the referenced worktree is untouched",
+        "Dirty source worktree without `--force`: exits non-zero, outcome `refused-dirty`, worktree and branch intact; with `--force`: proceeds",
+        "`--squash`/`--rebase` merge with recycle: branch kept, outcome `branch-kept(<reason>)` naming why; `--ff`/`--merge` delete the branch",
+        "Partial-removal injection: outcome `partial-leftover(<path>)` naming the path",
+        "Base worktree untouched by recycle: after a merge with recycle, the base worktree is clean and at the result commit",
+        "Switchover ordering contract held: #9/#3/#4 landed by the old path (no forge PR) and the announcement lives in this ticket's OLD-PATH integration commit message + Issue comment",
+        "gf-dogfood.sh covers the outcome vocabulary (removed / refused-dirty / refused-not-contained / branch-deleted / branch-kept)"
+      ],
+      "origin": "plan",
+      "addressesItemId": []
+    },
+    {
+      "id": "t3",
+      "description": "Implement the eight-clause adapter contract inside `devflow.cjs` behind `propose --forge`: PR creation at merge-gate time, idempotent issue projection, proof-ticket closure, failure taxonomy, crash reconcile/resume probe, recycle ownership consuming #4's structured outcome, progress-log mirroring, and a fake git-forge test-matrix fixture with dual-path parity.",
+      "dependsOn": [
+        "t2"
+      ],
+      "milestone": "adapter",
+      "touches": [
+        "~/.agents/skills/implement/scripts/devflow.cjs",
+        "~/.agents/skills/implement/tests/",
+        "~/.agents/skills/implement/fixtures/"
+      ],
+      "fulfills": [
+        "VAL-113",
+        "VAL-114",
+        "VAL-115",
+        "VAL-116",
+        "VAL-117"
+      ],
+      "verification": {
+        "mode": "steps",
+        "steps": [
+          {
+            "id": "check",
+            "command": "cargo test",
+            "expectedExit": "zero"
+          }
+        ]
+      },
+      "skillName": "tdd",
+      "expectedBehavior": [
+        "`propose --forge` creates PRs at merge-gate time; `runtime.json` gains prId/issueId; progress log records `forge_pr_created`",
+        "Filing is idempotent: a retry reuses the open Issue matched by `session:<s>` label + first body line `Ticket: <fid>` — forge-side issue count does not grow across retries",
+        "Proof tickets close via exactly one issue comment (evidence pointer + status) + close; all forge write calls originate from the adapter, never validators",
+        "Failure taxonomy maps each class to its named pause/recreate path: ci red→`gate_failed`; stale/superseded→recreate (`forge_pr_superseded`, no pause); bridge/parse + persistent CAS→RECOVERABLE `forge_bridge_failed`; recycle refused/partial→`worktree_partial_removal`",
+        "Crash reconcile probe converges all three injected interrupt states (merged-not-recorded / merged-open-issue / merged-remaining-worktree) and never re-invokes `pr merge`",
+        "Recycle ownership: adapter consumes #4's structured outcome, runs salvage BEFORE recycle, persists the outcome before clearing feature.worktree/branch",
+        "Fake git-forge fixture + dual-path parity green in the implement-skill test matrix; progress-log mirror events reconstruct the recreate window"
+      ],
+      "origin": "plan",
+      "addressesItemId": []
+    },
+    {
+      "id": "v-p1",
+      "description": "exercise every merge-core and adapter ASSERTION through its real surface (forge CLI; adapter via the implement-skill test matrix / fake git-forge fixture) and report per assertion",
+      "dependsOn": [
+        "t0",
+        "t1",
+        "t2",
+        "t3"
+      ],
+      "milestone": "acceptance",
+      "touches": [],
+      "fulfills": [],
+      "proves": [
+        "VAL-101",
+        "VAL-102",
+        "VAL-103",
+        "VAL-104",
+        "VAL-105",
+        "VAL-106",
+        "VAL-107",
+        "VAL-108",
+        "VAL-109",
+        "VAL-110",
+        "VAL-111",
+        "VAL-112",
+        "VAL-113",
+        "VAL-114",
+        "VAL-115",
+        "VAL-116",
+        "VAL-117",
+        "VAL-118"
+      ],
+      "reportOnly": true,
+      "skillName": "user-validate-flow",
+      "expectedBehavior": [
+        "Every assigned assertion carries a verdict and at least one evidence artifact"
+      ],
+      "origin": "plan",
+      "addressesItemId": []
+    },
+    {
+      "id": "a-final",
+      "description": "exercise every contract assertion through its real surface and report per assertion",
+      "dependsOn": [
+        "t0",
+        "t1",
+        "t2",
+        "t3",
+        "v-p1"
+      ],
+      "milestone": "acceptance",
+      "touches": [],
+      "fulfills": [],
+      "proves": [
+        "VAL-101",
+        "VAL-102",
+        "VAL-103",
+        "VAL-104",
+        "VAL-105",
+        "VAL-106",
+        "VAL-107",
+        "VAL-108",
+        "VAL-109",
+        "VAL-110",
+        "VAL-111",
+        "VAL-112",
+        "VAL-113",
+        "VAL-114",
+        "VAL-115",
+        "VAL-116",
+        "VAL-117",
+        "VAL-118"
+      ],
+      "reportOnly": true,
+      "validatorKind": "acceptance",
+      "skillName": "user-validate-flow",
+      "expectedBehavior": [
+        "Every contract assertion carries a verdict and at least one evidence artifact"
+      ],
+      "origin": "plan",
+      "addressesItemId": []
+    },
+    {
+      "id": "p-promote",
+      "description": "turn the accepted P1 flows (ff integration with checked-out base; worktree/branch recycle; forge-adapter pipeline) into install-e2e flow contracts under `.agents/qa/flows/`, reviewed and merged like any other change.",
+      "dependsOn": [
+        "a-final"
+      ],
+      "milestone": "acceptance",
+      "touches": [
+        ".agents/qa/"
+      ],
+      "fulfills": [],
+      "verification": {
+        "mode": "steps",
+        "steps": [
+          {
+            "id": "check",
+            "command": "cargo test",
+            "expectedExit": "zero"
+          }
+        ]
+      },
+      "skillName": "tdd",
+      "expectedBehavior": [
+        "Three flow contract files exist under `.agents/qa/flows/` with the five required headings each",
+        "Each flow names the CLI steps and the exit-code/outcome-line/ref-state assertions the acceptance sweep observed (including the `removed | refused-* | branch-* | partial-leftover` outcome vocabulary)",
+        "The install-e2e parser accepts them (its own shape check passes)",
+        "Nothing else changes — the flows are documentation-of-proof, not code"
+      ],
+      "origin": "plan",
+      "addressesItemId": []
+    }
+  ]
+}
