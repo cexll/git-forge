@@ -2073,10 +2073,26 @@ function forgeMergeFeature(missionDir, state, featuresDoc, feature) {
       try {
         prId = forgeCreatePR(missionDir, state, feature);
         feature.prId = prId;
+        if (supersededFrom) {
+          // The mirror names old AND new ids so the recreate window stays
+          // reconstructable from the log alone (clause 5).
+          logEvent(missionDir, 'forge_pr_superseded', { featureId: feature.id, oldPrId: supersededFrom, newPrId: prId, reason: 'stale base' });
+          supersededFrom = null;
+        }
         // Persist the key BEFORE the merge: a crash after the merge leaves the
         // reconcile probe something to key on (clause 7).
         writeFeaturesDoc(missionDir, featuresDoc);
       } catch (e) {
+        // The create attempt failed at the bridge (prCreateFail / parse garbage):
+        // the feature's work is done and stays in_review — no work to redo — and
+        // the mission pauses RECOVERABLY; re-running the same round self-clears
+        // (clause 6). A paused feature would requeue the worker for nothing.
+        state.state = 'paused';
+        state.pauseReason = 'forge_bridge_failed';
+        writeState(missionDir, state);
+        logEvent(missionDir, 'merge_blocked', { featureId: feature.id, code: 'forge_bridge_failed' });
+        logEvent(missionDir, 'forge_bridge_failed', { featureId: feature.id, pauseReason: 'forge_bridge_failed', error: String(e.message || e).slice(0, 300) });
+        writeFeaturesDoc(missionDir, featuresDoc);
         if (e instanceof RejectError) return { ok: false, code: e.code, message: e.message };
         throw e;
       }
@@ -2102,12 +2118,30 @@ function forgeMergeFeature(missionDir, state, featuresDoc, feature) {
     }
     const merged = forgeRun(state, ['pr', 'merge', String(prId), '--ff', '--recycle-worktree', feature.worktree]);
     const out = `${merged.stdout}\n${merged.stderr}`;
+    // A partial-leftover recycle is reported AFTER a successful merge with a
+    // non-zero exit (the forge's own epilogue): the merge line is in the output
+    // even though merged.ok is false. Detect it before any refusal class.
+    const mergedLine = out.match(FORGE_RE.merged);
+    const partialOutcome = out.match(FORGE_RE.recycleOutcome);
+    if (!merged.ok && mergedLine && partialOutcome && /partial-leftover/.test(partialOutcome[1])) {
+      const commitId = mergedLine[3];
+      logEvent(missionDir, 'forge_merged', { featureId: feature.id, prId, commitId });
+      logEvent(missionDir, 'feature_merged', { featureId: feature.id, branch, commitId, prId });
+      feature.status = 'completed';
+      feature.currentWorkerSessionId = null;
+      // Persist the outcome BEFORE anything is cleared; the worktree stays.
+      logEvent(missionDir, 'forge_recycle_outcome', { featureId: feature.id, prId, outcome: partialOutcome[1], worktree: feature.worktree });
+      logEvent(missionDir, 'worktree_recycle_partial', { featureId: feature.id, prId, outcome: partialOutcome[1], keptWorktree: feature.worktree });
+      state.state = 'paused';
+      state.pauseReason = 'worktree_partial_removal';
+      writeState(missionDir, state);
+      writeFeaturesDoc(missionDir, featuresDoc);
+      return { ok: false, code: 'worktree_partial_removal', message: `PR #${prId} merged; recycle outcome: ${partialOutcome[1]} — feature.worktree kept as the recovery record (worktree_partial_removal)`, partial: true };
+    }
     if (!merged.ok) {
       if (FORGE_RE.movedBase.test(out)) {
-        // stale-base → adapter recreate, never a pause, budget-neutral.
         logEvent(missionDir, 'forge_stale_base', { featureId: feature.id, prId });
         forgeRun(state, ['pr', 'abandon', String(prId), '--reason', 'superseded: base moved; recreating the snapshot']);
-        logEvent(missionDir, 'forge_pr_superseded', { featureId: feature.id, oldPrId: prId, newPrId: null, reason: 'stale base' });
         supersededFrom = prId;
         prId = null;
         continue;
@@ -2127,13 +2161,23 @@ function forgeMergeFeature(missionDir, state, featuresDoc, feature) {
       // pr merge refusal that is none of the named classes: persistent finalize
       // CAS conflict after the forge's own retries, or an unknown bridge failure.
       const err = forgeBridgeError(`git forge pr merge failed: ${(merged.stderr || merged.stdout).slice(0, 300)}`);
+      state.state = 'paused';
+      state.pauseReason = 'forge_bridge_failed';
+      writeState(missionDir, state);
       logEvent(missionDir, 'merge_blocked', { featureId: feature.id, code: 'forge_bridge_failed' });
+      logEvent(missionDir, 'forge_bridge_failed', { featureId: feature.id, pauseReason: 'forge_bridge_failed', error: String(err.message).slice(0, 300) });
+      writeFeaturesDoc(missionDir, featuresDoc);
       return { ok: false, code: 'forge_bridge_failed', message: err.message };
     }
     const mm = out.match(FORGE_RE.merged);
     if (!mm) {
       const err = forgeBridgeError(`cannot parse 'merged PR #<n> into <base> (<sha>)' from forge output: ${out.slice(0, 200)}`);
+      state.state = 'paused';
+      state.pauseReason = 'forge_bridge_failed';
+      writeState(missionDir, state);
       logEvent(missionDir, 'merge_blocked', { featureId: feature.id, code: 'forge_bridge_failed' });
+      logEvent(missionDir, 'forge_bridge_failed', { featureId: feature.id, pauseReason: 'forge_bridge_failed', error: String(err.message).slice(0, 300) });
+      writeFeaturesDoc(missionDir, featuresDoc);
       return { ok: false, code: 'forge_bridge_failed', message: err.message };
     }
     const commitId = mm[3];
@@ -7894,6 +7938,9 @@ async function main() {
       case 'bind-authority':
         cmdBindAuthority(rest);
         break;
+      case 'missions':
+        cmdMissions(rest);
+        break;
       case 'amend':
         cmdAmend(rest);
         break;
@@ -7932,9 +7979,6 @@ async function main() {
         break;
       case 'wave':
         cmdWave(rest);
-        break;
-      case 'reconcile':
-        cmdReconcile(rest);
         break;
       case 'reconcile-forge':
         cmdReconcileForge(rest);

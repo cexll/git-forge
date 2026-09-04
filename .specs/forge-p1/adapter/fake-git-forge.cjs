@@ -284,6 +284,17 @@ if (group === 'pr') {
       const cur = git(['rev-parse', `refs/heads/${p.base}`]);
       finish(1, '', `base branch '${p.base}' has moved since PR #${id} was created (${cur.stdout} != snapshot ${p.base_head}); recreate the PR or merge manually`);
     }
+    // #3 live-base refresh: any worktree with the base branch checked out is
+    // refreshed to the result commit, or the main worktree's index/HEAD go stale
+    // against the moved ref (git status would show a phantom 'D <file>').
+    const wl = git(['worktree', 'list', '--porcelain']);
+    for (const block of wl.stdout.split('\n\n')) {
+      if (block.startsWith('worktree ') && block.includes(`branch refs/heads/${p.base}`)) {
+        const wtPath = block.split('\n')[0].slice('worktree '.length);
+        const refresh = git(['reset', '--hard'], wtPath);
+        if (!refresh.ok) finish(1, '', `fake-forge: base worktree refresh failed: ${refresh.stderr}`);
+      }
+    }
     p.merged = p.source_head;
     if (p.closes) {
       const issue = issues.issues.find((x) => x.id === p.closes);
