@@ -391,5 +391,51 @@ at "noff error names rebase remedy" 0 "git forge pr merge 19 --ff 2>&1 | grep -q
 at "noff base unchanged" 0 "[ \"\$(git rev-parse \"\$BASE_BRANCH\")\" = \"\$NOFF_BASE\" ]"
 at "noff pr still unmerged" 0 "! git forge pr show 19 | grep -q 'merged:'"
 
+# ── #4 / VAL-109..112: pr merge --recycle-worktree — outcome vocabulary ──
+# Worktrees live OUTSIDE the disposable clone (a worktree inside it would
+# register as untracked dirt and trip the checked-out base guard). $WR is
+# trap-removed with $T; the at() strings double-escape \$ (eval expands
+# twice), matching the established escaping.
+WR="$T/gf-wt"
+mkdir -p "$WR"
+git worktree add -q "$WR/src" -b feat/gf-recycle "$BASE_BRANCH"
+printf 'r\n' > "$WR/src/gf-recycle.txt"
+git -C "$WR/src" add gf-recycle.txt && git -C "$WR/src" commit -qm "recycle c1"
+git forge pr create --source feat/gf-recycle --base "$BASE_BRANCH" "recycle PR" >/dev/null
+git forge pr review 20 --approve >/dev/null
+git forge ci run 20 >/dev/null   # green latest CI Check so the gate lets #20 merge (t3)
+# refused-not-contained: an UNREGISTERED path refuses, PR unmerged.
+at "recycle unregistered path refused" 0 "git forge pr merge 20 --ff --recycle-worktree \$WR/nope 2>&1 | tee \"\$T/rc.out\" | grep -q refused-not-contained"
+at "recycle unregistered refusal unmerged" 0 "! git forge pr show 20 | grep -q 'merged:'"
+# refused-not-contained: a REGISTERED worktree on the WRONG branch refuses
+# and the referenced worktree is untouched.
+git worktree add -q "$WR/wrong" -b feat/gf-wrong "$BASE_BRANCH"
+at "recycle wrong-branch worktree refused" 0 "git forge pr merge 20 --ff --recycle-worktree \$WR/wrong 2>&1 | grep -q refused-not-contained"
+at "recycle wrong worktree untouched" 0 "[ -d \$WR/wrong ] && git worktree list --porcelain | grep -qF \"\$WR/wrong\""
+# refused-dirty: a dirty source worktree (untracked file) refuses without
+# --force; worktree and branch stay intact, PR unmerged.
+printf 'u\n' > "$WR/src/gf-untracked.txt"
+at "recycle dirty refused" 0 "git forge pr merge 20 --ff --recycle-worktree \$WR/src 2>&1 | tee \"\$T/rc.out\" | grep -q refused-dirty"
+at "recycle dirty keeps worktree and branch" 0 "[ -d \$WR/src ] && git rev-parse -q --verify feat/gf-recycle >/dev/null"
+at "recycle dirty keeps PR unmerged" 0 "! git forge pr show 20 | grep -q 'merged:'"
+# --force proceeds: outcome removed + branch-deleted, worktree gone and
+# unregistered, branch rev-parse fails (VAL-109 evidence).
+at "recycle force merge ok with outcomes" 0 "git forge pr merge 20 --ff --force --recycle-worktree \$WR/src 2>&1 | tee \"\$T/rc.out\" | grep -q removed && grep -q branch-deleted \"\$T/rc.out\""
+at "recycle force worktree gone" 0 "[ ! -d \$WR/src ] && ! git worktree list --porcelain | grep -qF \"\$WR/src\""
+at "recycle force branch deleted" 0 "! git rev-parse -q --verify feat/gf-recycle >/dev/null"
+git worktree remove --force "$WR/wrong"
+
+# ── #4 / VAL-111: branch-kept — squash merge with recycle keeps the branch
+# and reports branch-kept(<reason>) naming why ──
+git worktree add -q "$WR/keep" -b feat/gf-keep "$BASE_BRANCH"
+printf 'k\n' > "$WR/keep/gf-keep.txt"
+git -C "$WR/keep" add gf-keep.txt && git -C "$WR/keep" commit -qm "keep c1"
+git forge pr create --source feat/gf-keep --base "$BASE_BRANCH" "keep PR" >/dev/null
+git forge pr review 21 --approve >/dev/null
+git forge ci run 21 >/dev/null   # green latest CI Check so the gate lets #21 merge (t3)
+at "squash recycle merge ok with branch-kept" 0 "git forge pr merge 21 --squash --recycle-worktree \$WR/keep 2>&1 | tee \"\$T/rc.out\" | grep -q removed && grep -qF 'branch-kept(' \"\$T/rc.out\""
+at "squash recycle worktree removed" 0 "[ ! -d \$WR/keep ] && ! git worktree list --porcelain | grep -qF \"\$WR/keep\""
+at "squash recycle branch still exists" 0 "git rev-parse -q --verify feat/gf-keep >/dev/null"
+
 echo "=========== DOGFOOD SUMMARY pass=$PASS fail=$FAIL ==========="
 [ "$FAIL" -eq 0 ]

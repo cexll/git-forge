@@ -2424,7 +2424,14 @@ fn merge_help_usage_and_strategies() {
     let (c, o, e) = forge(&dir, &["forge", "pr", "merge", "--help"]);
     assert_eq!(c, 0, "merge --help failed: {e}");
     assert!(o.contains("usage: git forge pr merge"), "usage head: {o}");
-    for s in ["--merge", "--squash", "--rebase", "--ff"] {
+    for s in [
+        "--merge",
+        "--squash",
+        "--rebase",
+        "--ff",
+        "--recycle-worktree",
+        "--force",
+    ] {
         assert!(o.contains(s), "help must list {s}: {o}");
     }
     let (c2, o2, e2) = forge(&dir, &["forge", "pr", "merge", "-h"]);
@@ -3667,4 +3674,390 @@ fn ff_finalize_base_cas_clash_leaves_no_partial_write() {
         "no partial issue.close event may exist: {events:?}"
     );
     assert_no_temp_worktree_pr(&dir, 2);
+}
+
+// ── t2 / VAL-109..112: `pr merge --recycle-worktree` (#4 source recycle) ──
+
+/// Register a linked worktree on `branch` in a unique temp path OUTSIDE the
+/// repo dir — the real pipeline layout (devflow worktrees never live inside
+/// the integration tree, where they would register as untracked dirt and
+/// trip the checked-out base guard). The main worktree stays wherever it is
+/// (typically the clean base branch), so the checked-out base guard and the
+/// #3 refresh see a clean base while the source worktree is the recycle
+/// target.
+fn add_source_worktree(dir: &Path, name: &str, branch: &str) -> PathBuf {
+    let wt = std::env::temp_dir().join(format!(
+        "gf-t3-wt-{name}-{}-{:?}",
+        std::process::id(),
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .subsec_nanos()
+    ));
+    let (c, _, e) = git(
+        dir,
+        &["worktree", "add", "-q", wt.to_str().unwrap(), branch],
+    );
+    assert_eq!(c, 0, "worktree add {name} on {branch} failed: {e}");
+    wt
+}
+
+#[test]
+fn recycle_ff_removes_source_worktree_and_deletes_branch() {
+    // VAL-109: a registered clean source worktree whose checked-out branch
+    // is the PR source_ref, recycled through `pr merge --ff
+    // --recycle-worktree`: exit 0, outcome lines `removed` +
+    // `branch-deleted`, the worktree directory is gone and unregistered,
+    // and `git rev-parse <source_ref>` fails (branch deleted). The base
+    // advanced to the result commit (== the source head for --ff).
+    let dir = tmpdir("recycleff");
+    init_repo(&dir);
+    make_feature(&dir, "feature", "feat\n");
+    checkout(&dir, "feature");
+    add_passing_ci_plan(&dir);
+    checkout(&dir, "main");
+    let wt = add_source_worktree(&dir, "wt-src", "feature");
+    let wts = wt.to_str().unwrap();
+    let (c, o, e) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "create",
+            "--source",
+            "feature",
+            "--base",
+            "main",
+            "recycle PR",
+        ],
+    );
+    assert_eq!(c, 0, "pr create failed: {e} {o}");
+    ci_green(&dir);
+    let (c, o, e) = forge(&dir, &["forge", "pr", "review", "1", "--approve"]);
+    assert_eq!(c, 0, "approve failed: {e} {o}");
+    let source_before = ref_oid(&dir, "refs/heads/feature").unwrap();
+    let (cm, om, em) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "merge",
+            "1",
+            "--ff",
+            "--recycle-worktree",
+            wts,
+        ],
+    );
+    assert_eq!(cm, 0, "ff merge with recycle failed: {em} {om}");
+    assert!(om.contains("removed"), "outcome must contain removed: {om}");
+    assert!(
+        om.contains("branch-deleted"),
+        "outcome must contain branch-deleted: {om}"
+    );
+    assert!(!wt.exists(), "worktree directory must be gone");
+    let (_, list, _) = git(&dir, &["worktree", "list", "--porcelain"]);
+    assert!(!list.contains(wts), "worktree must be unregistered: {list}");
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/feature"),
+        None,
+        "source branch must be deleted"
+    );
+    // --ff result commit IS the source head; the base advanced onto it.
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        source_before,
+        "base tip must be the merged source head"
+    );
+}
+
+/// Setup shared by the recycle tests: repo, approved green PR #1 on branch
+/// `feature`, a registered source worktree on `feature`, main worktree on
+/// the clean base. Returns (dir, worktree path).
+fn recycle_setup(tag: &str) -> (PathBuf, PathBuf) {
+    let dir = tmpdir(tag);
+    init_repo(&dir);
+    make_feature(&dir, "feature", "feat\n");
+    checkout(&dir, "feature");
+    add_passing_ci_plan(&dir);
+    checkout(&dir, "main");
+    let wt = add_source_worktree(&dir, "wt-src", "feature");
+    let (c, o, e) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "create",
+            "--source",
+            "feature",
+            "--base",
+            "main",
+            "recycle PR",
+        ],
+    );
+    assert_eq!(c, 0, "pr create failed: {e} {o}");
+    ci_green(&dir);
+    let (c, o, e) = forge(&dir, &["forge", "pr", "review", "1", "--approve"]);
+    assert_eq!(c, 0, "approve failed: {e} {o}");
+    (dir, wt)
+}
+
+#[test]
+fn recycle_refuses_unregistered_and_wrong_branch_paths() {
+    // VAL-110 (containment): an UNREGISTERED path and a worktree whose
+    // checked-out branch is NOT the PR source_ref both refuse with exit
+    // non-zero, outcome refused-not-contained, refs unchanged, PR unmerged,
+    // and the referenced worktree untouched (the wrong-branch worktree must
+    // still exist and stay registered afterwards).
+    let (dir, wt) = recycle_setup("recyclenc");
+    let wts = wt.to_str().unwrap();
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let head_before = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+    // A registered worktree on a branch that is NOT the PR source_ref
+    // (a branch cannot be checked out in two worktrees, so this is its own).
+    let (_c, _o, _eb) = git(&dir, &["branch", "other", "main"]);
+    let wrong = add_source_worktree(&dir, "wt-wrong", "other");
+    let wrongs = wrong.to_str().unwrap();
+
+    let (_c1, o1, e1) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "merge",
+            "1",
+            "--ff",
+            "--recycle-worktree",
+            "/tmp/gf-not-registered",
+        ],
+    );
+    let both1 = format!("{o1} {e1}");
+    assert!(
+        both1.contains("refused-not-contained"),
+        "unregistered refusal must say refused-not-contained: {both1}"
+    );
+
+    let (c2, o2, e2) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "merge",
+            "1",
+            "--ff",
+            "--recycle-worktree",
+            wrongs,
+        ],
+    );
+    assert_ne!(c2, 0, "wrong-branch worktree must refuse");
+    let both2 = format!("{o2} {e2}");
+    assert!(
+        both2.contains("refused-not-contained"),
+        "wrong-branch refusal must say refused-not-contained: {both2}"
+    );
+    assert_eq!(ref_oid(&dir, "refs/heads/main").unwrap(), base_before);
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        head_before,
+        "PR head must be unchanged"
+    );
+    let (_cs, os, _) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert!(!os.contains("merged:"), "PR must remain unmerged: {os}");
+    assert!(
+        wt.exists() && wrong.exists(),
+        "referenced worktrees must be untouched"
+    );
+    let (_, list, _) = git(&dir, &["worktree", "list", "--porcelain"]);
+    assert!(
+        list.contains(wts) && list.contains(wrongs),
+        "registrations intact: {list}"
+    );
+}
+
+#[test]
+fn recycle_refuses_dirty_without_force_proceeds_with_force() {
+    // VAL-110 (dirty): a dirty source worktree (tracked modification AND an
+    // untracked file both count) refuses without --force with outcome
+    // refused-dirty, worktree and branch intact, merge refused; with
+    // --force the merge + recycle proceed.
+    let (dir, wt) = recycle_setup("recycledirty");
+    let wts = wt.to_str().unwrap();
+    std::fs::write(wt.join("feature.txt"), "dirty\n").unwrap();
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let head_before = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+    let (_cd, od, ed) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "merge",
+            "1",
+            "--ff",
+            "--recycle-worktree",
+            wts,
+        ],
+    );
+    let bothd = format!("{od} {ed}");
+    assert!(
+        bothd.contains("refused-dirty"),
+        "dirty refusal must say refused-dirty: {bothd}"
+    );
+    assert!(wt.exists(), "refused-dirty keeps the worktree");
+    assert!(
+        ref_oid(&dir, "refs/heads/feature").is_some(),
+        "refused-dirty keeps the branch"
+    );
+    assert_eq!(ref_oid(&dir, "refs/heads/main").unwrap(), base_before);
+    assert_eq!(ref_oid(&dir, "refs/forge/prs/1/head").unwrap(), head_before);
+
+    let (cf, of, ef) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "merge",
+            "1",
+            "--ff",
+            "--force",
+            "--recycle-worktree",
+            wts,
+        ],
+    );
+    assert_eq!(cf, 0, "--force must proceed: {ef} {of}");
+    assert!(of.contains("removed"), "--force recycle must remove: {of}");
+    assert!(!wt.exists(), "--force recycle removes the worktree");
+    assert!(
+        ref_oid(&dir, "refs/heads/feature").is_none(),
+        "branch deleted after --force recycle"
+    );
+}
+
+#[test]
+fn recycle_branch_deletion_follows_strategy_ancestry() {
+    // VAL-111: branch deletion ONLY when the source tip is an ancestor of
+    // the integrated base tip. --ff and --merge delete the branch (their
+    // result commit contains the source tip); --squash and --rebase KEEP it
+    // and report branch-kept(<reason>) naming why (squash/rebase synthesize
+    // a NEW commit; the original branch tip is not an ancestor of the
+    // result).
+    for (strategy, want_deleted) in [
+        ("--ff", true),
+        ("--merge", true),
+        ("--squash", false),
+        ("--rebase", false),
+    ] {
+        let dir = tmpdir("recyclestrat");
+        init_repo(&dir);
+        make_feature(&dir, "feature", "feat\n");
+        checkout(&dir, "feature");
+        add_passing_ci_plan(&dir);
+        checkout(&dir, "main");
+        let wt = add_source_worktree(&dir, "wt-src", "feature");
+        let wts = wt.to_str().unwrap();
+        let (c, o, e) = forge(
+            &dir,
+            &[
+                "forge", "pr", "create", "--source", "feature", "--base", "main", "strat PR",
+            ],
+        );
+        assert_eq!(c, 0, "pr create failed: {e} {o}");
+        ci_green(&dir);
+        let (c, o, e) = forge(&dir, &["forge", "pr", "review", "1", "--approve"]);
+        assert_eq!(c, 0, "approve failed: {e} {o}");
+        let (cm, om, em) = forge(
+            &dir,
+            &[
+                "forge",
+                "pr",
+                "merge",
+                "1",
+                strategy,
+                "--recycle-worktree",
+                wts,
+            ],
+        );
+        assert_eq!(cm, 0, "{strategy} merge with recycle failed: {em} {om}");
+        assert!(
+            om.contains("removed"),
+            "{strategy}: worktree must be removed: {om}"
+        );
+        assert!(!wt.exists(), "{strategy}: worktree dir must be gone");
+        if want_deleted {
+            assert!(
+                om.contains("branch-deleted"),
+                "{strategy}: outcome must contain branch-deleted: {om}"
+            );
+            assert_eq!(
+                ref_oid(&dir, "refs/heads/feature"),
+                None,
+                "{strategy}: branch must be deleted"
+            );
+        } else {
+            let both = om.clone();
+            assert!(
+                both.contains("branch-kept("),
+                "{strategy}: outcome must contain branch-kept(<reason>): {both}"
+            );
+            assert!(
+                ref_oid(&dir, "refs/heads/feature").is_some(),
+                "{strategy}: branch must be kept"
+            );
+        }
+    }
+}
+
+#[test]
+fn recycle_partial_leftover_on_removal_failure_base_untouched() {
+    // VAL-112: partial-removal injection — a locked source worktree makes
+    // `git worktree remove --force` fail deterministically, so the recycle
+    // reports partial-leftover(<path>) NAMING THE PATH, the worktree stays
+    // registered, and the merge itself is intact (the PR is merged, the
+    // branch kept). The base worktree is NEVER touched by the recycle:
+    // after a merge with recycle, the base worktree is clean and its HEAD
+    // is the result commit (the #3 refresh, which recycle runs after).
+    let (dir, wt) = recycle_setup("recyclepl");
+    let wts = wt.to_str().unwrap();
+    let source_before = ref_oid(&dir, "refs/heads/feature").unwrap();
+    // Inject the partial-removal: lock the source worktree (debug seam) so
+    // the recycle's `git worktree remove --force` fails.
+    let (cm, om, em) = run_forge(
+        &dir,
+        None,
+        &[("GIT_FORGE_TEST_FAIL_RECYCLE_REMOVE", wts)],
+        &[
+            "forge",
+            "pr",
+            "merge",
+            "1",
+            "--ff",
+            "--recycle-worktree",
+            wts,
+        ],
+    );
+    assert_ne!(cm, 0, "partial removal must exit non-zero: {om} {em}");
+    let both = format!("{om} {em}");
+    assert!(
+        both.contains(&format!("partial-leftover({wts})")),
+        "outcome must name partial-leftover(<path>) with the exact path: {both}"
+    );
+    // The merge itself is intact: PR merged onto the source head.
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        source_before,
+        "base advanced to the merged source head"
+    );
+    // The worktree stays registered (partial removal).
+    assert!(wt.exists(), "leftover worktree directory stays");
+    let (_, list, _) = git(&dir, &["worktree", "list", "--porcelain"]);
+    assert!(
+        list.contains(wts),
+        "leftover worktree stays registered: {list}"
+    );
+    // Base worktree NEVER touched by the recycle: clean, HEAD == result.
+    let (_, status, _) = git(&dir, &["status", "--porcelain"]);
+    assert_eq!(status, "", "base worktree must be clean: {status}");
+    let (_, head, _) = git(&dir, &["rev-parse", "HEAD"]);
+    assert_eq!(
+        head, source_before,
+        "base worktree HEAD must be the result commit"
+    );
 }

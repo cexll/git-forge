@@ -499,6 +499,79 @@ pub(crate) fn refresh_base_worktree(worktree: &Path, head_tip: &str) -> Result<(
     }
 }
 
+/// The branch ref (`refs/heads/<name>`) the registered worktree at `target`
+/// has checked out, parsed from `git worktree list --porcelain` output.
+/// `None` when the path is not registered, detached, or bare. Both sides are
+/// symlink-resolved via [`canonicalize_for_compare`] so the macOS `/var` vs
+/// `/private/var` spelling difference cannot miss the matching entry (F-005,
+/// same comparison rule as [`worktree_registered_path`]).
+pub(crate) fn worktree_branch_of(porcelain: &str, target: &Path) -> Option<String> {
+    for block in porcelain.split("\n\n") {
+        let mut wt_path: Option<&str> = None;
+        let mut branch: Option<String> = None;
+        for line in block.lines() {
+            if let Some(p) = line.strip_prefix("worktree ") {
+                wt_path = Some(p);
+            } else if let Some(b) = line.strip_prefix("branch ") {
+                branch = Some(b.to_string());
+            }
+        }
+        if let (Some(p), Some(b)) = (wt_path, branch) {
+            if canonicalize_for_compare(Path::new(p)) == canonicalize_for_compare(target) {
+                return Some(b);
+            }
+        }
+    }
+    None
+}
+
+/// The current tip of `refs/heads/<branch>`, `None` when the branch does not
+/// exist. Used by the recycle to read the LIVE source tip (the branch may
+/// legitimately be absent — then there is nothing to delete).
+pub(crate) fn branch_tip(repo_dir: &Path, branch: &str) -> Option<String> {
+    let (ok, out, _) = git_in(
+        repo_dir,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    );
+    if ok {
+        Some(out)
+    } else {
+        None
+    }
+}
+
+/// `git merge-base --is-ancestor <ancestor> <descendant>`: true when
+/// `ancestor` is an ancestor of (or equal to) `descendant`. The recycle's
+/// branch-deletion authority (#4): the branch is deleted only when its tip is
+/// an ancestor of the integrated result commit.
+pub(crate) fn merge_base_is_ancestor(repo_dir: &Path, ancestor: &str, descendant: &str) -> bool {
+    let (ok, _, _) = git_in(
+        repo_dir,
+        &["merge-base", "--is-ancestor", ancestor, descendant],
+    );
+    ok
+}
+
+/// Delete a local branch (`git branch -D`) from the repository. The caller
+/// establishes merged-ness with [`merge_base_is_ancestor`] FIRST — `-D` is
+/// deliberate: the recycle's own ancestry check against the result commit is
+/// the contract's authority, while `git branch -d`'s merged-into-HEAD check
+/// would depend on the unrelated HEAD state of whichever worktree runs the
+/// command. Err carries git's stderr.
+pub(crate) fn branch_force_delete(repo_dir: &Path, branch: &str) -> Result<(), String> {
+    let (ok, _, err) = git_in(repo_dir, &["branch", "-D", branch]);
+    if ok {
+        Ok(())
+    } else {
+        Err(err)
+    }
+}
+
 /// Execute the requested merge strategy inside the temp worktree and return
 /// the resulting HEAD oid (as a string). On any failure the in-flight
 /// merge/rebase state is cleaned up (abort/reset + `git clean -fd`) and the
@@ -792,6 +865,21 @@ fn classify_config_get(
                 sanitize_config_diag(stderr).trim()
             ))
         }
+    }
+}
+
+/// Debug-only test seam (VAL-112): lock a SOURCE worktree so the recycle's
+/// `git worktree remove --force` fails deterministically, exercising the
+/// partial-leftover injection. The variable VALUE is the worktree path —
+/// only that path is locked. Inert in release builds and when the env var
+/// is unset. Err carries git's stderr.
+#[cfg(debug_assertions)]
+pub(crate) fn lock_source_worktree_for_recycle(repo_dir: &Path, path: &Path) -> Result<(), String> {
+    let (ok, _, err) = git_in(repo_dir, &["worktree", "lock", path_to_str(path)?]);
+    if ok {
+        Ok(())
+    } else {
+        Err(err)
     }
 }
 

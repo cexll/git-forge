@@ -22,8 +22,22 @@ use crate::store::EventStore;
 pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String, String> {
     let mut id_arg = None;
     let mut strategy: Option<&str> = None; // merge | squash | rebase
-    for a in args {
-        match a.as_str() {
+    let mut recycle: Option<String> = None;
+    let mut i = 0;
+    let mut force = false;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--recycle-worktree" => {
+                // #4: the next token is the source-worktree path to recycle.
+                i += 1;
+                if i >= args.len() {
+                    return Err("--recycle-worktree requires a worktree path".into());
+                }
+                if recycle.is_some() {
+                    return Err("--recycle-worktree specified more than once".into());
+                }
+                recycle = Some(args[i].clone());
+            }
             "--merge" => {
                 if strategy.is_some() {
                     return Err("merge strategy flag specified more than once".into());
@@ -48,6 +62,10 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
                 }
                 strategy = Some("ff");
             }
+            "--force" => {
+                // #4: unlocks ONLY the dirty-source-worktree recycle refusal.
+                force = true;
+            }
             "-h" | "--help" => return Ok(pr_merge_help()),
             s if s.starts_with('-') => return Err(format!("unknown option '{s}'")),
             s => {
@@ -61,6 +79,7 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
                 id_arg = Some(s.to_string());
             }
         }
+        i += 1;
     }
     let strategy = strategy.unwrap_or("merge");
     let id = crate::cli::parse_entity_id(id_arg.as_deref().unwrap_or(""))?;
@@ -161,7 +180,21 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
             ));
         }
     }
-
+    // Recycle pre-validation (#4, phase 1): a refused recycle must leave the
+    // merge UNEXECUTED (PR unmerged, refs unchanged), so containment (the
+    // path must be a registered worktree on the PR source branch) and the
+    // dirty check (--force is the only unlock) run HERE, before any merge
+    // side effect — refused-not-contained / refused-dirty exit non-zero with
+    // nothing touched. `--force` without `--recycle-worktree` is a usage
+    if let Some(target) = &recycle {
+        let source_ref = state
+            .source_ref
+            .as_deref()
+            .ok_or("--recycle-worktree requires a PR with a source branch")?;
+        crate::merge_state::validate_recycle_target(&repo_dir, source_ref, target, force)?;
+    } else if force {
+        return Err("--force requires --recycle-worktree".into());
+    }
     // Resolve the event actor NOW, before any merge side effects (worktree
     // reservation, pending-result ref, execution). Identity resolution is
     // fallible (config read); resolving it any later — after the pending-result
@@ -393,7 +426,6 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
         }
         return Err(b);
     }
-
     crate::merge_state::run_finalize(
         &store,
         crate::merge_state::MergeFinalizeSpec {
@@ -406,6 +438,9 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
             gate_head,
             closes_issue: state.closes,
             base_worktrees: &base_worktrees,
+            recycle: recycle.as_deref().map(|p| (p, force)),
+            source_ref: state.source_ref.as_deref(),
+            source_head: &source_oid.to_string(),
         },
         &mut lock_handle,
         &tmp,
@@ -414,9 +449,20 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
 
 pub(crate) fn pr_merge_help() -> String {
     "usage: git forge pr merge [<n>] [--merge|--squash|--rebase|--ff]\n\
+     \x20                   [--recycle-worktree <path>] [--force]\n\
      \x20 default / --merge: merge commit (--no-ff --no-edit)\n\
      \x20 --squash: single squashed commit\n\
      \x20 --rebase: replay source onto base (linear history)\n\
-     \x20 --ff: fast-forward base to source (requires source directly on base)"
+     \x20 --ff: fast-forward base to source (requires source directly on base)\n\
+     \x20 --recycle-worktree <path>: after the merge, remove the registered source\n\
+     \x20   worktree whose checked-out branch is the PR source_ref and delete that\n\
+     \x20   branch when its tip is the merged source head and an ancestor of the\n\
+     \x20   result commit (--squash/--rebase keep it). Refusals (a path that is not\n\
+     \x20   such a worktree, or a dirty one without --force) leave the merge\n\
+     \x20   unexecuted. Outcome vocabulary: removed | refused-dirty |\n\
+     \x20   refused-not-contained | partial-leftover(<path>) | branch-deleted |\n\
+     \x20   branch-kept(<reason>)\n\
+     \x20 --force: recycle a dirty source worktree anyway (never unlocks the base\n\
+     \x20   dirty-worktree refusal)"
         .to_string()
 }

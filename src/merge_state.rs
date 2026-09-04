@@ -270,15 +270,21 @@ pub(crate) struct MergeFinalizeSpec<'a> {
     /// gains a fourth CAS: `refs/forge/issues/<n>` onto an `issue.close`
     /// event commit, in the SAME batch as base + PR-head + pending delete.
     pub closes_issue: Option<u64>,
-    /// Non-temporary worktrees with `base_ref` checked out (the #3
-    /// live-base refresh set), each verified clean by the caller's guard.
-    /// Empty when the base is not checked out anywhere: no refresh runs.
-    /// After the base CAS each is refreshed to `result_commit`; a refresh
-    /// failure rolls the whole transaction back (refs unchanged, no partial
-    /// move) and reports the worktree as a leftover.
     pub base_worktrees: &'a [std::path::PathBuf],
+    /// #4 recycle: `Some((target_path, force))` when `pr merge` was given
+    /// `--recycle-worktree <path>` (with its optional `--force`). `None`
+    /// keeps the merge recycle-free (explicit per-merge, never hooked).
+    pub recycle: Option<(&'a str, bool)>,
+    /// The PR's source branch NAME (from the `pr.created` snapshot), needed
+    /// by the recycle's containment check and branch deletion. `None` only
+    /// for PRs without a source branch, which refuse the recycle.
+    pub source_ref: Option<&'a str>,
+    /// The PR's snapshot source head OID (hex), the recycle's branch-content
+    /// identity anchor: the branch is deleted only when its live tip equals
+    /// this (the work the PR was created from, not a moved branch) AND that
+    /// tip is an ancestor of the integrated result commit.
+    pub source_head: &'a str,
 }
-
 /// Stage the linked-issue close for ONE finalize attempt (t2): fold the
 /// issue chain at its CURRENT tip and decide whether the transaction needs
 /// an `issue.close` at all. Returns `Some((issue_id, close_commit,
@@ -616,10 +622,195 @@ pub(crate) fn run_finalize(
     // base worktree to the result commit and roll the whole completion back
     // (never split) when a refresh fails. Detail in `refresh_base_worktrees`.
     refresh_base_worktrees(store, &spec, head_applied, applied_issue)?;
-    Ok(format!(
+    finish_merge_output(store, &spec)
+}
+
+/// The #4 recycle epilogue, extracted from `run_finalize` (clippy
+/// too_many_lines): after base refresh (#3) and finalization, run the
+/// source-worktree recycle when `--recycle-worktree` was passed (recycle is
+/// explicit per-merge, never hooked) and shape the merged-PR output line. A
+/// refused/partial recycle does NOT undo the merge: the PR is terminal, the
+/// outcome names what stayed.
+fn finish_merge_output(
+    store: &BoundEventStore,
+    spec: &MergeFinalizeSpec<'_>,
+) -> Result<String, String> {
+    let merged = format!(
         "merged PR #{} into {} ({})",
         spec.id, spec.base_ref, spec.result_commit
-    ))
+    );
+    let Some((target, _force)) = spec.recycle else {
+        return Ok(merged);
+    };
+    let source_ref = spec
+        .source_ref
+        .ok_or_else(|| "--recycle-worktree requires a PR with a source branch".to_string())?;
+    let repo_dir = store
+        .repo()
+        .workdir()
+        .map(|p| p.to_path_buf())
+        .ok_or_else(|| "cannot resolve repository working directory".to_string())?;
+    recycle_source_worktree(
+        &repo_dir,
+        source_ref,
+        spec.source_head,
+        &spec.result_commit.to_string(),
+        target,
+        spec.strategy,
+    )
+    .map(|outcome| format!("{merged}; {outcome}"))
+}
+
+/// ── #4 source-worktree recycle, phase 1: PRE-MERGE validation. A recycle
+/// refusal must leave the merge unexecuted (PR unmerged, base ref
+/// unchanged), so containment and dirtiness are checked BEFORE any merge
+/// side effect — right after the checked-out base guard. Containment: the
+/// path must be a REGISTERED worktree whose checked-out branch is the PR's
+/// source_ref (refused-not-contained otherwise). Dirty check (untracked
+/// counts, same porcelain semantics as #3): --force is the ONLY unlock
+/// (refused-dirty otherwise). `force` never unlocks containment.
+pub(crate) fn validate_recycle_target(
+    repo_dir: &std::path::Path,
+    source_ref: &str,
+    target: &str,
+    force: bool,
+) -> Result<(), String> {
+    let target_path = std::path::Path::new(target);
+    let (ok_list, porcelain, list_err) = crate::git::worktree_list_raw(repo_dir);
+    if !ok_list {
+        return Err(format!(
+            "recycle refused (refused-not-contained): git worktree list failed: {list_err}"
+        ));
+    }
+    let head_ref = format!("refs/heads/{source_ref}");
+    let on_source = crate::git::worktree_branch_of(&porcelain, target_path)
+        .map(|b| b == head_ref)
+        .unwrap_or(false);
+    if !on_source {
+        return Err(format!(
+            "recycle refused (refused-not-contained): '{target}' is not a registered \
+             worktree checked out on the PR source branch '{source_ref}'; \
+             the worktree is untouched, the PR is not merged"
+        ));
+    }
+    if crate::git::worktree_dirty(target_path)? && !force {
+        return Err(format!(
+            "recycle refused (refused-dirty): worktree '{target}' has uncommitted \
+             changes; commit, stash or clean it, or pass --force to recycle anyway"
+        ));
+    }
+    Ok(())
+}
+
+/// ── #4 source-worktree recycle, phase 2: post-finalize execution, after
+/// base refresh (#3) and finalization. Removes the validated source
+/// worktree and conditionally deletes its branch; never touches the base
+/// worktree; salvage renaming of an unmerged branch is pipeline-side and
+/// happens BEFORE this call (adapter contract clause 8). The outcome line
+/// is the forge→adapter contract; the adapter consumes it verbatim and
+/// persists it before clearing feature.worktree/branch. Vocabulary,
+/// exactly: `removed | partial-leftover(<path>) | branch-deleted |
+/// branch-kept(<reason>)` (the refused-* states can no longer occur here —
+/// they are phase-1 pre-merge refusals).
+///
+/// Branch deletion (VAL-111) needs BOTH: (a) the live branch tip still
+/// points at the PR's snapshot source_head — a moved branch holds unmerged
+/// work and is kept — AND (b) that tip is an ancestor of the integrated
+/// result commit (`git merge-base --is-ancestor`), AND (c) the strategy
+/// preserves the source tip in the result: `--ff`/`--merge` do (their
+/// result contains the source tip), `--squash`/`--rebase` synthesize a NEW
+/// commit and always keep the branch with `branch-kept(<reason>)` naming
+/// the strategy. A branch that no longer exists has nothing to delete.
+pub(crate) fn recycle_source_worktree(
+    repo_dir: &std::path::Path,
+    source_ref: &str,
+    source_head: &str,
+    result_commit: &str,
+    target: &str,
+    strategy: &str,
+) -> Result<String, String> {
+    let target_path = std::path::Path::new(target);
+    // Debug-only test seam (VAL-112): GIT_FORGE_TEST_FAIL_RECYCLE_REMOVE=<path>
+    // locks THAT worktree so `git worktree remove --force` fails
+    // deterministically, exercising the partial-leftover outcome. Inert in
+    // release builds and when the env var is unset.
+    #[cfg(debug_assertions)]
+    if std::env::var("GIT_FORGE_TEST_FAIL_RECYCLE_REMOVE").as_deref()
+        == Ok(target_path.to_string_lossy().as_ref())
+    {
+        if let Err(lock_err) = crate::git::lock_source_worktree_for_recycle(repo_dir, target_path) {
+            return Err(format!(
+                "recycle outcome: partial-leftover({target}): test seam failed to lock the \
+                 worktree for removal-failure injection: {lock_err}"
+            ));
+        }
+    }
+    // Capture the live branch tip BEFORE removing the worktree (a
+    // checked-out branch cannot be deleted while a worktree holds it).
+    let live_tip = crate::git::branch_tip(repo_dir, source_ref);
+    // Removal. A failure that leaves the directory OR the registration in
+    // place is reported as partial-leftover(<path>) — partial removal
+    // injected (VAL-112) or genuine.
+    if let Err(rm_err) = crate::git::worktree_remove(repo_dir, target_path) {
+        if target_path.exists() || worktree_registered_path(repo_dir, target_path) {
+            return Err(format!(
+                "recycle outcome: partial-leftover({target}): worktree removal failed: {rm_err}"
+            ));
+        }
+    }
+    if target_path.exists() || worktree_registered_path(repo_dir, target_path) {
+        return Err(format!(
+            "recycle outcome: partial-leftover({target}): worktree still present \
+             after removal"
+        ));
+    }
+    // Branch deletion (VAL-111). --squash/--rebase synthesize a NEW commit:
+    // the branch is ALWAYS kept, with branch-kept(<reason>) naming the
+    // strategy. --ff/--merge keep the source tip in the result, so the
+    // branch is deleted only when its live tip still equals the PR's
+    // snapshot source_head (a moved branch holds unmerged work) AND that
+    // tip is an ancestor of the integrated result commit
+    // (`git merge-base --is-ancestor`). A branch that no longer exists has
+    // nothing to delete.
+    if strategy == "squash" || strategy == "rebase" {
+        return Ok(format!(
+            "recycle outcome: removed; branch-kept({source_ref}: the {strategy} merge \
+             synthesized a new commit, so the branch tip is not an ancestor of the \
+             integrated result commit — the branch holds the original commits; \
+             salvage renaming is pipeline-side)"
+        ));
+    }
+    let Some(tip) = live_tip else {
+        return Ok(format!(
+            "recycle outcome: removed (branch {source_ref} absent)"
+        ));
+    };
+    if tip == source_head
+        && crate::git::merge_base_is_ancestor(repo_dir, source_head, result_commit)
+    {
+        match crate::git::branch_force_delete(repo_dir, source_ref) {
+            Ok(()) => Ok(format!(
+                "recycle outcome: removed; branch-deleted ({source_ref})"
+            )),
+            Err(del_err) => Err(format!(
+                "recycle outcome: partial-leftover({target}): worktree removed but branch \
+                 deletion failed: {del_err}"
+            )),
+        }
+    } else {
+        Ok(format!(
+            "recycle outcome: removed; branch-kept({source_ref}: its tip is not an \
+             ancestor of the integrated result commit — the branch holds unmerged work; \
+             salvage renaming is pipeline-side)"
+        ))
+    }
+}
+
+/// Registered-worktree check helper for the partial-leftover verdict: true
+/// when `git worktree list --porcelain` still registers `target`.
+fn worktree_registered_path(repo_dir: &std::path::Path, target: &std::path::Path) -> bool {
+    let (ok, porcelain, _) = crate::git::worktree_list_raw(repo_dir);
+    ok && crate::git::worktree_registered_path(&porcelain, target)
 }
 
 /// Test-only pending-window barrier (wire contract § Test-only pending-window
