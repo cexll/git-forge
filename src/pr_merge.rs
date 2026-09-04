@@ -145,12 +145,21 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
         .map(|p| p.to_path_buf())
         .ok_or_else(|| "cannot resolve repository working directory".to_string())?;
 
-    // Checked-out base guard: refuse if base is checked out anywhere.
-    if crate::git::base_checked_out_elsewhere(&repo_dir, &base_ref)? {
-        return Err(format!(
-            "base branch '{base_ref}' is checked out in a worktree; \
-             run the merge from/against an un-checked-out base"
-        ));
+    // Checked-out base guard (#3 live-base refresh): the base may be checked
+    // out in non-temporary worktrees, but ONLY while every such worktree is
+    // clean — `git status --porcelain` empty (untracked counts as dirty;
+    // ignored does not). A dirty worktree refuses BEFORE any side effect:
+    // advancing a checked-out branch without updating its working tree would
+    // leave files at the old tree, and no `--force` unlocks this refusal.
+    let base_worktrees = crate::git::base_checked_out_worktrees(&repo_dir, &base_ref)?;
+    for wt in &base_worktrees {
+        if crate::git::worktree_dirty(wt)? {
+            return Err(format!(
+                "base branch '{base_ref}' is checked out in a dirty worktree ({}); \
+                 commit, stash or clean it (including untracked files) before merging",
+                wt.display()
+            ));
+        }
     }
 
     // Resolve the event actor NOW, before any merge side effects (worktree
@@ -396,6 +405,7 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
             strategy,
             gate_head,
             closes_issue: state.closes,
+            base_worktrees: &base_worktrees,
         },
         &mut lock_handle,
         &tmp,

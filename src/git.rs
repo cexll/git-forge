@@ -422,15 +422,81 @@ pub(crate) fn worktree_lock(repo_dir: &Path, path: &Path) -> Result<(), String> 
     }
 }
 
-/// True if `base_ref` is checked out in a non-temporary worktree (main or a
-/// linked one). Refuses advancing a checked-out branch without updating its
-/// working tree (wire contract § Checked-out base guard). Aborts (Err) if the
-/// worktree list cannot be enumerated — a failed guard must not silently
-/// bypass the check.
-pub(crate) fn base_checked_out_elsewhere(repo_dir: &Path, base_ref: &str) -> Result<bool, String> {
+/// Non-temporary worktrees (main or a linked one) with `base_ref` checked
+/// out on the branch, as absolute paths in `git worktree list --porcelain`
+/// order. The live-base refresh (#3) merges through these worktrees: each
+/// must be clean ([`Self::worktree_dirty`]) and is refreshed to the result
+/// commit after the base CAS ([`Self::refresh_base_worktree`]). Aborts (Err)
+/// if the worktree list cannot be enumerated — a failed guard must not
+/// silently bypass the check.
+pub(crate) fn base_checked_out_worktrees(
+    repo_dir: &Path,
+    base_ref: &str,
+) -> Result<Vec<PathBuf>, String> {
     let text = worktree_list(repo_dir)?;
     let want = format!("branch refs/heads/{base_ref}");
-    Ok(text.lines().any(|l| l.trim() == want))
+    let mut out = Vec::new();
+    let mut current: Option<PathBuf> = None;
+    for line in text.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            current = Some(PathBuf::from(p));
+        } else if line.trim() == want {
+            if let Some(p) = current.take() {
+                out.push(p);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// True when the worktree at `path` has a non-empty `git status --porcelain`
+/// (default flags): modified tracked files AND untracked files count as
+/// dirty; ignored files do not appear in porcelain output and are never
+/// dirty (the #3 clean-worktree definition). Err when status itself fails —
+/// a failed cleanliness check must not silently admit the worktree.
+pub(crate) fn worktree_dirty(path: &Path) -> Result<bool, String> {
+    let (ok, out, err) = git_in(path, &["status", "--porcelain"]);
+    if !ok {
+        return Err(format!("git status failed: {err}"));
+    }
+    Ok(!out.trim().is_empty())
+}
+
+/// Refresh a clean checked-out base worktree to `to` (the post-CAS result
+/// commit, #3): bare `git reset --hard` re-materializes the worktree files
+/// and index from HEAD. The caller runs it only AFTER the base branch CAS,
+/// so HEAD (attached to the moved branch) already resolves to `to` and the
+/// bare reset moves NO ref — never a ref-only advance, never a ref move.
+/// A `to` that is not the worktree's current HEAD tip is refused (the bare
+/// reset would silently materialize a different tree). Err carries git's
+/// stderr. Debug-only test seam (VAL-107): `GIT_FORGE_TEST_FAIL_BASE_REFRESH=1`
+/// injects a refresh failure before any git call; inert in release builds.
+pub(crate) fn refresh_base_worktree(worktree: &Path, head_tip: &str) -> Result<(), String> {
+    #[cfg(debug_assertions)]
+    if std::env::var("GIT_FORGE_TEST_FAIL_BASE_REFRESH").as_deref() == Ok("1") {
+        return Err("test seam: injected base-worktree refresh failure".to_string());
+    }
+    let (okh, tip, _) = git_in(worktree, &["rev-parse", "HEAD"]);
+    if !okh {
+        return Err(format!(
+            "cannot refresh base worktree {}: git rev-parse HEAD failed",
+            worktree.display()
+        ));
+    }
+    if tip != head_tip {
+        return Err(format!(
+            "cannot refresh base worktree {}: HEAD {} does not hold the expected tip {}",
+            worktree.display(),
+            tip,
+            head_tip
+        ));
+    }
+    let (ok, _, err) = git_in(worktree, &["reset", "--hard"]);
+    if ok {
+        Ok(())
+    } else {
+        Err(format!("git reset --hard failed: {err}"))
+    }
 }
 
 /// Execute the requested merge strategy inside the temp worktree and return

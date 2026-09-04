@@ -270,7 +270,15 @@ pub(crate) struct MergeFinalizeSpec<'a> {
     /// gains a fourth CAS: `refs/forge/issues/<n>` onto an `issue.close`
     /// event commit, in the SAME batch as base + PR-head + pending delete.
     pub closes_issue: Option<u64>,
+    /// Non-temporary worktrees with `base_ref` checked out (the #3
+    /// live-base refresh set), each verified clean by the caller's guard.
+    /// Empty when the base is not checked out anywhere: no refresh runs.
+    /// After the base CAS each is refreshed to `result_commit`; a refresh
+    /// failure rolls the whole transaction back (refs unchanged, no partial
+    /// move) and reports the worktree as a leftover.
+    pub base_worktrees: &'a [std::path::PathBuf],
 }
+
 /// Stage the linked-issue close for ONE finalize attempt (t2): fold the
 /// issue chain at its CURRENT tip and decide whether the transaction needs
 /// an `issue.close` at all. Returns `Some((issue_id, close_commit,
@@ -303,6 +311,88 @@ fn stage_issue_close(
     Ok(Some((issue_event.entity_id, close_oid, tip)))
 }
 
+/// ── #3 live-base refresh: after the base CAS, refresh every checked-out
+/// base worktree to the result commit. The transaction moved the branch
+/// ref; each worktree's HEAD is attached to it, so a bare `git reset
+/// --hard` materializes the result tree without moving any ref.
+/// NEVER-SPLIT POSTURE (issue #3, VAL-107): a refresh failure rolls the
+/// whole completion back in ONE update-ref batch — the base branch is
+/// CAS'd back to the snapshot base_head, the PR head chain is restored to
+/// the tip the transaction advanced FROM, the linked issue (if closed in
+/// the same batch) is re-anchored to its pre-close tip, and the pending
+/// result ref is cleaned best-effort — so no ref shows a moved state with
+/// a stale tree (never split), the merge reports unchanged, and the
+/// failing worktree is reported as a leftover. A failed rollback is
+/// reported loudly with the exact partial state, never silently.
+fn refresh_base_worktrees(
+    store: &BoundEventStore,
+    spec: &MergeFinalizeSpec<'_>,
+    head_applied: Oid,
+    applied_issue: Option<(u64, Oid, Oid)>,
+) -> Result<(), String> {
+    for wt in spec.base_worktrees {
+        if let Err(rerr) = crate::git::refresh_base_worktree(wt, &spec.result_commit.to_string()) {
+            let base_branch_ref = format!("refs/heads/{}", spec.base_ref);
+            let mut rollback = vec![
+                // Revert the base branch CAS (result_commit → base_head).
+                format!(
+                    "update {base_branch_ref} {} {}",
+                    spec.base_oid, spec.result_commit
+                ),
+            ];
+            // Restore the PR head chain from the tip the transaction left it
+            // at (the pr.merge event commit), read fresh: the CAS refuses to
+            // clobber a concurrently moved chain.
+            let head_ref = pr_head_ref(spec.id);
+            let head_tip = store
+                .store()
+                .current_tip(&head_ref)
+                .map_err(|e| format!("head ref unreadable during rollback: {e}"))?
+                .ok_or_else(|| "head ref vanished during rollback".to_string())?;
+            rollback.push(format!("update {head_ref} {head_applied} {head_tip}"));
+            if let Some((issue_id, _close_oid, issue_expected)) = applied_issue {
+                rollback.push(format!(
+                    "update {} {} {}",
+                    issue_ref(issue_id),
+                    issue_expected,
+                    spec.gate_head
+                ));
+            }
+            let rolled = store.store().run_update_ref_stdin(&rollback);
+            let pending_note = match rolled {
+                Ok(()) => String::new(),
+                Err(berr) => format!(
+                    " ROLLBACK FAILED ({berr}): base ref is at {} — a partial \
+                     state exists and must be reconciled manually",
+                    spec.result_commit
+                ),
+            };
+            return Err(format!(
+                "merge completed but base worktree refresh failed: {rerr} \
+                 (worktree left at {}){pending_note}",
+                wt.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// The single `pr.merge` event (F-009): strategy + result_commit in the
+/// body, actor from the merge's one identity resolution. Reused across CAS
+/// retries so the event identity never regenerates.
+fn build_merge_event(spec: &MergeFinalizeSpec<'_>) -> Event {
+    let mut merge_body = HashMap::new();
+    merge_body.insert(
+        "strategy".into(),
+        JsonValue::String(spec.strategy.to_string()),
+    );
+    merge_body.insert(
+        "result_commit".into(),
+        JsonValue::String(spec.result_commit.to_string()),
+    );
+    Event::new(EventKind::PrMerge, "pr", spec.id, spec.actor, merge_body)
+}
+
 /// Build the `pr.merge` event ONCE (F-009) and run the atomic completion
 /// transaction with CAS retry: the transaction deletes the pending ref, CASes
 /// the base branch and CASes the PR head chain from the GATE-VALIDATED OID.
@@ -331,16 +421,7 @@ pub(crate) fn run_finalize(
     lock_handle: &mut Option<std::fs::File>,
     tmp: &std::path::Path,
 ) -> Result<String, String> {
-    let mut merge_body = HashMap::new();
-    merge_body.insert(
-        "strategy".into(),
-        JsonValue::String(spec.strategy.to_string()),
-    );
-    merge_body.insert(
-        "result_commit".into(),
-        JsonValue::String(spec.result_commit.to_string()),
-    );
-    let merge_event = Event::new(EventKind::PrMerge, "pr", spec.id, spec.actor, merge_body);
+    let merge_event = build_merge_event(&spec);
     // Single `issue.close` event constructed ONCE (F-009 analogue): every
     // finalize attempt re-parents the SAME event to the then-current issue
     // tip, so retries never regenerate the event identity, and its empty
@@ -355,11 +436,11 @@ pub(crate) fn run_finalize(
             HashMap::new(),
         )
     });
-    let head = pr_head_ref(spec.id);
+    const MAX_FINALIZE_RETRIES: u32 = 3;
     let mut head_expected = spec.gate_head;
     let mut attempts = 0u32;
-    const MAX_FINALIZE_RETRIES: u32 = 3;
-    loop {
+    let head = pr_head_ref(spec.id);
+    let (head_applied, applied_issue) = loop {
         // Stage the issue close for THIS attempt (fresh fold + fresh tip):
         // the CAS retry loop rebuilds the parent/expected tip every attempt
         // (t2), so an attempt that fails because the issue moved concurrently
@@ -389,7 +470,7 @@ pub(crate) fn run_finalize(
             maybe_run_issue_stage_barrier(store, &spec, attempts, lock_handle, tmp)?;
         }
         match finalize_pr_merge(store, &spec, &merge_event, head_expected, issue_stage) {
-            Ok(()) => break,
+            Ok(()) => break (head_expected, issue_stage),
             Err(e) => {
                 // F-008: read the EXACT current head tip ONCE. The candidate we
                 // validate, fold, and CAS is the SAME OID — never a re-read tip
@@ -530,7 +611,11 @@ pub(crate) fn run_finalize(
                 }
             }
         }
-    }
+    };
+    // ── #3 live-base refresh: after the base CAS, refresh every checked-out
+    // base worktree to the result commit and roll the whole completion back
+    // (never split) when a refresh fails. Detail in `refresh_base_worktrees`.
+    refresh_base_worktrees(store, &spec, head_applied, applied_issue)?;
     Ok(format!(
         "merged PR #{} into {} ({})",
         spec.id, spec.base_ref, spec.result_commit

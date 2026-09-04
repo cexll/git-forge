@@ -495,14 +495,153 @@ fn stale_base_rejects_merge_without_ref_changes() {
 }
 
 #[test]
-fn checked_out_base_refused() {
-    let dir = tmpdir("checkedout");
+fn checked_out_dirty_base_refused_refs_unchanged() {
+    // VAL-106: the guard relaxes only for a CLEAN checked-out base. A
+    // modified tracked file makes the main worktree dirty; the merge must
+    // still refuse before any side effect, naming the dirt, with refs
+    // unchanged.
+    let dir = tmpdir("checkedout-dirty");
     init_repo(&dir);
-    create_approved_pr(&dir, "feature", "co PR");
-    // user is ON main (base checked out) → merge must refuse.
+    create_approved_pr(&dir, "feature", "co dirty PR");
+    // main is checked out (create_approved_pr leaves it there); make it dirty
+    // by modifying a tracked file.
+    std::fs::write(dir.join("base.txt"), "dirty\n").unwrap();
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
     let (c, _, e) = forge(&dir, &["forge", "pr", "merge", "1"]);
-    assert_ne!(c, 0, "merge must refuse when base checked out");
-    assert!(e.contains("checked out"), "stderr: {e}");
+    assert_ne!(c, 0, "dirty checked-out base must refuse");
+    assert!(e.contains("dirty"), "stderr: {e}");
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged"
+    );
+    let (cs, os, _) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert!(cs == 0, "pr show must succeed after dirty refusal");
+    assert!(!os.contains("merged"), "no pr.merge on dirty refusal: {os}");
+}
+
+#[test]
+fn checked_out_untracked_base_refused_refs_unchanged() {
+    // VAL-106: UNTRACKED files count as dirty — an untracked file in the
+    // checked-out base worktree refuses the merge exactly like a tracked
+    // modification.
+    let dir = tmpdir("checkedout-untracked");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "co untracked PR");
+    std::fs::write(dir.join("untracked.txt"), "u\n").unwrap();
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let (c, _, e) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_ne!(c, 0, "untracked file must count as dirty");
+    assert!(e.contains("dirty"), "stderr: {e}");
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged"
+    );
+}
+
+#[test]
+fn checked_out_clean_base_merges_and_worktree_refreshes() {
+    // VAL-105: a CLEAN checked-out base (porcelain empty) merges, and after
+    // the base CAS the base worktree is refreshed — its files match the
+    // result commit and the tree stays clean (never a moved ref with a
+    // stale tree).
+    let dir = tmpdir("checkedout-clean");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "co clean PR");
+    // main is checked out and clean (create_approved_pr leaves it there).
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let (c, o, e) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_eq!(c, 0, "clean checked-out base must merge: {e} {o}");
+    let result = ref_oid(&dir, "refs/heads/main").unwrap();
+    assert_ne!(result, base_before, "base advanced to the result commit");
+    // The result commit is the merge of the source; its tree carries the
+    // feature file with the feature's content.
+    let (ch, head, _) = git(&dir, &["rev-parse", "HEAD"]);
+    assert_eq!(ch, 0, "rev-parse HEAD failed");
+    assert_eq!(head, result, "worktree HEAD agrees with the moved base ref");
+    let content = std::fs::read_to_string(dir.join("feature.txt")).unwrap();
+    assert_eq!(content, "feat\n", "worktree files match the result commit");
+    let (_, status, _) = git(&dir, &["status", "--porcelain"]);
+    assert_eq!(status, "", "worktree clean after refresh: {status:?}");
+    let (cs, os, _) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert!(cs == 0, "pr show must succeed");
+    assert!(os.contains("merged:"), "pr.merge recorded: {os}");
+}
+
+#[test]
+fn checked_out_ignored_only_base_merges() {
+    // VAL-106 (ignored clause): ignored files do NOT count as dirty — an
+    // ignored file in the checked-out base worktree must not refuse the
+    // merge (porcelain output is empty for ignored-only trees). The
+    // .gitignore is committed BEFORE the PR snapshot so the base ref never
+    // moves after creation.
+    let dir = tmpdir("checkedout-ignored");
+    init_repo(&dir);
+    std::fs::write(dir.join(".gitignore"), "ignored.txt\n").unwrap();
+    let (ca, _, ea) = git(&dir, &["add", ".gitignore"]);
+    assert_eq!(ca, 0, "add .gitignore failed: {ea}");
+    let (cc, _, ec) = git(&dir, &["commit", "-qm", "gitignore"]);
+    assert_eq!(cc, 0, "commit .gitignore failed: {ec}");
+    create_approved_pr(&dir, "feature", "co ignored PR");
+    std::fs::write(dir.join("ignored.txt"), "i\n").unwrap();
+    let (_, porcelain, _) = git(&dir, &["status", "--porcelain"]);
+    assert_eq!(porcelain, "", "ignored-only tree must be porcelain-clean");
+    let (c, o, e) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_eq!(c, 0, "ignored-only dirt must not refuse: {e} {o}");
+}
+
+#[test]
+fn refresh_failure_rolls_refs_back_and_reports_leftover() {
+    // VAL-107: with the refresh seam injected, the merge exits non-zero, the
+    // base ref and the worktree HEAD agree (no partial move — the tree keeps
+    // the pre-merge content the old tip checks out), and the output reports
+    // the worktree as a leftover.
+    let dir = tmpdir("refreshfail");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "refresh fail PR");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let head_before = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let out = Command::new(bin)
+        .args(["forge", "pr", "merge", "1"])
+        .current_dir(&dir)
+        .env("GIT_FORGE_TEST_FAIL_BASE_REFRESH", "1")
+        .output()
+        .unwrap();
+    let code = out.status.code().unwrap_or(-1);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_ne!(code, 0, "refresh failure must fail the merge");
+    assert!(
+        stderr.contains("base worktree refresh failed"),
+        "stderr must name the refresh failure: {stderr}"
+    );
+    assert!(
+        stderr.contains("worktree left at"),
+        "stderr must report the worktree as a leftover: {stderr}"
+    );
+    // Refs agree with the worktree: base moved nowhere, PR chain untouched,
+    // and the worktree HEAD is the pre-merge base tip (no partial move).
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base must roll back to the pre-merge tip"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        head_before,
+        "PR head chain must be restored"
+    );
+    let (_, head, _) = git(&dir, &["rev-parse", "HEAD"]);
+    assert_eq!(head, base_before, "worktree HEAD agrees with the base ref");
+    let content = std::fs::read_to_string(dir.join("feature.txt"));
+    assert!(
+        content.is_err(),
+        "worktree tree is unchanged (feature file absent)"
+    );
+    let (cs, os, _) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert!(cs == 0, "pr show must succeed after refresh failure");
+    assert!(!os.contains("merged:"), "no pr.merge recorded: {os}");
 }
 
 #[test]

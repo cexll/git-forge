@@ -171,17 +171,33 @@ ck "pr show merged" 0 git forge pr show 2
 at "base contains merged commit" 0 "git merge-base --is-ancestor \$(git rev-parse feat/dogfood) \"\$BASE_BRANCH\""
 ck "already merged blocked" nonzero git forge pr merge 2
 
-# ── AC-005e / VAL-022: base checked out → refuse (from base itself) ──
+# ── #3 / VAL-105/106: live-base refresh — a CLEAN checked-out base merges and
+# the base worktree is refreshed to the result commit; a DIRTY base (tracked
+# modification OR untracked file) still refuses with refs unchanged; ignored
+# files do NOT count as dirty ──
 git checkout -B feat2 "$BASE_BRANCH"
 printf '\n# change 2\n' >> PLAN.md
 mkdir -p .forge && printf '#!/bin/sh\necho ok\n' > .forge/ci.sh   # green CI plan (t3)
 git add PLAN.md .forge/ci.sh && git commit -qm "feat(dogfood): change 2"
 git checkout -q "$BASE_BRANCH"
+printf 'scratch.log\n' >> .gitignore   # tracked: makes the ignored-only case real
+git add .gitignore && git commit -qm "chore(dogfood): ignore scratch log"
 git forge pr create --source feat2 --base "$BASE_BRANCH" "PR base-checked-out" >/dev/null
 git forge pr review 3 --approve >/dev/null
-git forge ci run 3 >/dev/null   # green latest CI Check so the gate lets #3 reach the base-guard (t3)
-ck "merge refused with base checked out" nonzero git forge pr merge 3
-at "checked-out-base error names worktree" 0 "git forge pr merge 3 2>&1 | grep -q 'checked out'"
+git forge ci run 3 >/dev/null   # green latest CI Check so the gate lets #3 merge (t3)
+at "dirty tracked base refused" 0 "printf '\\n# dirty tracked\\n' >> PLAN.md && ! git forge pr merge 3 2>/dev/null"
+at "dirty refusal names the dirt" 0 "git forge pr merge 3 2>&1 | grep -q 'dirty'"
+at "dirty refusal leaves base ref" 0 "[ \"\$(git rev-parse \"\$BASE_BRANCH\")\" = \"\$(git rev-parse refs/forge/prs/3/base)\" ]"
+at "dirty refusal leaves PR unmerged" 0 "! git forge pr show 3 | grep -q 'merged:'"
+at "untracked file counts as dirty" 0 "printf 'u\\n' > gf-untracked-dirty.txt && ! git forge pr merge 3 2>/dev/null; rm gf-untracked-dirty.txt"
+at "untracked refusal leaves base ref" 0 "[ \"\$(git rev-parse \"\$BASE_BRANCH\")\" = \"\$(git rev-parse refs/forge/prs/3/base)\" ]"
+git checkout -q -- PLAN.md   # restore the tracked modification before the later cases
+printf 'log\\n' > scratch.log   # ignored-only: must NOT block
+at "ignored-only is not dirty" 0 "[ -z \"\$(git status --porcelain)\" ]"
+ck "clean checked-out base merges" 0 git forge pr merge 3
+at "base worktree refreshed to result" 0 "[ \"\$(git rev-parse HEAD)\" = \"\$(git rev-parse \"\$BASE_BRANCH\")\" ] && git merge-base --is-ancestor feat2 \"\$BASE_BRANCH\" && [ -z \"\$(git status --porcelain)\" ]"
+at "ignored file survives refresh" 0 "[ -f scratch.log ]"
+rm scratch.log
 
 # ── AC-005b / VAL-017: stale base rejected (from non-base checkout) ──
 git checkout -B feat3 "$BASE_BRANCH"
