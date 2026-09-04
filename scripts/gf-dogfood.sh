@@ -342,5 +342,38 @@ set -e
 at "both concurrent comments exit 0" 0 "[ \$E1 -eq 0 ] && [ \$E2 -eq 0 ]"
 at "both comments folded in show" 0 "git forge issue show 1 | grep -q c1 && git forge issue show 1 | grep -q c2"
 
+# ── #9 / VAL-101..102: pr merge --ff fast-forward strategy ──
+cd "$R"
+git checkout -q -B feat/gf-ff "$BASE_BRANCH"
+printf 'n\n' > gf-ff.txt && git add gf-ff.txt && git commit -qm "ff c1"
+git checkout -q "$BASE_BRANCH"
+git forge pr create --source feat/gf-ff --base "$BASE_BRANCH" "ff PR" >/dev/null
+git forge pr review 18 --approve >/dev/null
+git forge ci run 18 >/dev/null   # green latest CI Check so the gate lets #18 merge (t3)
+BASE_TIP="$(git rev-parse "$BASE_BRANCH")"
+SRC_HEAD="$(git rev-parse feat/gf-ff)"
+git checkout -q feat/gf-ff
+ck "ff merge ok" 0 git forge pr merge 18 --ff
+at "ff result_commit is source_head" 0 "git forge pr show 18 | grep -q \"merged: \$SRC_HEAD\""
+at "ff base tip is source head" 0 "[ \"\$(git rev-parse \"\$BASE_BRANCH\")\" = \"\$SRC_HEAD\" ]"
+at "ff no new commit single parent" 0 "[ \$(git rev-list --parents -n 1 \"\$BASE_BRANCH\" | awk '{print NF}') -eq 2 ] && [ \"\$(git rev-list --parents -n 1 \"\$BASE_BRANCH\" | awk '{print \$2}')\" = \"\$BASE_TIP\" ]"
+at "ff pr show merged" 0 "git forge pr show 18 | grep -q 'merged:'"
+
+# ── #9 / VAL-102: non-ffable PR refuses --ff naming the rebase remedy ──
+git checkout -q -b feat/gf-ff-noff "$BASE_BRANCH"
+printf 'p\n' > gf-ff-noff.txt && git add gf-ff-noff.txt && git commit -qm "ff noff c1"
+git checkout -q "$BASE_BRANCH"
+printf '\n# base advance for noff\n' >> PLAN.md
+git add PLAN.md && git commit -qm "base advance for noff"
+git forge pr create --source feat/gf-ff-noff --base "$BASE_BRANCH" "noff PR" >/dev/null
+git forge pr review 19 --approve >/dev/null
+git forge ci run 19 >/dev/null   # green latest CI Check so the gate lets #19 reach the ff check (t3)
+NOFF_BASE="$(git rev-parse "$BASE_BRANCH")"
+git checkout -q feat/gf-ff-noff
+ck "non-ff merge rejected" nonzero git forge pr merge 19 --ff
+at "noff error names rebase remedy" 0 "git forge pr merge 19 --ff 2>&1 | grep -qE 'rebase|recreate'"
+at "noff base unchanged" 0 "[ \"\$(git rev-parse \"\$BASE_BRANCH\")\" = \"\$NOFF_BASE\" ]"
+at "noff pr still unmerged" 0 "! git forge pr show 19 | grep -q 'merged:'"
+
 echo "=========== DOGFOOD SUMMARY pass=$PASS fail=$FAIL ==========="
 [ "$FAIL" -eq 0 ]

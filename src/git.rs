@@ -466,6 +466,14 @@ pub(crate) fn execute_strategy(
                 return Err(cleanup_failed_worktree(repo_dir, tmp, "rebase", e));
             }
         }
+        "ff" => {
+            // Fast-forward: the caller has already checked merge_base ==
+            // base_head; `merge --ff-only` fails closed if git still refuses.
+            let (ok, _o, e) = git_in(tmp, &["merge", "--ff-only", &source_oid.to_string()]);
+            if !ok {
+                return Err(cleanup_failed_worktree(repo_dir, tmp, "ff", e));
+            }
+        }
         "squash" => {
             // `git merge --squash` runs first (staging); only then is the
             // title checked, so a missing/empty title hits the cleanup path

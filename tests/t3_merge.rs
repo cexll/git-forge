@@ -2285,7 +2285,7 @@ fn merge_help_usage_and_strategies() {
     let (c, o, e) = forge(&dir, &["forge", "pr", "merge", "--help"]);
     assert_eq!(c, 0, "merge --help failed: {e}");
     assert!(o.contains("usage: git forge pr merge"), "usage head: {o}");
-    for s in ["--merge", "--squash", "--rebase"] {
+    for s in ["--merge", "--squash", "--rebase", "--ff"] {
         assert!(o.contains(s), "help must list {s}: {o}");
     }
     let (c2, o2, e2) = forge(&dir, &["forge", "pr", "merge", "-h"]);
@@ -3275,4 +3275,257 @@ fn all_mutators_refuse_abandoned_pr_with_same_reason_and_no_refs_move() {
         "show: {os}"
     );
     assert!(!os.contains("different reason"), "show: {os}");
+}
+
+// ── t0 / VAL-101..104: `pr merge --ff` fast-forward strategy ──────────────
+
+#[test]
+fn ff_merge_fast_forwards_to_source_head() {
+    // VAL-101: `pr merge --ff` on a strictly-on-top source exits 0; the
+    // integrated base tip IS the verified source_head (no new commit,
+    // single-parent chain preserved); `pr show` displays result_commit ==
+    // source_head; the base tip's parent is the prior base tip.
+    let dir = tmpdir("ffok");
+    init_repo(&dir);
+    // Single-commit source strictly on top of base (feature + CI plan in ONE
+    // commit), so the integrated tip's sole parent is exactly the prior base
+    // tip. The PR then gets a green CI Check and an approval (merge gate).
+    let (c, _, e) = git(&dir, &["checkout", "-q", "-b", "feature"]);
+    assert_eq!(c, 0, "checkout -b feature: {e}");
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    add_passing_ci_plan(&dir);
+    let (c, _, e) = git(&dir, &["checkout", "-q", "main"]);
+    assert_eq!(c, 0, "checkout main: {e}");
+    let (c, o, e) = forge(
+        &dir,
+        &[
+            "forge", "pr", "create", "--source", "feature", "--base", "main", "ff PR",
+        ],
+    );
+    assert_eq!(c, 0, "pr create failed: {e} {o}");
+    ci_green(&dir);
+    let (c, o, e) = forge(&dir, &["forge", "pr", "review", "1", "--approve"]);
+    assert_eq!(c, 0, "approve failed: {e} {o}");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let source_before = ref_oid(&dir, "refs/heads/feature").unwrap();
+    checkout(&dir, "feature");
+    let (c, o, e) = forge(&dir, &["forge", "pr", "merge", "1", "--ff"]);
+    assert!(c == 0, "ff merge failed: {e} {o}");
+    // result_commit == source_head: base tip is exactly the source head.
+    let base_after = ref_oid(&dir, "refs/heads/main").unwrap();
+    assert_eq!(base_after, source_before, "base tip must equal source head");
+    // No new commit: the source tip's sole parent is the PRIOR base tip.
+    let (_, parents, _) = git(&dir, &["rev-list", "--parents", "-n", "1", &base_after]);
+    let p: Vec<&str> = parents.split_whitespace().collect();
+    assert_eq!(p.len(), 2, "source tip must keep a single parent");
+    assert_eq!(p[1], base_before, "parent must be the prior base tip");
+    // pr show displays result_commit == source_head.
+    let (cs, os, es) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert_eq!(cs, 0, "pr show failed: {es}");
+    assert!(os.contains("merged:"), "pr show must display merged: {os}");
+    assert!(
+        os.contains(&source_before),
+        "pr show must display result_commit {source_before}: {os}"
+    );
+    // The source branch is untouched by the merge.
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/feature").unwrap(),
+        source_before,
+        "source branch unchanged"
+    );
+}
+
+#[test]
+fn ff_non_ffable_pr_rejected_naming_rebase_remedy() {
+    // VAL-102: a PR whose source does NOT sit directly on top of the snapshot
+    // base (merge_base != base_head) refuses `--ff` with a distinct error
+    // naming the rebase remedy; refs unchanged; PR remains unmerged.
+    let dir = tmpdir("ffnoff");
+    init_repo(&dir);
+    make_feature(&dir, "feature", "feat\n");
+    // Advance main AFTER the feature forked, then create the PR: the snapshot
+    // base_head (current main) is no longer the source's merge_base.
+    let (c, _, e) = git(&dir, &["checkout", "-q", "feature"]);
+    assert_eq!(c, 0, "co feature: {e}");
+    add_passing_ci_plan(&dir);
+    let (c, _, e) = git(&dir, &["checkout", "-q", "main"]);
+    assert_eq!(c, 0, "co main: {e}");
+    std::fs::write(dir.join("diverge.txt"), "diverge\n").unwrap();
+    let (c, _, e) = git(&dir, &["add", "diverge.txt"]);
+    assert_eq!(c, 0, "add: {e}");
+    let (c, _, e) = git(&dir, &["commit", "-q", "-m", "diverge on main"]);
+    assert_eq!(c, 0, "commit: {e}");
+    let (c, o, e) = forge(
+        &dir,
+        &[
+            "forge", "pr", "create", "--source", "feature", "--base", "main", "noff PR",
+        ],
+    );
+    assert_eq!(c, 0, "pr create failed: {e} {o}");
+    ci_green(&dir);
+    let (c, o, e) = forge(&dir, &["forge", "pr", "review", "1", "--approve"]);
+    assert_eq!(c, 0, "approve failed: {e} {o}");
+    checkout(&dir, "feature");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let head_before = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+    let (cm, _, em) = forge(&dir, &["forge", "pr", "merge", "1", "--ff"]);
+    assert_ne!(cm, 0, "non-ffable PR must refuse --ff");
+    assert!(
+        em.contains("rebase") || em.contains("recreate"),
+        "refusal must name the rebase/recreate remedy: {em}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged on ff refusal"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        head_before,
+        "PR head unchanged on ff refusal"
+    );
+    let (_cs, os, _) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert!(!os.contains("merged:"), "PR must remain unmerged: {os}");
+}
+
+#[test]
+fn ff_moved_base_refuses_naming_recreate_or_rebase_and_recheck() {
+    // VAL-103: after the base ref advanced past the snapshot base_head, `--ff`
+    // refuses with the exact remedy phrase recreate-or-rebase-and-recheck;
+    // base/PR refs unchanged.
+    let dir = tmpdir("ffmoved");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "ff moved PR");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let head_before = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+    // Advance main after PR creation.
+    let (c, _, e) = git(&dir, &["checkout", "-q", "main"]);
+    assert_eq!(c, 0, "co main: {e}");
+    std::fs::write(dir.join("later.txt"), "later\n").unwrap();
+    let (c, _, e) = git(&dir, &["add", "later.txt"]);
+    assert_eq!(c, 0, "add: {e}");
+    let (c, _, e) = git(&dir, &["commit", "-q", "-m", "later"]);
+    assert_eq!(c, 0, "commit: {e}");
+    let moved_base = ref_oid(&dir, "refs/heads/main").unwrap();
+    assert_ne!(base_before, moved_base);
+    checkout(&dir, "feature");
+    let (cm, _, em) = forge(&dir, &["forge", "pr", "merge", "1", "--ff"]);
+    assert_ne!(cm, 0, "moved base must refuse --ff");
+    assert!(
+        em.contains("recreate-or-rebase-and-recheck"),
+        "refusal must name recreate-or-rebase-and-recheck: {em}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        moved_base,
+        "base unchanged"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        head_before,
+        "PR head unchanged"
+    );
+    let (_cs, os, _) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert!(!os.contains("merged:"), "PR must remain unmerged: {os}");
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn ff_finalize_base_cas_clash_leaves_no_partial_write() {
+    // VAL-104: exact-base CAS — the base advances between the expectation
+    // check and finalize (injected in the GIT_FORGE_TEST_MERGE_BARRIER
+    // window: pending result ref exists, temp worktree already gone). The
+    // completion transaction's base CAS then fails → merge exits non-zero
+    // with base/PR/issue refs all unchanged (no partial write).
+    let dir = tmpdir("ffcas");
+    init_repo(&dir);
+    let (ci, _, ei) = forge(&dir, &["forge", "issue", "new", "ff cas bug"]);
+    assert_eq!(ci, 0, "issue new failed: {ei}");
+    create_approved_pr_closes(&dir, "feature", "ff closes PR", 1, 2);
+    checkout(&dir, "feature");
+    let barrier = tmpdir("ffcas-window");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let head_before = ref_oid(&dir, "refs/forge/prs/2/head").unwrap();
+    let issue_before = ref_oid(&dir, "refs/forge/issues/1").unwrap();
+
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let child: Child = Command::new(bin)
+        .args(["forge", "pr", "merge", "2", "--ff"])
+        .current_dir(&dir)
+        .env("GIT_FORGE_TEST_MERGE_BARRIER", &barrier)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !barrier.join("ready").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "ff merge never reached the barrier window"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Inject the CAS clash: advance the base ref while the merge is parked
+    // between the expectation check and the finalize transaction. The clash
+    // commit is built with plumbing (commit-tree of the current base tree,
+    // empty delta) so no checkout of main is needed.
+    let tree_before = {
+        let (_, o, _) = git(&dir, &["rev-parse", &format!("{base_before}^{{tree}}")]);
+        o.trim().to_string()
+    };
+    let (c, o3, e3) = git(
+        &dir,
+        &["commit-tree", &tree_before, "-m", "concurrent base advance"],
+    );
+    assert_eq!(c, 0, "commit-tree failed: {e3} {o3}");
+    let new_base = o3.trim().to_string();
+    let (c, _, e) = git(
+        &dir,
+        &["update-ref", "refs/heads/main", &new_base, &base_before],
+    );
+    assert_eq!(c, 0, "advance base ref: {e}");
+    let moved = ref_oid(&dir, "refs/heads/main").unwrap();
+    assert_eq!(moved, new_base, "base ref must have moved");
+    assert_ne!(moved, base_before);
+
+    let release_path = barrier.join("release");
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&release_path)
+            .expect("release sentinel must be created atomically");
+        let _ = f.write_all(b"go\n");
+    }
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "the CAS-clashed ff merge must fail: {stderr}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        new_base,
+        "base must hold the concurrent value (merge wrote nothing)"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/2/head").unwrap(),
+        head_before,
+        "PR head chain must be unchanged"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/issues/1").unwrap(),
+        issue_before,
+        "issue ref must be unchanged"
+    );
+    let events = chain_event_jsons(&dir, "refs/forge/issues/1");
+    assert!(
+        events
+            .iter()
+            .all(|j| !j.contains("\"kind\":\"issue.close\"")),
+        "no partial issue.close event may exist: {events:?}"
+    );
+    assert_no_temp_worktree_pr(&dir, 2);
 }

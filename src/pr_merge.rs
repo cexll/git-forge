@@ -42,6 +42,12 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
                 }
                 strategy = Some("rebase");
             }
+            "--ff" => {
+                if strategy.is_some() {
+                    return Err("merge strategy flag specified more than once".into());
+                }
+                strategy = Some("ff");
+            }
             "-h" | "--help" => return Ok(pr_merge_help()),
             s if s.starts_with('-') => return Err(format!("unknown option '{s}'")),
             s => {
@@ -92,7 +98,6 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
         .transpose()
         .map_err(|_| "PR merge_base invalid".to_string())?
         .ok_or_else(|| "PR has no merge_base".to_string())?;
-
     // Stale-base rejection: current base branch tip must equal PR base_head.
     let current_base = store
         .repo()
@@ -102,6 +107,28 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
                 .ok_or(git2::Error::from_str("base branch has no target"))
         })
         .map_err(|_| format!("base branch '{base_ref}' does not exist"))?;
+    // --ff preconditions (VAL-102, VAL-103): the snapshot source must sit
+    // directly on top of the snapshot base (merge_base == base_head), and —
+    // until #2 (live-base refresh) lands — the current base ref must still
+    // equal the snapshot base_head. Distinct remedies, checked BEFORE the
+    // generic stale-base refusal so the ff path names its own remedy.
+    if strategy == "ff" {
+        if merge_base != base_oid {
+            return Err(format!(
+                "PR #{id} cannot fast-forward: the source does not sit directly \
+                 on top of the snapshot base (merge_base != base_head); \
+                 use `pr merge --rebase` to replay the source or recreate the PR"
+            ));
+        }
+        if current_base != base_oid {
+            return Err(format!(
+                "base branch '{base_ref}' has moved since PR #{id} was created \
+                 ({current_base} != snapshot {base_oid}); \
+                 recreate-or-rebase-and-recheck"
+            ));
+        }
+    }
+
     if current_base != base_oid {
         return Err(format!(
             "base branch '{base_ref}' has moved since PR #{id} was created \
@@ -376,9 +403,10 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
 }
 
 pub(crate) fn pr_merge_help() -> String {
-    "usage: git forge pr merge [<n>] [--merge|--squash|--rebase]\n\
+    "usage: git forge pr merge [<n>] [--merge|--squash|--rebase|--ff]\n\
      \x20 default / --merge: merge commit (--no-ff --no-edit)\n\
      \x20 --squash: single squashed commit\n\
-     \x20 --rebase: replay source onto base (linear history)"
+     \x20 --rebase: replay source onto base (linear history)\n\
+     \x20 --ff: fast-forward base to source (requires source directly on base)"
         .to_string()
 }
