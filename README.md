@@ -29,7 +29,11 @@ Requests tabs stay unused. A web view is deferred L2 roadmap.
   `.forge/ci.sh` is absent; a present symlink or other non-regular entry is
   refused up front without appending a Check result.
 - **Merge strategies**: `--merge` (default, merge commit), `--squash`
-  (single commit), `--rebase` (linear replay onto the base tip).
+  (single commit), `--rebase` (linear replay onto the base tip), and `--ff`
+  (fast-forward the base to the source; requires the source to sit directly
+  on top of the snapshot base). After a successful merge,
+  `--recycle-worktree <path>` removes the merged source worktree (and
+  deletes its branch when safe); `--force` recycles a dirty source worktree.
 - All state in git refs (`refs/forge/*`); no daemon, no second protocol.
 
 ## Install
@@ -84,7 +88,8 @@ git forge issue close 1 && git forge issue reopen 1
 git checkout -b feature
 git commit ...
 git forge pr create --source feature --base main "add feature"
-git checkout feature          # L1 refuses to merge while the base is checked out
+git checkout feature          # a clean checked-out base merges fine and is
+                              # refreshed; only a DIRTY base worktree refuses
 git forge pr show 1
 git forge pr diff 1                      # base_head...source_head
 git forge pr review 1 --approve
@@ -97,11 +102,17 @@ git forge ci run 1                       # execute .forge/ci.sh (or `just check`
 git forge pr merge 1                     # merge commit (default)
 # or: git forge pr merge 1 --squash      # single commit
 # or: git forge pr merge 1 --rebase      # linear replay onto the base tip
+# or: git forge pr merge 1 --ff          # fast-forward (source sits on base)
+# or: git forge pr merge 1 --recycle-worktree ../feature-wt   # remove the
+#    merged source worktree afterwards; --force recycles a dirty one
 ```
 
 The merge runs in a disposable temporary worktree (so a dirty main worktree
-survives), refuses a stale base or a checked-out base branch, and finalizes
-base + PR chain atomically in one ref transaction.
+survives). A clean worktree with the base branch checked out also merges —
+the merge refreshes it to the result commit — while a stale base, a dirty
+base worktree, or a source not sitting directly on the snapshot base (for
+`--ff`) refuses, and it finalizes base + PR chain atomically in one ref
+transaction.
 
 ## Design
 

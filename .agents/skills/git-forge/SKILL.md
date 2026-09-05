@@ -43,7 +43,8 @@ show <n>                                     # snapshot fields + effective revie
 comment <n> <body>
 review <n> --approve|--reject [--file <f> --line <l> --commit <c>]
 diff <n>                                     # three-dot diff base_head...source_head from snapshot refs
-merge [<n>] [--merge|--squash|--rebase]      # default: merge commit
+merge [<n>] [--merge|--squash|--rebase|--ff] [--recycle-worktree <path>] [--force]
+abandon <n> --reason <text>                    # terminal: merge/review/CI refuse it afterwards
 ci:  git forge ci run <n>                    # run CI plan against the snapshot, record a ci.check event
 ```
 
@@ -60,7 +61,7 @@ pr=$(printf '%s' "$out" | sed -n 's/.*PR #\([0-9]*\) created:.*/\1/p')
 git forge pr show "$pr" && git forge pr diff "$pr"      # 4. inspect
 git forge pr review "$pr" --approve                     # 5. review (approve)
 git forge ci run "$pr"                                  # 6. record a green CI Check
-git forge pr merge "$pr"                                # 7. merge (or --squash / --rebase)
+git forge pr merge "$pr"                                # 7. merge (or --squash / --rebase / --ff)
 git forge issue close <n>                               # 8. close the loop on the issue
 ```
 
@@ -72,7 +73,7 @@ git forge issue close <n>                               # 8. close the loop on t
 - **Merge gate is two-part**: the *last reachable* review must be `approve` AND the *latest* `ci.check` must be `success`. A later `--reject` flips the effective decision and blocks merge. No CI Check (or a failed/pending one) refuses with a message naming `git forge ci run <n>` as the remedy.
 - **CI plan comes from the snapshot**: `ci run` executes `.forge/ci.sh` when it is a regular file in the PR snapshot, else the `just check` fallback (which requires a self-contained justfile — no `import`/`mod`, no `set fallback`). A failing plan still records a `failure` Check, then exits non-zero.
 - **Stale base refuses**: if the base branch tip moved since `pr create`, merge exits non-zero (`recreate the PR or merge manually`).
-- **Checked-out base refuses**: switch off the base branch before merging.
+- **Checked-out base**: a clean worktree holding the base branch merges fine — after the merge its tree is refreshed to the result commit; only a DIRTY base worktree refuses (untracked counts as dirty; no flag unlocks it). `--recycle-worktree <path>` removes the merged source worktree afterwards (`--force` recycles a dirty one).
 - **Merge is terminal and atomic**: a merged PR cannot merge again; base + PR-chain finalize in one ref transaction, and a failed hook/conflict cleans up without touching refs. Strategies are mutually exclusive.
 - **Merge runs in a disposable worktree** — the user's dirty main worktree is safe.
 
