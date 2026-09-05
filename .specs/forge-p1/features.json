@@ -374,6 +374,48 @@
         "kind": "review",
         "itemId": "F-002"
       }
+    },
+    {
+      "dependsOn": [
+        "t5-fix-adapter"
+      ],
+      "touches": [
+        "docs/architecture/git-forge.md",
+        "README.md",
+        ".agents/skills/git-forge/",
+        ".specs/forge-p1/forge-p1/missions/handoff/",
+        "~/.agents/skills/git-forge/references/"
+      ],
+      "fulfills": [],
+      "expectedBehavior": [
+        "F-001/F-002: ~/.agents/skills/git-forge wire-contract + glossary mirrors byte-identical to docs/architecture/git-forge.md + CONTEXT.md glossary (cmp verified)",
+        "F-003: event-kind table shows strategy merge|squash|rebase|ff",
+        "F-004: no stale 'live-base merge is L2' sentences remain in docs/architecture/git-forge.md",
+        "F-005: merge-execution paragraph tail states clean-proceeds+refresh / dirty-refuses",
+        "F-006: README lists --ff and --recycle-worktree --force; checked-out-base comments teach clean-merges-and-refreshes",
+        "F-007: repo-local + mirror SKILL.md surface block includes abandon, --ff, --recycle-worktree; stale checked-out bullet reworded",
+        "F-008: t3 receipt commitId points to 88b767c"
+      ],
+      "addressesItemId": [
+        "F-001",
+        "F-002",
+        "F-003",
+        "F-004",
+        "F-005",
+        "F-006",
+        "F-007",
+        "F-008"
+      ],
+      "id": "t6-docs-sync",
+      "description": "Fix scrutiny-acceptance findings F-001..F-008 (all docs/records drift, no code): re-sync ~/.agents/skills/git-forge wire-contract + glossary mirrors byte-for-byte (F-001/F-002); event-kind table gains strategy:\"ff\" (F-003); two stale 'live-base merge is L2' sentences corrected (F-004); merge-execution paragraph tail rewritten to clean-proceeds+refresh/dirty-refuses (F-005); README gains --ff/--recycle-worktree surface + clean-checked-out-base rule (F-006); repo-local + mirror SKILL.md surface gains abandon/--ff/--recycle-worktree + rewrites stale checked-out bullet (F-007); t3 receipt commitId re-pointed 77cf289→88b767c (F-008).",
+      "milestone": "follow-up",
+      "proves": [],
+      "skillName": "tdd",
+      "origin": "amend",
+      "cause": {
+        "kind": "review",
+        "itemId": "F-001"
+      }
     }
   ]
 }
