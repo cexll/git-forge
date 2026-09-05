@@ -1,0 +1,87 @@
+{
+  "contract_version": "1",
+  "authority": "machine contract for forge-p2; spec.md Validation Plan is the human-readable view, this JSON is the machine grammar consumed by devflow.cjs validate",
+  "assertions": [
+    {
+      "id": "VAL-201",
+      "title": "`--json` on issue new/list/show + pr create/list/show + ci run 输出 byte-stable schema,含分配 id;`git forge version` 输 semver 退出 0",
+      "behavior": "`--json` on issue new/list/show + pr create/list/show + ci run 输出 byte-stable schema,含分配 id;`git forge version` 输 semver 退出 0",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "每个命令 schema fixture 逐字节匹配;version 输出格式稳定",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-202",
+      "title": "未知 flag 仍 exit-1;裸 `git forge --help` exit-1 quirk 文档化(help 在 `git forge help`)",
+      "behavior": "未知 flag 仍 exit-1;裸 `git forge --help` exit-1 quirk 文档化(help 在 `git forge help`)",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "注入未知 flag exit 非零;docs 声明 quirk",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-203",
+      "title": "adapter 在 #7 落地后切到 --json 解析 + version-gate(不再 sed 散文)",
+      "behavior": "adapter 在 #7 落地后切到 --json 解析 + version-gate(不再 sed 散文)",
+      "surface": "pipeline",
+      "tool": "pipeline",
+      "evidence": "adapter matrix 用 --json fixture 全绿;version-gate 逻辑测试",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-204",
+      "title": "#8 actor 区分:同一 repo 中 worker/reviewer/orchestrator 的事件 actor 可区分;wire contract 声明 role 语义",
+      "behavior": "#8 actor 区分:同一 repo 中 worker/reviewer/orchestrator 的事件 actor 可区分;wire contract 声明 role 语义",
+      "surface": "cli+docs",
+      "tool": "cli+docs",
+      "evidence": "三种角色事件链 actor 互异;docs 更新",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-205",
+      "title": "#1 pr.update 把 PR 重新 pin 到分支 tip 为新代;事件 body 记录 old/new source_head/base_head/merge_base",
+      "behavior": "#1 pr.update 把 PR 重新 pin 到分支 tip 为新代;事件 body 记录 old/new source_head/base_head/merge_base",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "update 后 show 显示新快照;事件 body 含四字段",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-206",
+      "title": "#1 代绑定 gate:approve-before-update 不能 merge post-update 内容;CI-green-before-update 同样 stale;仅最新代 approve+check 满足 gate",
+      "behavior": "#1 代绑定 gate:approve-before-update 不能 merge post-update 内容;CI-green-before-update 同样 stale;仅最新代 approve+check 满足 gate",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "先 approve 再 update 再 merge → 拒绝;update 后重新 approve+CI → 通过",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-207",
+      "title": "#2 live-base merge:base 前移后 merge 对当前 base 重算并绑定 result-bound CI+review 通过;未 re-validate 拒绝",
+      "behavior": "#2 live-base merge:base 前移后 merge 对当前 base 重算并绑定 result-bound CI+review 通过;未 re-validate 拒绝",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "双 PR 场景第二个 PR base 前移 → 无 fresh CI 拒绝;fresh CI+review 后通过",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-208",
+      "title": "#2 的 finalize CAS 绑定当前 gate 验证的 base tip(F-007/F-008 重设计命名);并发 CAS 冲突无部分写入",
+      "behavior": "#2 的 finalize CAS 绑定当前 gate 验证的 base tip(F-007/F-008 重设计命名);并发 CAS 冲突无部分写入",
+      "surface": "cli",
+      "tool": "cli",
+      "evidence": "CAS 冲突注入 exit 非零 refs 不变",
+      "status": "pending"
+    },
+    {
+      "id": "VAL-209",
+      "title": "自举契约:#7/#8/#1/#2 全部通过新 forge 流程合并,PR closes issue;adapter 全程使用 --json/version-gate",
+      "behavior": "自举契约:#7/#8/#1/#2 全部通过新 forge 流程合并,PR closes issue;adapter 全程使用 --json/version-gate",
+      "surface": "pipeline",
+      "tool": "pipeline",
+      "evidence": "每个 feature 的 PR merged + issue closed;adapter matrix 绿",
+      "status": "pending"
+    }
+  ]
+}

@@ -1,0 +1,249 @@
+{
+  "mission": "forge-p2",
+  "generatedBy": "devflow.cjs compile",
+  "generatedAt": "2026-09-05",
+  "statusNote": "This is the plan and holds no status. Live status is in <spec-dir>/missions/runtime.json (gitignored, written only by devflow). Read it with: devflow.cjs brief --mission-dir <spec-dir>/missions — that answers \"is it done\", read-only. Never edit this file by hand: append with 'devflow.cjs amend --add-feature', and drop work with 'devflow.cjs cancel'.",
+  "features": [
+    {
+      "id": "a-final",
+      "description": "exercise every contract assertion through its real surface and report per assertion",
+      "dependsOn": [
+        "t1",
+        "t2",
+        "t7",
+        "t8",
+        "v-p2"
+      ],
+      "milestone": "acceptance",
+      "touches": [],
+      "fulfills": [],
+      "proves": [
+        "VAL-201",
+        "VAL-202",
+        "VAL-203",
+        "VAL-204",
+        "VAL-205",
+        "VAL-206",
+        "VAL-207",
+        "VAL-208",
+        "VAL-209"
+      ],
+      "reportOnly": true,
+      "validatorKind": "acceptance",
+      "skillName": "user-validate-flow",
+      "expectedBehavior": [
+        "Every contract assertion carries a verdict and at least one evidence artifact"
+      ],
+      "origin": "plan",
+      "addressesItemId": []
+    },
+    {
+      "id": "p-promote",
+      "description": "turn the accepted P2 flows (machine-interface JSON; identity role attribution; pr.update generation gate; live-base result-bound merge) into install-e2e flow contracts under `.agents/qa/flows/`, reviewed and merged like any other change.",
+      "dependsOn": [
+        "a-final"
+      ],
+      "milestone": "acceptance",
+      "touches": [
+        ".agents/qa/"
+      ],
+      "fulfills": [],
+      "skillName": "tdd",
+      "expectedBehavior": [
+        "Four flow contract files exist under `.agents/qa/flows/` with the five required headings each",
+        "Each flow names the CLI steps and the exit-code/JSON-schema/ref-state assertions the acceptance sweep observed",
+        "The install-e2e parser accepts them (its own shape check passes)",
+        "Nothing else changes — the flows are documentation-of-proof, not code"
+      ],
+      "origin": "plan",
+      "addressesItemId": []
+    },
+    {
+      "id": "t1",
+      "description": "L1 PRs are one-shot immutable snapshots; commits added after creation never join the PR, and no pr.update event exists. Any review-fix loop needs follow-up commits on the same change: devflow fix rounds send a worker back into the SAME worktree/branch; with immutable snapshots every round must recreate the PR and re-collect approve + ci.check, so review history fragments across N PRs for one logical change. A pr.update event re-pins the PR to the branch tip as a NEW snapshot generation; existing immutability is kept per generation.",
+      "dependsOn": [],
+      "milestone": "pr-update",
+      "touches": [
+        "src/pr_merge.rs",
+        "src/merge_state.rs",
+        "src/store.rs",
+        "src/event.rs",
+        "src/fold.rs",
+        "src/cli.rs",
+        "tests/t3_merge.rs",
+        "scripts/gf-dogfood.sh"
+      ],
+      "fulfills": [
+        "VAL-205",
+        "VAL-206"
+      ],
+      "verification": {
+        "mode": "steps",
+        "steps": [
+          {
+            "id": "check",
+            "command": "cargo test (exit zero) + dogfood assertions",
+            "expectedExit": "zero"
+          }
+        ]
+      },
+      "skillName": "diagnosing-bugs",
+      "expectedBehavior": [
+        "`pr update <n>` re-pins the PR to the branch tip; event body records old/new source_head/base_head/merge_base",
+        "Each update is addressable as a new immutable generation; generation-0 L1 refs unchanged",
+        "`pr show` exposes the latest generation; diff = merge_base..latest source_head",
+        "Approve-before-update cannot merge post-update content (gate refuses pre-update approve/CI)",
+        "After update, fresh approve + fresh CI green on the latest generation merges",
+        "dogfood gains update-then-merge assertions (stale approve refused, fresh approve passes)"
+      ],
+      "origin": "plan",
+      "addressesItemId": []
+    },
+    {
+      "id": "t2",
+      "description": "git forge pr merge refuses when refs/heads/<base> has moved since pr create; the only remedy is recreating the PR. Multiple in-flight PRs against the same base serialize — the moment one merges, every other PR is stale. Agent pipelines land feature branches one after another onto a moving integration branch, so recreate churn is per-merge, not exceptional. Live-base merge recomputes merge_base against the current base tip and binds review/CI to the merge result.",
+      "dependsOn": [],
+      "milestone": "live-base",
+      "touches": [
+        "src/pr_merge.rs",
+        "src/merge_state.rs",
+        "src/event.rs",
+        "src/fold.rs",
+        "src/cli.rs",
+        "tests/t3_merge.rs",
+        "scripts/gf-dogfood.sh"
+      ],
+      "fulfills": [
+        "VAL-207",
+        "VAL-208"
+      ],
+      "verification": {
+        "mode": "steps",
+        "steps": [
+          {
+            "id": "check",
+            "command": "cargo test (exit zero) + dogfood assertions",
+            "expectedExit": "zero"
+          }
+        ]
+      },
+      "skillName": "tdd",
+      "expectedBehavior": [
+        "Two PRs on one base: first merges; second's base moved → merge refuses (no re-validation)",
+        "After fresh CI run + fresh approve (result-bound), the second PR's live-base merge passes",
+        "Finalize CASes the CURRENT base tip the gate validated (F-007/F-008 binding redesign named in code)",
+        "CAS conflict injected (base moved between gate validation and finalize): merge fails, refs unchanged, no partial write",
+        "dogfood gains two-PR live-base assertions (refuse without fresh gate, pass with)"
+      ],
+      "origin": "plan",
+      "addressesItemId": []
+    },
+    {
+      "id": "t7",
+      "description": "`--json` on issue new/list/show, pr create/list/show, ci run (machine-readable result incl. allocated id/status; pr create JSON includes the allocated PR number); `git forge version` prints a semver and exits 0; capabilities discovery DEFERRED (adapter version-gates on semver ranges); unknown flags keep exit-1; the bare `git forge --help` exit-1 quirk stays and is documented.",
+      "dependsOn": [],
+      "milestone": "machine-interface",
+      "touches": [
+        "src/cli.rs",
+        "src/issue.rs",
+        "src/pr_merge.rs",
+        "src/event.rs",
+        "tests/t3_merge.rs",
+        "scripts/gf-dogfood.sh",
+        "~/.agents/skills/implement/scripts/devflow.cjs"
+      ],
+      "fulfills": [
+        "VAL-201",
+        "VAL-202",
+        "VAL-203"
+      ],
+      "verification": {
+        "mode": "steps",
+        "steps": [
+          {
+            "id": "check",
+            "command": "cargo test (exit zero) + adapter matrix (JSON fixture)",
+            "expectedExit": "zero"
+          }
+        ]
+      },
+      "skillName": "tdd",
+      "expectedBehavior": [
+        "Each JSON-enabled command emits a byte-stable schema fixture (issue new/list/show, pr create/list/show, ci run) matching byte-for-byte",
+        "`git forge version` prints a semver and exits 0",
+        "Unknown flags exit-1 (unchanged); bare `git forge --help` exit-1 quirk documented",
+        "adapter devflow.cjs parses --json (no more sed-parsing prose) and version-gates on semver range"
+      ],
+      "origin": "plan",
+      "addressesItemId": []
+    },
+    {
+      "id": "t8",
+      "description": "every Forge Event actor is the repo user.email; in the single-user local setting the orchestrator, the implementing subagent, and the reviewing subagent all share one identity — the Review gate proves 'an approve event exists', not 'someone other than the implementer approved'. The wire contract should say so, and a future multi-agent pipeline wants role attribution in the chain. Identity resolution shells out to `git -C <worktree> config`, so per-worktree identity is already technically reachable via extensions.worktreeConfig or GIT_CONFIG_COUNT/GIT_CONFIG_KEY_0/GIT_CONFIG_VALUE_0 env overrides — but neither is a promised interface.",
+      "dependsOn": [],
+      "milestone": "identity",
+      "touches": [
+        "src/identity.rs",
+        "src/event.rs",
+        "src/cli.rs",
+        "docs/architecture/git-forge.md",
+        "~/.agents/skills/git-forge/references/wire-contract.md"
+      ],
+      "fulfills": [
+        "VAL-204",
+        "VAL-209"
+      ],
+      "verification": {
+        "mode": "steps",
+        "steps": [
+          {
+            "id": "check",
+            "command": "cargo test (exit zero) + dogfood role-attribution assertions",
+            "expectedExit": "zero"
+          }
+        ]
+      },
+      "skillName": "tdd",
+      "expectedBehavior": [
+        "Three roles (worker/reviewer/orchestrator) produce distinguishable event actors in one repo",
+        "Per-worktree identity via extensions.worktreeConfig works and is documented",
+        "Environment override (GIT_CONFIG_COUNT etc.) works and is documented",
+        "Wire contract (docs/architecture/git-forge.md + mirror) declares the role semantics",
+        "Review gate: an approve from the implementer's own role does not satisfy 'someone other than the implementer approved' (when roles are distinct)"
+      ],
+      "origin": "plan",
+      "addressesItemId": []
+    },
+    {
+      "id": "v-p2",
+      "description": "exercise every P2 ASSERTION through its real surface (forge CLI; adapter via the implement-skill test matrix with the fake git-forge fixture) and report per assertion",
+      "dependsOn": [
+        "t7",
+        "t8",
+        "t1",
+        "t2"
+      ],
+      "milestone": "acceptance",
+      "touches": [],
+      "fulfills": [],
+      "proves": [
+        "VAL-201",
+        "VAL-202",
+        "VAL-203",
+        "VAL-204",
+        "VAL-205",
+        "VAL-206",
+        "VAL-207",
+        "VAL-208",
+        "VAL-209"
+      ],
+      "reportOnly": true,
+      "skillName": "user-validate-flow",
+      "expectedBehavior": [
+        "Every assigned assertion carries a verdict and at least one evidence artifact"
+      ],
+      "origin": "plan",
+      "addressesItemId": []
+    }
+  ]
+}
