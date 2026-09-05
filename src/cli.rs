@@ -305,6 +305,9 @@ fn cmd_pr_show(store: &EventStore, args: &[String]) -> Result<String, String> {
             sanitize_terminal(s)
         ));
     }
+    // t1: the PR's current snapshot generation (0 = the authoritative
+    // pr.created snapshot, +1 per pr.update).
+    out.push_str(&format!("generation: {}\n", state.generation));
     if let Some(d) = &state.description {
         out.push_str(&format!("description: {}\n", sanitize_terminal(d)));
     }
@@ -470,6 +473,13 @@ fn cmd_pr_review(args: &[String]) -> Result<String, String> {
         // diff changes).
         body.insert("commit".into(), json_str(&c));
     }
+    // Generation binding: the decision authorizes the snapshot generation
+    // current at review time; the merge gate refuses a decision from an
+    // older generation (pre-update approve is stale).
+    body.insert(
+        "generation".into(),
+        JsonValue::Number(state.generation as i64),
+    );
     let ev = Event::new(EventKind::PrReview, "pr", id, &actor, body);
     store.append_event(&r, &ev).map_err(|e| e.to_string())?;
     Ok(format!("reviewed PR #{id} ({decision})"))
@@ -544,9 +554,24 @@ fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String, String> {
     if !store_has_ref(store, &head) {
         return Err(format!("PR #{id} does not exist"));
     }
-    // Resolve from the IMMUTABLE snapshot refs (survive branch deletion + gc).
-    let source = crate::store::pr_source_ref(id);
-    let base = crate::store::pr_base_ref(id);
+    // Resolve from the CURRENT generation's immutable snapshot refs (survive
+    // branch deletion + gc): generation 0 uses the L1 `/source`//`/base`
+    // refs, later generations their `/source/g<k>`//`/base/g<k>` pins. The
+    // folded head chain is the authority on which generation is current.
+    let head_tip = store
+        .repo()
+        .find_reference(&head)
+        .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
+        .map_err(|_| format!("PR #{id} does not exist"))?;
+    let (anchored, chain) = store
+        .read_pr_chain_anchored(id, head_tip)
+        .map_err(|e| e.to_string())?;
+    if !anchored {
+        return Err(format!("PR #{id} head chain is not anchored to PR #{id}"));
+    }
+    let state = crate::event::fold(&chain).pr;
+    let source = crate::store::pr_source_ref_for(id, state.generation);
+    let base = crate::store::pr_base_ref_for(id, state.generation);
     let source_oid = store
         .repo()
         .find_reference(&source)
@@ -557,10 +582,10 @@ fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String, String> {
         .find_reference(&base)
         .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
         .map_err(|_| format!("PR #{id} snapshot base ref missing"))?;
-    // F-008: a retargeted `/source`/`/base` would let `pr diff` display a
-    // different patch than the one a reviewer approves (shared invariant, one
-    // owner in the store).
-    store.validate_pr_snapshot_refs(id, source_oid, base_oid)?;
+    // F-008: a retargeted `/source`//`/base` would let `pr diff` display a
+    // different patch than the one a reviewer approves (shared invariant,
+    // one owner in the store).
+    crate::store::EventStore::validate_snapshot_against_state(id, &state, source_oid, base_oid)?;
     // F-027 (review): the `git diff` shell-out must run through the SANITIZED
     // git adapter — a caller `GIT_EXTERNAL_DIFF`/`GIT_DIR`/`GIT_CONFIG` would
     // otherwise render an arbitrary/redirected patch (or run an external-diff
@@ -615,6 +640,7 @@ pub fn run_pr(argv: &[String]) -> Result<String, String> {
         "show" => cmd_pr_show(&open_store()?, &argv[1..]),
         "comment" => cmd_pr_comment(&argv[1..]),
         "review" => cmd_pr_review(&argv[1..]),
+        "update" => crate::pr_merge::cmd_pr_update(&argv[1..]),
         "abandon" => cmd_pr_abandon(&argv[1..]),
         "diff" => cmd_pr_diff(&open_store()?, &argv[1..]),
         "merge" => crate::pr_merge::cmd_pr_merge(open_store()?, &argv[1..]),
@@ -633,18 +659,20 @@ fn pr_sub_usage(sub: &str) -> Option<&'static str> {
         "review" => "usage: git forge pr review <n> --approve|--reject [--file <f> --line <l> --commit <c>]",
         "abandon" => "usage: git forge pr abandon <n> --reason <text>",
         "diff" => "usage: git forge pr diff <n>",
+        "update" => "usage: git forge pr update <n>",
         _ => return None,
     })
 }
 
 fn pr_help() -> String {
-    "usage: git forge pr <create|list|show|comment|review|diff|merge|abandon> ...\n\
+    "usage: git forge pr <create|list|show|comment|review|update|diff|merge|abandon> ...\n\
      \nsubcommands:\n\
      \x20 create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]... [--closes <n>]\n\
      \x20 list\n\
      \x20 show <n>\n\
      \x20 comment <n> <body>\n\
      \x20 review <n> --approve|--reject [--file <f> --line <l> --commit <c>]\n\
+     \x20 update <n>\n\
      \x20 diff <n>\n\
      \x20 merge [<n>] [--squash|--rebase]\n\
      \x20 abandon <n> --reason <text>"
@@ -700,7 +728,23 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
     if !store_has_ref(&store, &head) {
         return Err(format!("PR #{id} does not exist"));
     }
-    let chain = store.read_chain(&head).map_err(|e| e.to_string())?;
+    // Anchored read (F-008): the WHOLE chain folded here must be anchored to
+    // PR #id's authoritative pr.created — a forged/foreign chain must not
+    // supply the snapshot fields the run executes against.
+    let head_tip = store
+        .repo()
+        .find_reference(&head)
+        .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
+        .map_err(|_| format!("PR #{id} does not exist"))?;
+    let (anchored, chain) = store
+        .read_pr_chain_anchored(id, head_tip)
+        .map_err(|e| e.to_string())?;
+    if !anchored {
+        return Err(format!(
+            "refs/forge/prs/{id}/head points at a tip whose chain is not anchored \
+             to PR #{id}"
+        ));
+    }
     let state = crate::event::fold(&chain).pr;
     // Abandoned PRs are terminal (pr.abandoned): refuse BEFORE the plan is
     // materialized or any worktree is created — no ci.check is appended and
@@ -709,21 +753,23 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
         return Err(format!("PR #{id} is abandoned: {reason}"));
     }
     let (store, actor) = open_mutation_store()?;
-    // The plan runs against the PR's immutable source snapshot (its own
-    // commits), never the developer's working tree.
+    // The plan runs against the PR's CURRENT generation's immutable source
+    // snapshot (its own commits), never the developer's working tree.
+    let generation = state.generation;
     let source_oid = store
         .repo()
-        .find_reference(&crate::store::pr_source_ref(id))
+        .find_reference(&crate::store::pr_source_ref_for(id, generation))
         .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
         .map_err(|_| format!("PR #{id} snapshot source ref missing"))?;
     let base_oid = store
         .repo()
-        .find_reference(&crate::store::pr_base_ref(id))
+        .find_reference(&crate::store::pr_base_ref_for(id, generation))
         .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
         .map_err(|_| format!("PR #{id} snapshot base ref missing"))?;
-    // F-008: the `/source` ref must still point at the AUTHORITATIVE
-    // `pr.created` snapshot (shared invariant, one owner in the store).
-    store.validate_pr_snapshot_refs(id, source_oid, base_oid)?;
+    // F-008: the snapshot refs must still point at the AUTHORITATIVE
+    // snapshot of the current generation (shared invariant, one owner in
+    // the store).
+    crate::store::EventStore::validate_snapshot_against_state(id, &state, source_oid, base_oid)?;
     let repo_dir = store
         .repo()
         .workdir()
@@ -828,6 +874,9 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
     let mut body = HashMap::new();
     body.insert("status".into(), json_str(status));
     body.insert("plan".into(), json_str(plan.label()));
+    // Generation binding: the Check validates the snapshot it ran against;
+    // the merge gate refuses a Check from an older generation.
+    body.insert("generation".into(), JsonValue::Number(generation as i64));
     let ev = Event::new(EventKind::CiCheck, "pr", id, &actor, body);
     // Record the outcome — a failing plan still appends a `failure` CI Check
     // (VAL-002) before the command exits nonzero.

@@ -4353,3 +4353,256 @@ fn recycle_phase2_dirty_force_proceeds() {
         "branch deleted after --force recycle"
     );
 }
+
+// ── #1 per-generation snapshots (t1, VAL-205/206) ──────────────────────────
+
+/// Append a commit to the PR's source branch (the fix-round shape), then
+/// re-pin with `pr update`. Must be called while the source branch is
+/// checked out; returns the new branch tip.
+fn fix_round_commit(dir: &Path, branch: &str, file: &str, content: &str) -> String {
+    checkout(dir, branch);
+    std::fs::write(dir.join(file), content).unwrap();
+    let (c, _, e) = git(dir, &["add", file]);
+    assert_eq!(c, 0, "add failed: {e}");
+    let (c, _, e) = git(dir, &["commit", "-q", "-m", "fix round"]);
+    assert_eq!(c, 0, "commit failed: {e}");
+    ref_oid(dir, &format!("refs/heads/{branch}")).unwrap()
+}
+
+/// Read the `.forge/event.json` payload of the commit a PR ref points at.
+fn head_event_json(dir: &Path, pr: u64) -> String {
+    let r = format!("refs/forge/prs/{pr}/head");
+    let (c, o, e) = git(dir, &["show", &format!("{r}:.forge/event.json")]);
+    assert_eq!(c, 0, "read {r} event failed: {e}");
+    o
+}
+
+/// The `pr.update` event body must record old/new source_head, base_head,
+/// merge_base (the ticket's 4 field groups, 6 OIDs) and the generation.
+fn assert_update_event_body(ev: &str, old_source: &str, new_source: &str, base: &str) {
+    assert!(ev.contains("\"kind\":\"pr.update\""), "event kind: {ev}");
+    for (field, oid) in [
+        ("old_source_head", old_source),
+        ("new_source_head", new_source),
+        ("old_base_head", base),
+        ("new_base_head", base),
+        ("old_merge_base", base),
+        ("new_merge_base", base),
+    ] {
+        assert!(
+            ev.contains(&format!("\"{field}\":\"{oid}\"")),
+            "{field}: {ev}"
+        );
+    }
+}
+
+/// VAL-205: `pr update <n>` re-pins the PR to the source branch tip as a NEW
+/// immutable generation; the event body records old/new source_head,
+/// base_head, merge_base; generation-0 refs stay untouched; `pr show` exposes
+/// the latest generation and its snapshot; `pr diff` shows the new content.
+#[test]
+fn pr_update_re_pins_snapshot_as_new_generation() {
+    let dir = tmpdir("prupdate");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "update PR");
+    let gen0_source = ref_oid(&dir, "refs/forge/prs/1/source").unwrap();
+    let gen0_base = ref_oid(&dir, "refs/forge/prs/1/base").unwrap();
+
+    let new_tip = fix_round_commit(&dir, "feature", "feature.txt", "feat\nfix\n");
+    checkout(&dir, "main");
+
+    let (c, o, e) = forge(&dir, &["forge", "pr", "update", "1"]);
+    assert_eq!(c, 0, "pr update failed: {e} {o}");
+    assert!(
+        o.contains("generation 1"),
+        "update output names the generation: {o}"
+    );
+
+    // Generation-addressable ref pins the branch tip; the generation-0 L1
+    // snapshot ref stays exactly where pr.created pinned it.
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/gen/1/source").as_deref(),
+        Some(new_tip.as_str()),
+        "generation-1 ref must pin the new branch tip"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/source").as_deref(),
+        Some(gen0_source.as_str()),
+        "generation-0 /source ref must stay immutable"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/base").as_deref(),
+        Some(gen0_base.as_str()),
+        "generation-0 /base ref must stay immutable"
+    );
+
+    // pr.show exposes the latest generation and the new snapshot source.
+    let (_, o, _) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert!(
+        o.contains("generation: 1"),
+        "show must expose the generation: {o}"
+    );
+    assert!(
+        o.contains(&new_tip),
+        "show must expose the new source_head: {o}"
+    );
+
+    // The pr.update event body records old/new source_head, base_head,
+    // merge_base (the 4 contract field groups, 6 OIDs).
+    let ev = head_event_json(&dir, 1);
+    assert_update_event_body(&ev, &gen0_source, &new_tip, &gen0_base);
+
+    // diff = merge_base..latest source_head: the fix-round change shows.
+    let (c, o, e) = forge(&dir, &["forge", "pr", "diff", "1"]);
+    assert_eq!(c, 0, "pr diff failed: {e}");
+    assert!(o.contains("fix"), "diff must show the appended fix: {o}");
+}
+
+/// Each update is a new generation: after two updates both generation refs
+/// exist with their own pinned tips, the first stays immutable, and `pr
+/// show` exposes generation 2.
+#[test]
+fn pr_update_twice_pins_each_generation() {
+    let dir = tmpdir("prupdate2");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "update twice PR");
+    let g1_tip = fix_round_commit(&dir, "feature", "feature.txt", "feat\nfix1\n");
+    checkout(&dir, "main");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "update", "1"]);
+    assert_eq!(c, 0, "first update failed: {e}");
+
+    let g2_tip = fix_round_commit(&dir, "feature", "feature.txt", "feat\nfix2\n");
+    checkout(&dir, "main");
+    let (c, o, e) = forge(&dir, &["forge", "pr", "update", "1"]);
+    assert_eq!(c, 0, "second update failed: {e}");
+    assert!(o.contains("generation 2"), "second update output: {o}");
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/gen/1/source").as_deref(),
+        Some(g1_tip.as_str()),
+        "generation-1 must keep its pinned tip"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/gen/2/source").as_deref(),
+        Some(g2_tip.as_str()),
+        "generation-2 must pin the latest tip"
+    );
+    let (_, o, _) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert!(
+        o.contains("generation: 2"),
+        "show must expose generation 2: {o}"
+    );
+    assert!(
+        o.contains(&g2_tip),
+        "show must expose the latest snapshot: {o}"
+    );
+    assert!(
+        !o.contains(&g1_tip),
+        "show must not expose a stale snapshot: {o}"
+    );
+}
+
+/// `pr update` refusals: unknown PR, already-at-branch-tip (nothing to
+/// update), abandoned PR (terminal).
+#[test]
+fn pr_update_refusals() {
+    let dir = tmpdir("prupdateref");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "update refusals PR");
+
+    let (c, _, e) = forge(&dir, &["forge", "pr", "update", "99"]);
+    assert_ne!(c, 0, "unknown PR must refuse");
+    assert!(e.contains("PR #99 does not exist"), "unknown PR error: {e}");
+
+    // No new commits on the branch: nothing to update.
+    let (c, o, e) = forge(&dir, &["forge", "pr", "update", "1"]);
+    assert_ne!(c, 0, "no-op update must refuse: {o} {e}");
+    assert!(e.contains("nothing to update"), "no-op error: {e}");
+
+    // Terminal states refuse.
+    let (c, _, e) = forge(&dir, &["forge", "pr", "abandon", "1", "--reason", "gone"]);
+    assert_eq!(c, 0, "abandon failed: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "update", "1"]);
+    assert_ne!(c, 0, "abandoned PR update must refuse");
+    assert!(e.contains("gone"), "abandon refusal names the reason: {e}");
+}
+
+/// VAL-206: an approve recorded BEFORE `pr update` cannot merge post-update
+/// content — the merge refuses with refs unchanged; after a fresh approve and
+/// a fresh CI Check on the latest generation, the merge succeeds and the base
+/// contains the post-update commit.
+#[test]
+fn approve_before_update_cannot_merge_post_update_content() {
+    let dir = tmpdir("prupdatestale");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "stale approve PR");
+    let base_before = ref_oid(&dir, "main").unwrap();
+
+    let new_tip = fix_round_commit(&dir, "feature", "feature.txt", "feat\nfix\n");
+    checkout(&dir, "main");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "update", "1"]);
+    assert_eq!(c, 0, "pr update failed: {e}");
+
+    checkout(&dir, "feature");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_ne!(
+        c, 0,
+        "pre-update approve must not merge post-update content: {e}"
+    );
+    assert!(
+        e.contains("approve is stale"),
+        "refusal must name the stale gate input: {e}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "main").as_deref(),
+        Some(base_before.as_str()),
+        "a refused merge must leave the base untouched"
+    );
+    let (_, o, _) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert!(!o.contains("merged:"), "PR must stay unmerged: {o}");
+
+    // Fresh approve + fresh CI on the latest generation merge.
+    let (c, _, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_eq!(c, 0, "post-update ci run failed: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "review", "1", "--approve"]);
+    assert_eq!(c, 0, "post-update approve failed: {e}");
+    let (c, o, e) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_eq!(c, 0, "fresh approve + fresh CI must merge: {e} {o}");
+    assert!(
+        git(&dir, &["merge-base", "--is-ancestor", &new_tip, "main"]).0 == 0,
+        "the merged base must contain the post-update commit"
+    );
+}
+
+/// VAL-206 (CI leg): a green CI Check recorded BEFORE `pr update` is stale —
+/// a fresh approve alone must not satisfy the gate; the merge refuses naming
+/// the missing Check, and a fresh CI run on the latest generation completes
+/// the merge.
+#[test]
+fn ci_green_before_update_cannot_merge_post_update_content() {
+    let dir = tmpdir("prupdatestaleci");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "stale ci PR");
+
+    fix_round_commit(&dir, "feature", "feature.txt", "feat\nfix\n");
+    checkout(&dir, "main");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "update", "1"]);
+    assert_eq!(c, 0, "pr update failed: {e}");
+
+    checkout(&dir, "feature");
+    // Fresh approve is bound to the latest generation, but the only CI Check
+    // on the chain is the pre-update green one — stale, so the gate refuses.
+    let (c, _, e) = forge(&dir, &["forge", "pr", "review", "1", "--approve"]);
+    assert_eq!(c, 0, "fresh approve failed: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_ne!(c, 0, "pre-update green CI must not satisfy the gate: {e}");
+    assert!(
+        e.contains("CI Check is stale"),
+        "refusal must name the stale Check: {e}"
+    );
+
+    // Fresh CI on the latest generation completes the merge.
+    let (c, _, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_eq!(c, 0, "post-update ci run failed: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_eq!(c, 0, "fresh CI must complete the merge: {e}");
+}

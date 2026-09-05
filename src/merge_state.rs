@@ -89,6 +89,16 @@ pub(crate) fn validate_merge_gate_at(
             state.effective_decision.as_deref().unwrap_or("none")
         ));
     }
+    // Gate (t1 generation binding): a decision from an OLDER snapshot
+    // generation is stale — it authorized content the PR no longer holds.
+    // Only a latest-generation approve satisfies the gate.
+    if state.decision_generation != state.generation {
+        return Err(format!(
+            "PR #{id} approve is stale (decision on generation {}, current \
+             snapshot generation {}); re-review after `pr update`",
+            state.decision_generation, state.generation
+        ));
+    }
     // Already merged: a pr.merge event exists → no double merge.
     if state.merge_result.is_some() {
         return Err(format!("PR #{id} is already merged"));
@@ -98,7 +108,18 @@ pub(crate) fn validate_merge_gate_at(
     // merge BEFORE any worktree/ref side effect, and names the `ci run` step
     // as the remedy. This is purely additive to the L1 approval gate.
     match state.ci_status.as_deref() {
-        Some("success") => {}
+        Some("success") if state.ci_generation == state.generation => {}
+        // A green Check from an OLDER generation validated content the PR no
+        // longer holds: stale, never satisfies the gate (t1 generation
+        // binding).
+        Some("success") => {
+            return Err(format!(
+                "PR #{id} is not mergeable: latest CI Check is stale (run on \
+                 generation {}, current snapshot generation {}); \
+                 run `git forge ci run {id}`",
+                state.ci_generation, state.generation
+            ));
+        }
         Some(status) => {
             return Err(format!(
                 "PR #{id} is not mergeable: latest CI Check is `{status}` \

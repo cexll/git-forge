@@ -96,19 +96,20 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
         .ok_or_else(|| "PR has no base_ref".to_string())?;
     let source_oid = store
         .repo()
-        .find_reference(&crate::store::pr_source_ref(id))
+        .find_reference(&crate::store::pr_source_ref_for(id, state.generation))
         .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
         .map_err(|_| format!("PR #{id} snapshot source ref missing"))?;
     let base_oid = store
         .repo()
-        .find_reference(&crate::store::pr_base_ref(id))
+        .find_reference(&crate::store::pr_base_ref_for(id, state.generation))
         .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
         .map_err(|_| format!("PR #{id} snapshot base ref missing"))?;
-    // The immutable-snapshot refs must still point at the AUTHORITATIVE
-    // `pr.created` snapshot. The comparison uses the ALREADY-ANCHORED gate
-    // state (F-008), NOT a fresh `/head` read — a concurrent rewrite between
-    // the gate read and the finalize cannot substitute a forged snapshot
-    // (shared invariant, one owner in the store).
+    // The current generation's immutable-snapshot refs must still point at
+    // the AUTHORITATIVE snapshot carried by the gate state. The comparison
+    // uses the ALREADY-ANCHORED gate state (F-008), NOT a fresh `/head`
+    // read — a concurrent rewrite between the gate read and the finalize
+    // cannot substitute a forged snapshot (shared invariant, one owner in
+    // the store).
     crate::store::EventStore::validate_snapshot_against_state(id, &state, source_oid, base_oid)?;
     let merge_base = state
         .merge_base
@@ -445,6 +446,112 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
         &mut lock_handle,
         &tmp,
     )
+}
+
+/// `git forge pr update <n>` — re-pin the PR to the source branch tip as a
+/// NEW immutable snapshot generation (t1). The `pr.update` event records
+/// old/new source_head, base_head, merge_base; generation-addressable refs
+/// `refs/forge/prs/<n>/source/g<k>` / `base/g<g>` pin the new snapshot
+/// atomically with the `/head` chain append. Refusals (before any write):
+/// unknown PR, abandoned (terminal), already merged, base branch moved (the
+/// recreate-or-revalidate remedy stays with #2 live-base), and a branch tip
+/// that already IS the snapshot source_head (nothing to update).
+pub(crate) fn cmd_pr_update(args: &[String]) -> Result<String, String> {
+    const USAGE: &str = "usage: git forge pr update <n>";
+    if args.len() != 1 {
+        return Err(USAGE.into());
+    }
+    let id = crate::cli::parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
+    // Read-only refusals first: every terminal/consistency check resolves
+    // nothing and writes nothing; the transaction below re-opens the store
+    // bound to the actor.
+    let store = crate::cli::open_store()?;
+    let head = crate::store::pr_head_ref(id);
+    if !crate::cli::store_has_ref(&store, &head) {
+        return Err(format!("PR #{id} does not exist"));
+    }
+    let chain = store.read_chain(&head).map_err(|e| e.to_string())?;
+    let state = crate::event::fold(&chain).pr;
+    if let Some(reason) = &state.abandoned {
+        return Err(format!("PR #{id} is abandoned: {reason}"));
+    }
+    if state.merge_result.is_some() {
+        return Err(format!("PR #{id} is already merged"));
+    }
+    let source_ref = state
+        .source_ref
+        .clone()
+        .ok_or_else(|| "PR has no source_ref".to_string())?;
+    let base_ref = state
+        .base_ref
+        .clone()
+        .ok_or_else(|| "PR has no base_ref".to_string())?;
+    let old_source = state
+        .source_head
+        .as_deref()
+        .map(|s| s.parse::<git2::Oid>())
+        .transpose()
+        .map_err(|_| "PR source_head invalid".to_string())?
+        .ok_or_else(|| "PR has no source_head".to_string())?;
+    let old_base = state
+        .base_head
+        .as_deref()
+        .map(|s| s.parse::<git2::Oid>())
+        .transpose()
+        .map_err(|_| "PR base_head invalid".to_string())?
+        .ok_or_else(|| "PR has no base_head".to_string())?;
+    let old_merge_base = state
+        .merge_base
+        .as_deref()
+        .map(|s| s.parse::<git2::Oid>())
+        .transpose()
+        .map_err(|_| "PR merge_base invalid".to_string())?
+        .ok_or_else(|| "PR has no merge_base".to_string())?;
+    // Re-pin to the LIVE branch tips. The source branch may have moved (the
+    // whole point of update); the base branch may NOT — a moved base keeps
+    // its recreate remedy (#2 live-base re-validation), so update refuses
+    // rather than silently adopting a base the PR was never reviewed against.
+    let resolve_tip = |branch: &str| -> Result<git2::Oid, String> {
+        store
+            .repo()
+            .find_reference(&format!("refs/heads/{branch}"))
+            .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
+            .map_err(|_| format!("branch '{branch}' does not exist"))
+    };
+    let new_source = resolve_tip(&source_ref)?;
+    let new_base = resolve_tip(&base_ref)?;
+    if new_base != old_base {
+        return Err(format!(
+            "base branch '{base_ref}' has moved since PR #{id} was created \
+             ({new_base} != snapshot {old_base}); recreate the PR or merge manually"
+        ));
+    }
+    if new_source == old_source {
+        return Err(format!(
+            "PR #{id} source branch tip is already the snapshot source_head \
+             ({old_source}); nothing to update"
+        ));
+    }
+    let new_merge_base = crate::git::require_single_merge_base(store.repo(), new_base, new_source)?;
+    let (store, actor) = crate::identity::open_mutation_store()?;
+    let generation = state.generation + 1;
+    store
+        .update_pr(
+            id,
+            old_source,
+            old_base,
+            old_merge_base,
+            new_source,
+            new_base,
+            new_merge_base,
+            generation,
+            &actor,
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(format!(
+        "PR #{id} updated to snapshot generation {generation} \
+         (source {source_ref} -> {new_source})"
+    ))
 }
 
 pub(crate) fn pr_merge_help() -> String {

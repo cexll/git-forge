@@ -75,6 +75,7 @@ fn event_kind_string_roundtrip_all_kinds() {
         EventKind::IssueClose,
         EventKind::IssueReopen,
         EventKind::PrCreated,
+        EventKind::PrUpdate,
         EventKind::PrComment,
         EventKind::PrReview,
         EventKind::PrMerge,
@@ -83,7 +84,7 @@ fn event_kind_string_roundtrip_all_kinds() {
     ] {
         assert_eq!(kind.as_str().parse::<EventKind>().unwrap(), kind);
     }
-    assert!("ci.check".parse::<EventKind>().is_ok());
+    assert!("pr.update".parse::<EventKind>().is_ok());
     assert!("pr.merge".parse::<EventKind>().is_ok());
     assert!("pr.abandoned".parse::<EventKind>().is_ok());
     assert!("issue.bogus".parse::<EventKind>().is_err());

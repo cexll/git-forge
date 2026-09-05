@@ -39,6 +39,7 @@ pub enum EventKind {
     IssueClose,
     IssueReopen,
     PrCreated,
+    PrUpdate,
     PrComment,
     PrReview,
     PrMerge,
@@ -54,6 +55,7 @@ impl EventKind {
             EventKind::IssueClose => "issue.close",
             EventKind::IssueReopen => "issue.reopen",
             EventKind::PrCreated => "pr.created",
+            EventKind::PrUpdate => "pr.update",
             EventKind::PrComment => "pr.comment",
             EventKind::PrReview => "pr.review",
             EventKind::PrMerge => "pr.merge",
@@ -73,6 +75,7 @@ impl std::str::FromStr for EventKind {
             "issue.close" => Self::IssueClose,
             "issue.reopen" => Self::IssueReopen,
             "pr.created" => Self::PrCreated,
+            "pr.update" => Self::PrUpdate,
             "pr.comment" => Self::PrComment,
             "pr.review" => Self::PrReview,
             "pr.merge" => Self::PrMerge,
@@ -334,6 +337,18 @@ pub struct PrState {
     pub ci_plan: Option<String>,
     /// Actor of the latest CI Check.
     pub ci_actor: Option<String>,
+    /// Current snapshot generation: 0 for the authoritative `pr.created`
+    /// snapshot, +1 per `pr.update` event. Names which source ref pins the
+    /// PR's current snapshot (`/source` for 0, `/source/g<k>` for k >= 1).
+    pub generation: u64,
+    /// Snapshot generation the current effective review decision was made
+    /// against. A decision from an older generation cannot satisfy the merge
+    /// gate (pre-update approvals are stale).
+    pub decision_generation: u64,
+    /// Snapshot generation the latest CI Check ran against. A Check from an
+    /// older generation cannot satisfy the merge gate (pre-update Checks are
+    /// stale).
+    pub ci_generation: u64,
     /// Timestamp of the latest CI Check.
     pub ci_ts: Option<String>,
 }
@@ -363,6 +378,15 @@ impl PrState {
             EventKind::PrReview => {
                 if let Some(decision) = str_field(&event.body, "decision") {
                     self.effective_decision = Some(decision);
+                    // Generation binding: a decision binds the snapshot
+                    // generation current at review time; events without the
+                    // field (pre-#1 chains) bind the generation current in
+                    // the fold, which keeps legacy gen-0 chains valid.
+                    self.decision_generation = event
+                        .body
+                        .get("generation")
+                        .and_then(JsonValue::as_u64)
+                        .unwrap_or(self.generation);
                 }
             }
             EventKind::PrMerge => {
@@ -370,6 +394,21 @@ impl PrState {
             }
             EventKind::PrAbandoned => {
                 self.abandoned = str_field(&event.body, "reason");
+            }
+            EventKind::PrUpdate => {
+                // Re-pin: the new snapshot generation replaces the old
+                // source_head; base_head/merge_base are recomputed by the
+                // writer (base movement is #2's live-base refresh, not
+                // update's job). The generation-addressable refs pin every
+                // generation immutably; the fold exposes only the latest.
+                self.source_head = str_field(&event.body, "new_source_head");
+                self.base_head = str_field(&event.body, "new_base_head");
+                self.merge_base = str_field(&event.body, "new_merge_base");
+                self.generation = event
+                    .body
+                    .get("generation")
+                    .and_then(JsonValue::as_u64)
+                    .unwrap_or(self.generation + 1);
             }
             EventKind::CiCheck => {
                 // The fold keeps the LATEST CI Check: each event overwrites the
@@ -379,6 +418,12 @@ impl PrState {
                 self.ci_plan = str_field(&event.body, "plan");
                 self.ci_actor = Some(event.actor.clone());
                 self.ci_ts = Some(event.ts.clone());
+                // Generation binding (same default rule as PrReview).
+                self.ci_generation = event
+                    .body
+                    .get("generation")
+                    .and_then(JsonValue::as_u64)
+                    .unwrap_or(self.generation);
             }
             _ => {}
         }

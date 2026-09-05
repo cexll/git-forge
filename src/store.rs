@@ -50,6 +50,41 @@ pub fn pr_source_ref(n: u64) -> String {
 pub fn pr_base_ref(n: u64) -> String {
     format!("refs/forge/prs/{n}/base")
 }
+
+/// Generation-addressable snapshot refs (t1 pr.update): generation k >= 1
+/// pins its source/base snapshot immutably under `gen/<k>/source` and
+/// `gen/<k>/base`. Generation 0 (the authoritative `pr.created` snapshot)
+/// keeps the plain `/source` and `/base` refs, which stay immutable forever.
+/// The `gen/<k>/` layout is not the ticket's illustrative `/source/g<k>`:
+/// the files ref backend refuses a D/F sibling pair (`/source` exists, so
+/// `/source/g1` cannot be created), while `gen/<k>/` shares no prefix with
+/// any existing per-PR ref.
+pub fn pr_source_generation_ref(n: u64, generation: u64) -> String {
+    format!("refs/forge/prs/{n}/gen/{generation}/source")
+}
+pub fn pr_base_generation_ref(n: u64, generation: u64) -> String {
+    format!("refs/forge/prs/{n}/gen/{generation}/base")
+}
+
+/// The ref that pins generation `generation`'s source snapshot: the L1
+/// `/source` ref for generation 0, the generation ref for k >= 1.
+pub fn pr_source_ref_for(n: u64, generation: u64) -> String {
+    if generation == 0 {
+        pr_source_ref(n)
+    } else {
+        pr_source_generation_ref(n, generation)
+    }
+}
+
+/// The ref that pins generation `generation`'s base snapshot.
+pub fn pr_base_ref_for(n: u64, generation: u64) -> String {
+    if generation == 0 {
+        pr_base_ref(n)
+    } else {
+        pr_base_generation_ref(n, generation)
+    }
+}
+
 pub fn pr_result_ref(n: u64) -> String {
     format!("refs/forge/prs/{n}/result")
 }
@@ -301,34 +336,6 @@ impl EventStore {
         self.chain_events_from_tip(tip)
     }
 
-    /// Validate that the `/source` and `/base` snapshot refs still point at the
-    /// AUTHORITATIVE `pr.created` snapshot (F-008): a retargeted ref would let
-    /// the merge gate / CI / diff operate on a different snapshot than the one
-    /// that was reviewed and CI-gated. Shared by `cmd_pr_merge`, `cmd_ci_run`
-    /// and `cmd_pr_diff` so the invariant lives in one owner.
-    pub(crate) fn validate_pr_snapshot_refs(
-        &self,
-        id: u64,
-        source_oid: Oid,
-        base_oid: Oid,
-    ) -> Result<(), String> {
-        // Read the head chain AND validate it is ANCHORED to PR `id` in ONE
-        // walk (a forged duplicate pr.created or a temporary head rewrite must
-        // not supply the snapshot fields), then compare the refs.
-        let tip = self
-            .current_tip(&pr_head_ref(id))
-            .map_err(|e| e.to_string())?
-            .ok_or_else(|| format!("PR #{id} does not exist"))?;
-        let (anchored, chain) = self
-            .read_pr_chain_anchored(id, tip)
-            .map_err(|e| e.to_string())?;
-        if !anchored {
-            return Err(format!("PR #{id} head chain is not anchored to PR #{id}"));
-        }
-        let state = crate::event::fold(&chain).pr;
-        Self::validate_snapshot_against_state(id, &state, source_oid, base_oid)
-    }
-
     /// Pure comparison of the snapshot refs against an AUTHORITATIVE
     /// `pr.created` state (the caller MUST have obtained it from an anchored
     /// read). The merge gate passes its ALREADY-ANCHORED gate state here, so a
@@ -550,19 +557,6 @@ impl BoundEventStore {
     pub fn read_chain(&self, entity_ref: &str) -> Result<Vec<Event>, StoreError> {
         self.inner.read_chain(entity_ref)
     }
-    /// Validate that the `/source` and `/base` snapshot refs still point at the
-    /// AUTHORITATIVE `pr.created` snapshot (F-008; delegation to the inner
-    /// store, the single owner).
-    pub(crate) fn validate_pr_snapshot_refs(
-        &self,
-        id: u64,
-        source_oid: Oid,
-        base_oid: Oid,
-    ) -> Result<(), String> {
-        self.inner
-            .validate_pr_snapshot_refs(id, source_oid, base_oid)
-    }
-
     /// Read the counter next value (delegation to the read surface).
     pub fn counter_next(&self) -> Result<u64, StoreError> {
         self.inner.counter_next()
@@ -867,6 +861,100 @@ impl BoundEventStore {
                         return Err(StoreError::RefExists(pr_head_ref(next)));
                     }
                     return Err(e);
+                }
+            }
+        }
+        Err(StoreError::Exhausted)
+    }
+
+    /// Re-pin PR `id` to `new_source` as a NEW immutable snapshot generation
+    /// (t1 pr.update). Writes the `pr.update` event commit (sole parent = the
+    /// observed `/head` tip, body: old/new source_head, old/new base_head,
+    /// old/new merge_base) and creates the generation refs
+    /// `/source/g<generation>` and `/base/g<generation>` → the new snapshot
+    /// OIDs, then ONE `git update-ref --stdin` transaction CASes `/head`
+    /// from the observed tip to the event commit. All-or-nothing: a failure
+    /// leaves `/head` and both generation refs unchanged.
+    ///
+    /// Retry (bounded, like `append_event`): on CAS conflict the SAME event
+    /// (retained UUID) is re-parented onto the fresh tip. The generation
+    /// refs are created with expected absence; if a concurrent update
+    /// already claimed this generation number, `RefExists` refuses — the
+    /// caller recomputes the generation from the fresh fold.
+    ///
+    /// Parameter order is fixed and documented like `create_pr`: id, then
+    /// the three old snapshot OIDs, then the three new ones, then the
+    /// generation number, then the actor.
+    #[allow(clippy::too_many_arguments)]
+    pub fn update_pr(
+        &self,
+        id: u64,
+        old_source: Oid,
+        old_base: Oid,
+        old_merge_base: Oid,
+        new_source: Oid,
+        new_base: Oid,
+        new_merge_base: Oid,
+        generation: u64,
+        actor: &str,
+    ) -> Result<Oid, StoreError> {
+        let head = pr_head_ref(id);
+        let source_gen_ref = pr_source_generation_ref(id, generation);
+        let base_gen_ref = pr_base_generation_ref(id, generation);
+        let mut body = HashMap::new();
+        body.insert(
+            "old_source_head".into(),
+            JsonValue::String(old_source.to_string()),
+        );
+        body.insert(
+            "new_source_head".into(),
+            JsonValue::String(new_source.to_string()),
+        );
+        body.insert(
+            "old_base_head".into(),
+            JsonValue::String(old_base.to_string()),
+        );
+        body.insert(
+            "new_base_head".into(),
+            JsonValue::String(new_base.to_string()),
+        );
+        body.insert(
+            "old_merge_base".into(),
+            JsonValue::String(old_merge_base.to_string()),
+        );
+        body.insert(
+            "new_merge_base".into(),
+            JsonValue::String(new_merge_base.to_string()),
+        );
+        body.insert("generation".into(), JsonValue::Number(generation as i64));
+        let event = Event::new(EventKind::PrUpdate, "pr", id, actor, body);
+        let message = format!("forge:{}:{}", event.kind.as_str(), event.entity_id);
+        let mut tip = self.inner.current_tip(&head)?;
+        for _ in 0..MAX_APPEND_RETRIES {
+            let parents: Vec<Oid> = tip.into_iter().collect();
+            let event_oid = self.write_event_commit(&event, &parents, &message)?;
+            let mut lines = vec![
+                format!("update {source_gen_ref} {new_source} {ZERO_OID}"),
+                format!("update {base_gen_ref} {new_base} {ZERO_OID}"),
+            ];
+            let old = tip
+                .map(|o| o.to_string())
+                .unwrap_or_else(|| ZERO_OID.to_string());
+            lines.push(format!("update {head} {event_oid} {old}"));
+            match self.inner.run_update_ref_stdin(&lines) {
+                Ok(()) => return Ok(event_oid),
+                Err(e) => {
+                    // A generation ref existing after a failed batch means a
+                    // concurrent update claimed this generation number: the
+                    // caller must re-fold and use the next one.
+                    if self.inner.current_tip(&source_gen_ref)?.is_some() {
+                        return Err(StoreError::RefExists(source_gen_ref));
+                    }
+                    let fresh = self.inner.current_tip(&head)?;
+                    if fresh == tip {
+                        return Err(e);
+                    }
+                    tip = fresh;
                 }
             }
         }

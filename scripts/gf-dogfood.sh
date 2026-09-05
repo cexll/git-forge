@@ -437,5 +437,30 @@ at "squash recycle merge ok with branch-kept" 0 "git forge pr merge 21 --squash 
 at "squash recycle worktree removed" 0 "[ ! -d \$WR/keep ] && ! git worktree list --porcelain | grep -qF \"\$WR/keep\""
 at "squash recycle branch still exists" 0 "git rev-parse -q --verify feat/gf-keep >/dev/null"
 
+# ── t1 / VAL-205/206: pr.update — stale approve refused, fresh approve+CI merges ──
+git checkout -q -B feat/gf-update "$BASE_BRANCH"
+printf 'u1\n' > gf-update.txt && git add gf-update.txt && git commit -qm "update c1"
+git checkout -q "$BASE_BRANCH"
+git forge pr create --source feat/gf-update --base "$BASE_BRANCH" "update PR" >/dev/null
+git forge pr review 22 --approve >/dev/null
+git forge ci run 22 >/dev/null   # green latest CI Check so the gate reaches the stale check (t3)
+git checkout -q feat/gf-update
+printf 'u2\n' >> gf-update.txt && git add gf-update.txt && git commit -qm "update fix round"
+U2="$(git rev-parse feat/gf-update)"
+git checkout -q feat/gf-update
+at "update re-pins as generation 1" 0 "git forge pr update 22 | grep -q 'generation 1'"
+at "generation ref pins the new tip" 0 "[ \"\$(git rev-parse refs/forge/prs/22/gen/1/source)\" = \"\$U2\" ]"
+at "generation-0 source ref immutable" 0 "[ \"\$(git rev-parse refs/forge/prs/22/source)\" != \"\$U2\" ]"
+at "pr.update event records new source head" 0 "git show refs/forge/prs/22/head:.forge/event.json | grep -qF '\"new_source_head\":\"'\$U2"
+at "pr.update event records old base head" 0 "git show refs/forge/prs/22/head:.forge/event.json | grep -q 'old_base_head'"
+at "show exposes generation 1" 0 "git forge pr show 22 | grep -q 'generation: 1'"
+at "stale approve merge refused" 0 "! git forge pr merge 22 2>/dev/null"
+at "stale refusal names the gate" 0 "git forge pr merge 22 2>&1 | grep -q 'stale'"
+git forge ci run 22 >/dev/null
+git forge pr review 22 --approve >/dev/null
+git checkout -q feat/gf-update
+at "fresh approve+CI merge passes" 0 "git forge pr merge 22"
+at "merged base contains post-update commit" 0 "git merge-base --is-ancestor \$U2 \"\$BASE_BRANCH\""
+
 echo "=========== DOGFOOD SUMMARY pass=$PASS fail=$FAIL ==========="
 [ "$FAIL" -eq 0 ]
