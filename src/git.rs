@@ -70,8 +70,10 @@ fn git_in_with_status(dir: &Path, args: &[&str]) -> GitResult {
 }
 
 /// Run `git` in the given working directory, returning (success, stdout,
-/// stderr). Used for worktree merge/rebase execution and cleanup.
-fn git_in(dir: &Path, args: &[&str]) -> (bool, String, String) {
+/// stderr). Used for worktree merge/rebase execution and cleanup; also by
+/// `merge_state.rs`'s refresh rollback (CR-03) to restore earlier-refreshed
+/// base worktrees to the pre-merge tip after the refs roll back.
+pub(crate) fn git_in(dir: &Path, args: &[&str]) -> (bool, String, String) {
     let r = git_in_with_status(dir, args);
     (r.status == Some(0), r.stdout, r.stderr)
 }
@@ -471,10 +473,29 @@ pub(crate) fn worktree_dirty(path: &Path) -> Result<bool, String> {
 /// reset would silently materialize a different tree). Err carries git's
 /// stderr. Debug-only test seam (VAL-107): `GIT_FORGE_TEST_FAIL_BASE_REFRESH=1`
 /// injects a refresh failure before any git call; inert in release builds.
-pub(crate) fn refresh_base_worktree(worktree: &Path, head_tip: &str) -> Result<(), String> {
+/// `=1` fails EVERY refresh; `=<path>` fails only that worktree (CR-03 test
+/// needs the first of two base worktrees to succeed, the second to fail).
+/// `base_tip` is the pre-merge base OID: the dirty re-check (CR-02) must
+/// compare the worktree against IT — at refresh time the branch ref
+/// already points at the result commit while index/worktree still hold the
+/// pre-merge tree, so `git status --porcelain` would flag the normal
+/// pending-refresh state as dirty.
+pub(crate) fn refresh_base_worktree(
+    worktree: &Path,
+    head_tip: &str,
+    base_tip: &str,
+) -> Result<(), String> {
     #[cfg(debug_assertions)]
-    if std::env::var("GIT_FORGE_TEST_FAIL_BASE_REFRESH").as_deref() == Ok("1") {
-        return Err("test seam: injected base-worktree refresh failure".to_string());
+    {
+        let seam = std::env::var("GIT_FORGE_TEST_FAIL_BASE_REFRESH");
+        let hit = match seam.as_deref() {
+            Ok("1") => true,
+            Ok(p) => p == worktree.to_string_lossy(),
+            Err(_) => false,
+        };
+        if hit {
+            return Err("test seam: injected base-worktree refresh failure".to_string());
+        }
     }
     let (okh, tip, _) = git_in(worktree, &["rev-parse", "HEAD"]);
     if !okh {
@@ -489,6 +510,29 @@ pub(crate) fn refresh_base_worktree(worktree: &Path, head_tip: &str) -> Result<(
             worktree.display(),
             tip,
             head_tip
+        ));
+    }
+    // CR-02 (code review): the pre-merge guard validated the worktree clean,
+    // but edits can land in the window between that check and this refresh
+    // (the merge side effects run in between). A bare `reset --hard` silently
+    // discards uncommitted work — refuse instead; the caller rolls the whole
+    // completion back (never split) and names this worktree. Baseline is the
+    // PRE-MERGE tip (base_tip), not HEAD: at this point HEAD resolves the
+    // result commit while index/worktree still hold the base tree, so a
+    // `status --porcelain` would misreport the pending-refresh state as dirty.
+    // Tracked edits: `git diff --quiet <base_tip>` (exit 1 = differences, a
+    // git error exits >1 with stderr set). Untracked: `ls-files --others`
+    // (index is still the base tree, so no HEAD-move artifacts; ignored files
+    // excluded per the #3 clean-worktree definition).
+    let (okd, _, derr) = git_in(worktree, &["diff", "--quiet", base_tip]);
+    let (_oku, uout, _) = git_in(worktree, &["ls-files", "--others", "--exclude-standard"]);
+    let dirty = (!okd && derr.trim().is_empty()) || !uout.trim().is_empty();
+    if dirty {
+        return Err(format!(
+            "cannot refresh base worktree {}: the worktree became dirty after the \
+             pre-merge validation (uncommitted changes, including untracked); \
+             commit, stash or clean it so the refresh never discards work",
+            worktree.display()
         ));
     }
     let (ok, _, err) = git_in(worktree, &["reset", "--hard"]);

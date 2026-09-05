@@ -336,8 +336,13 @@ fn refresh_base_worktrees(
     head_applied: Oid,
     applied_issue: Option<(u64, Oid, Oid)>,
 ) -> Result<(), String> {
+    let mut refreshed: Vec<&std::path::Path> = Vec::new();
     for wt in spec.base_worktrees {
-        if let Err(rerr) = crate::git::refresh_base_worktree(wt, &spec.result_commit.to_string()) {
+        if let Err(rerr) = crate::git::refresh_base_worktree(
+            wt,
+            &spec.result_commit.to_string(),
+            &spec.base_oid.to_string(),
+        ) {
             let base_branch_ref = format!("refs/heads/{}", spec.base_ref);
             let mut rollback = vec![
                 // Revert the base branch CAS (result_commit → base_head).
@@ -373,11 +378,43 @@ fn refresh_base_worktrees(
                 ));
             }
             let rolled = store.store().run_update_ref_stdin(&rollback);
+            // CR-03 (code review): earlier-refreshed worktrees sit on the result
+            // commit's tree. If the refs roll back but those trees stay, the base
+            // ref returns to base_oid while a checked-out worktree holds the
+            // result tree — the exact ref/tree split never-split forbids, and the
+            // next merge refuses a dirty base worktree forever. Restore them to
+            // the pre-merge tip (bare reset: their HEAD now resolves base_oid).
+            // Best-effort and named, never silent. Only after a SUCCESSFUL ref
+            // rollback: with refs still advanced the worktree HEAD still resolves
+            // the result commit and tree/ref agree.
+            let mut stale_trees: Vec<String> = Vec::new();
+            if rolled.is_ok() {
+                for done in &refreshed {
+                    let (okh, tip, _) = crate::git::git_in(done, &["rev-parse", "HEAD"]);
+                    if !okh || tip != spec.base_oid.to_string() {
+                        stale_trees.push(format!("{} (HEAD not on the base tip)", done.display()));
+                        continue;
+                    }
+                    let (ok, _, err) = crate::git::git_in(done, &["reset", "--hard"]);
+                    if !ok {
+                        stale_trees
+                            .push(format!("{} (reset --hard failed: {err})", done.display()));
+                    }
+                }
+            }
+            let stale_note = if stale_trees.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; additionally stale trees left at: {}",
+                    stale_trees.join("; ")
+                )
+            };
             let pending_note = match rolled {
-                Ok(()) => String::new(),
+                Ok(()) => stale_note,
                 Err(berr) => format!(
                     " ROLLBACK FAILED ({berr}): base ref is at {} — a partial \
-                     state exists and must be reconciled manually",
+                     state exists and must be reconciled manually{stale_note}",
                     spec.result_commit
                 ),
             };
@@ -387,6 +424,7 @@ fn refresh_base_worktrees(
                 wt.display()
             ));
         }
+        refreshed.push(wt);
     }
     Ok(())
 }
@@ -658,7 +696,7 @@ fn finish_merge_output(
         .workdir()
         .map(|p| p.to_path_buf())
         .ok_or_else(|| "cannot resolve repository working directory".to_string())?;
-    recycle_source_worktree(
+    match recycle_source_worktree(
         &repo_dir,
         source_ref,
         spec.source_head,
@@ -666,8 +704,16 @@ fn finish_merge_output(
         target,
         spec.strategy,
         force,
-    )
-    .map(|outcome| format!("{merged}; {outcome}"))
+    ) {
+        Ok(outcome) => Ok(format!("{merged}; {outcome}")),
+        // CR-01 (code review): a recycle epilogue failure (phase-2 refused-dirty,
+        // partial-leftover) does NOT undo the merge — the PR is terminal. Keep the
+        // merged line in the error so the adapter can classify the outcome (its
+        // contract: the merged line always precedes the recycle outcome, success
+        // or failure); a bare Err would send a terminal merge into the adapter's
+        // bridge-failure catch-all with the wrong remedy.
+        Err(recycle_err) => Err(format!("{merged}; {recycle_err}")),
+    }
 }
 
 /// ── #4 source-worktree recycle, phase 1: PRE-MERGE validation. A recycle

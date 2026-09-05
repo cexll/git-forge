@@ -752,9 +752,193 @@ test('F-009: the fixture enforces the real forge ff precondition — a non-ff sn
   assert.ok(!events(arm.missionDir).some((e) => e.pauseReason === 'forge_bridge_failed' || e.code === 'forge_bridge_failed'), 'notOnTop is its own taxonomy class, not a bridge failure');
 });
 
-test('F-010: the node matrix is wired into a standing gate — one justfile entry runs the forge adapter matrix', () => {
-  const justfile = fs.readFileSync(path.join(ROOT, 'justfile'), 'utf8');
-  assert.match(justfile, /forge-matrix:/, 'the standing gate entry exists');
-  assert.match(justfile, /forge-adapter\.test\.cjs/, 'it runs the forge adapter matrix');
-  assert.match(justfile, /dual-path-parity\.test\.cjs/, 'it runs dual-path parity');
+ test('F-010: the node matrix is wired into a standing gate — one justfile entry runs the forge adapter matrix', () => {
+   const justfile = fs.readFileSync(path.join(ROOT, 'justfile'), 'utf8');
+   assert.match(justfile, /forge-matrix:/, 'the standing gate entry exists');
+   assert.match(justfile, /forge-adapter\.test\.cjs/, 'it runs the forge adapter matrix');
+   assert.match(justfile, /dual-path-parity\.test\.cjs/, 'it runs dual-path parity');
+ });
+
+// ---------------------------------------------------------------------------
+// CR-04..CR-10 (code review round 1): adapter fixes
+// ---------------------------------------------------------------------------
+
+test('CR-04: cancel on a --forge mission closes the ticket Issue via the abandon marker (forgeAbandonTicketIssue exists and runs)', () => {
+  const arm = makeArm('cr04-cancel', { forge: true });
+  // t1 is pending; cancel it with a reason — the adapter must close its Issue.
+  const c = run(['cancel', '--mission-dir', arm.missionDir, '--feature', 't1', '--reason', 'strategy change'], arm.env);
+  assert.equal(c.status, 0, `cancel failed: ${c.stderr}`);
+  const s = forgeState(arm);
+  const issue = s.issues.issues.find((i) => i.body.startsWith('Ticket: t1'));
+  assert.ok(issue, 'the ticket Issue exists');
+  assert.equal(issue.open, false, 'cancel closes the ticket Issue');
+  const comment = issue.comments.find((c2) => c2.startsWith('forge-abandon-close: t1'));
+  assert.ok(comment, 'the abandon marker comment is present');
+  assert.match(comment, /strategy change/, 'the reason is in the comment');
+});
+
+ test('CR-05: a clean forge merge records feature_completed so milestonesInRepair clears gate_failed', () => {
+   const arm = makeArm('cr05-completed', { forge: true });
+   const worker = writeWorker();
+   driveFeature(arm, 't1', worker);
+   const ev = events(arm.missionDir);
+   assert.ok(ev.some((e) => e.event === 'feature_completed' && e.featureId === 't1'), 'clean merge records feature_completed');
+   // milestonesInRepair: a gate_failed pause on t1 followed by the completion must clear it.
+   const failing = new Map();
+   for (const e of ev) {
+     if (e.pauseReason === 'gate_failed') failing.set(e.featureId, true);
+     if (e.event === 'feature_completed') failing.set(e.featureId, false);
+   }
+   assert.equal(failing.get('t1'), false, 'feature_completed clears the gate_failed repair state');
+ });
+
+test('CR-06: a fix round after gate_failed supersedes the stale PR snapshot and recreates from the moved branch', () => {
+  const arm = makeArm('cr06-fixround', { forge: true });
+  const worker = writeWorker();
+  // Round 1: ci red → gate_failed pause (the PR exists with the OLD snapshot).
+  driveFeature(arm, 't1', worker, 0, () => armScenario(arm, { ciFail: true }));
+  const s1 = forgeState(arm);
+  const pr1 = s1.prs.prs.find((p) => p.title.startsWith('t1:'));
+  assert.ok(pr1, 'round 1 created a PR');
+  assert.equal(pr1.merged, null, 'round 1 did not merge');
+  // The fix round: the worker commits NEW work to the branch (the snapshot
+  // source moves), then the gate re-runs — the adapter must abandon the stale
+  // PR and recreate it from the moved branch, never re-run CI on the old
+  // immutable snapshot.
+  const fix = path.join(tmp, 'fix-worker.cjs');
+  fs.writeFileSync(fix, `
+'use strict';
+const { spawnSync } = require('node:child_process');
+const fs = require('node:fs'), path = require('node:path');
+const wd = process.env.WORKING_DIRECTORY;
+fs.writeFileSync(path.join(wd, 'fix.txt'), 'fix\\n');
+spawnSync('git', ['add', '-A'], { cwd: wd });
+spawnSync('git', ['commit', '-m', 'fix: t1'], { cwd: wd });
+const commitId = spawnSync('git', ['rev-parse', 'HEAD'], { cwd: wd, encoding: 'utf8' }).stdout.trim();
+const receipt = {
+  successState: 'success', commitId, repoPath: wd, validatorsPassed: true,
+  handoff: {
+    salientSummary: 'fixed', whatWasImplemented: 'fix', whatWasLeftUndone: '',
+    verification: { commandsRun: [{ command: 'true', exitCode: 0 }] },
+    tests: { added: [] }, discoveredIssues: [],
+  },
+};
+const res = spawnSync(process.execPath, [process.env.DEVFLOW_CLI, 'end-feature', '--mission-dir', process.env.MISSION_DIR,
+  '--feature', process.env.FEATURE_ID, '--worker-session', process.env.WORKER_SESSION_ID],
+  { input: JSON.stringify(receipt), env: process.env, encoding: 'utf8' });
+process.stderr.write(res.stderr || '');
+process.exit(res.status === 0 ? 0 : 1);
+`);
+
+  const claimOut = run(['claim', '--mission-dir', arm.missionDir, '--feature', 't1', '--json'], arm.env);
+  assert.equal(claimOut.status, 0, `re-claim failed: ${claimOut.stderr}`);
+  const claim = JSON.parse(claimOut.stdout);
+  const fixEnv = { ...claim.env, DEVFLOW_CLI: CLI };
+  delete fixEnv.DEVFLOW_FORGE_CALLER;
+  const fr = spawnSync(process.execPath, [fix], { env: fixEnv, encoding: 'utf8' });
+  assert.equal(fr.status, 0, `fix worker failed: ${fr.stderr}`);
+  const reviewPath = path.join(arm.missionDir, 'reviews', 't1-r2.json');
+  fs.writeFileSync(reviewPath, JSON.stringify({ findings: [], summary: 'clean' }, null, 2));
+  const rec = run(['record-review', '--mission-dir', arm.missionDir, '--feature', 't1', '--report', reviewPath, '--round', '2'], arm.env);
+  assert.equal(rec.status, 0, `record-review r2 failed: ${rec.stderr}`);
+  const settle = run(['next-feature', '--mission-dir', arm.missionDir], arm.env);
+  assert.equal(settle.status, 0, settle.stderr);
+  const s2 = forgeState(arm);
+  const prs = s2.prs.prs.filter((p) => p.title.startsWith('t1:'));
+  assert.ok(prs.length >= 2, 'the stale PR was superseded and a new one created');
+  const abandoned = prs.find((p) => p.abandoned);
+  assert.ok(abandoned, 'the stale PR is abandoned');
+  const merged = prs.find((p) => p.merged);
+  assert.ok(merged, 'the recreated PR merged');
+  const ev = events(arm.missionDir);
+  assert.ok(ev.some((e) => e.event === 'forge_pr_superseded' && e.oldPrId === pr1.id), 'the supersede is mirrored with old AND new ids');
+});
+
+ test('CR-07: a proof-ticket close failure after a completed validator does not wedge the milestone (trio runs first)', () => {
+     const arm = makeArm('cr07-closefail', { forge: true });
+   // Inject a report-only validation feature so a proof ticket exists.
+   const amend = {
+             id: 'v-p1', description: 'validate', dependsOn: ['t1'], milestone: 'ms1',
+    validatorKind: 'assertions', fulfills: [], proves: ['VAL-001', 'VAL-002'], skillName: 'user-validate-flow',
+    expectedBehavior: ['report exists'], reportOnly: true,
+    cause: { kind: 'review', itemId: 'F-901' },
+  };
+     const amendPath = path.join(tmp, 'amend-v-p1-cr07.json');
+  fs.writeFileSync(amendPath, JSON.stringify(amend, null, 2));
+  const am = run(['amend', '--mission-dir', arm.missionDir, '--add-feature', amendPath], arm.env);
+  assert.equal(am.status, 0, `amend failed: ${am.stderr}`);
+  // The amended plan must be committed before the next claim (dirty_worktree gate).
+  const gc = spawnSync('git', ['add', '-A'], { cwd: arm.repo, encoding: 'utf8' });
+  assert.equal(gc.status, 0, `git add failed: ${gc.stderr}`);
+  const gcm = spawnSync('git', ['commit', '-m', 'amend: v-p1'], { cwd: arm.repo, encoding: 'utf8' });
+  assert.equal(gcm.status, 0, `git commit failed: ${gcm.stderr}`);
+  // Drive t1 to completion, then the validator with a close failure injected.
+   const worker = writeWorker();
+   driveFeature(arm, 't1', worker);
+   armScenario(arm, { issueCloseFail: true });
+   driveReportValidator(arm, 'v-p1');
+   const ev = events(arm.missionDir);
+      assert.ok(ev.some((e) => e.event === 'forge_ticket_close_failed'), 'the close failure is mirrored, not fatal');
+  // The trio is the point: a close failure AFTER feature_completed must not
+  // abort between the completion and the milestone bookkeeping (ms1 also holds
+  // t2, so no milestone_completed fires yet — the invariant is that v-p1 IS
+  // completed and the settle returned cleanly, which driveReportValidator
+  // already asserted).
+  const rt = runtime(arm.missionDir);
+  assert.equal(rt.features['v-p1'].status, 'completed', 'the validator feature completed despite the close failure');
+   const s = forgeState(arm);
+   const issue = s.issues.issues.find((i) => i.body.startsWith('Ticket: v-p1'));
+   assert.equal(issue.open, true, 'the issue stays open for the retry path');
+ });
+
+test('CR-08: a transient pr show failure pauses forge_bridge_failed instead of duplicating the PR', () => {
+  const arm = makeArm('cr08-transient', { forge: true });
+  const worker = writeWorker();
+  // Round 1: merge gate runs and creates the PR, then the merge itself fails
+  // with a bridge error (the PR exists). Round 2 re-runs the gate: a
+  // transient `pr show` failure must NOT null the prId (which would recreate
+  // the PR) — it pauses recoverably.
+  driveFeature(arm, 't1', worker, 0, () => armScenario(arm, { mergeFail: true }));
+  const s1 = forgeState(arm);
+  const pr1 = s1.prs.prs.find((p) => p.title.startsWith('t1:'));
+  assert.ok(pr1, 'round 1 created the PR');
+  // Inject a transient show failure for the re-run.
+  armScenario(arm, { prShowFail: true });
+  // Round 2: the same feature is already in_review (mergeFail left it there);
+  // no re-claim — the gate re-runs on the persisted prId.
+  const reviewPath = path.join(arm.missionDir, 'reviews', 't1-r2.json');
+  fs.writeFileSync(reviewPath, JSON.stringify({ findings: [], summary: 'clean' }, null, 2));
+  const rec = run(['record-review', '--mission-dir', arm.missionDir, '--feature', 't1', '--report', reviewPath, '--round', '2'], arm.env);
+  assert.equal(rec.status, 0, `record-review r2 failed: ${rec.stderr}`);
+  const settle = run(['next-feature', '--mission-dir', arm.missionDir], arm.env);
+  assert.equal(settle.status, 0, settle.stderr);
+  // The pause is RECOVERABLE — recoverMission clears a RECOVERABLE_PAUSE at the
+  // end of the same settle round (state back to orchestrator_turn). What must
+  // hold: the merge gate mirrored forge_bridge_failed (the CR-08 branch ran,
+  // prId was NOT nulled) and NO duplicate PR was created.
+  const ev2 = events(arm.missionDir);
+  assert.ok(
+    ev2.some((e) => e.event === 'forge_bridge_failed' && e.featureId === 't1'),
+    'the transient show failure mirrored forge_bridge_failed'
+  );
+  const s2 = forgeState(arm);
+  const prs = s2.prs.prs.filter((p) => p.title.startsWith('t1:'));
+  assert.equal(prs.length, 1, 'no duplicate PR was created');
+});
+
+test('CR-09: waive-assertion refuses a PENDING (never-run) assertion', () => {
+  const arm = makeArm('cr09-waive', { forge: true });
+  const c = run(['waive-assertion', '--mission-dir', arm.missionDir, '--assertion', 'VAL-001', '--reason', 'skip it'], arm.env);
+  assert.notEqual(c.status, 0, 'waiving a pending assertion must refuse');
+  assert.match(c.stderr, /never been run|not_attempted/, 'the refusal names the pending state');
+  const ev = events(arm.missionDir);
+  assert.ok(!ev.some((e) => e.event === 'assertion_waiver'), 'no waiver event was written');
+});
+
+test('CR-10: forgeFileActiveTickets has exactly one definition (the dead duplicate is gone)', () => {
+  const src = fs.readFileSync(path.join(ROOT, 'scripts', 'devflow.cjs'), 'utf8');
+  const defs = src.match(/function forgeFileActiveTickets/g) || [];
+  assert.equal(defs.length, 1, 'exactly one definition survives');
+  const abandons = src.match(/function forgeAbandonTicketIssue/g) || [];
+  assert.equal(abandons.length, 1, 'forgeAbandonTicketIssue is defined exactly once');
 });

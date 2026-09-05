@@ -717,6 +717,90 @@ fn refresh_failure_with_closes_rolls_all_refs_back() {
     assert_no_temp_worktree_pr(&dir, 2);
 }
 
+/// CR-02 (code review): dirt appearing in a checked-out BASE worktree between
+/// the pre-merge guard and the #3 refresh (the merge side effects run in
+/// between) must NOT be silently destroyed by the refresh's bare
+/// `reset --hard`. The refresh re-checks cleanliness and refuses; the whole
+/// completion rolls back (never split) and the uncommitted work survives.
+/// The shim appends an untracked file on the SECOND `git -C <dir> status
+/// --porcelain` call: call #1 is the pre-merge guard, call #2 is the refresh
+/// re-check — the dirt appears exactly in the guard→refresh window.
+#[test]
+fn refresh_refuses_dirt_that_appears_after_guard() {
+    let dir = tmpdir("refreshdirty");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "refresh dirty PR");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let head_before = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+    // The refresh runs `git -C <worktree>` with the CANONICAL path (the
+    // porcelain worktree list resolves symlinks, e.g. /private/var vs /var on
+    // macOS), so the shim must match the canonical form — a raw `dir.to_str()`
+    // could silently never trigger.
+    let dirstr = std::fs::canonicalize(&dir)
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    // The refresh's CR-02 re-check is `git -C <dir> diff --quiet <base_tip>`
+    // (baseline the PRE-MERGE tip; the first such call IS the re-check — the
+    // pre-merge guard uses `status --porcelain`, not diff). Inject the dirt on
+    // that first diff call so it appears exactly in the guard→refresh window.
+    let shim = make_git_shim(
+        "refresh-dirty-shim",
+        "if [ \"$1\" = \"-C\" ] && [ \"$2\" = \"$GF_TARGET\" ] && \
+         [ \"$3\" = \"diff\" ] && [ \"$4\" = \"--quiet\" ]; then\n\
+         n=$(cat \"$GF_ST_COUNT\" 2>/dev/null || echo 0)\n\
+         n=$((n+1))\n\
+         echo \"$n\" > \"$GF_ST_COUNT\"\n\
+         if [ \"$n\" -ge 1 ]; then\n\
+         echo dirt >> \"$GF_TARGET/dirt.txt\"\n\
+         fi\n\
+         fi",
+    );
+    let counter = shim.join("count");
+    std::fs::write(&counter, "0").unwrap();
+    let (cm, om, em) = run_forge(
+        &dir,
+        Some(&shim),
+        &[
+            ("GF_TARGET", dirstr.as_str()),
+            ("GF_ST_COUNT", counter.to_str().unwrap()),
+        ],
+        &["forge", "pr", "merge", "1"],
+    );
+    assert_ne!(cm, 0, "dirty-at-refresh must fail the merge: {om} {em}");
+    let both = format!("{om} {em}");
+    assert!(
+        both.contains("became dirty"),
+        "stderr must name the dirty refusal: {both}"
+    );
+    assert!(
+        !both.contains("ROLLBACK FAILED"),
+        "the atomic rollback must succeed (never-split): {both}"
+    );
+    // Refs agree with the worktree: base rolled back, PR chain restored.
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base must roll back to the pre-merge tip"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        head_before,
+        "PR head chain must be restored"
+    );
+    // The injected uncommitted work SURVIVES (no reset --hard ran).
+    assert!(
+        dir.join("dirt.txt").exists(),
+        "the uncommitted dirt must survive the refusal"
+    );
+    let (_, head, _) = git(&dir, &["rev-parse", "HEAD"]);
+    assert_eq!(head, base_before, "worktree HEAD agrees with the base ref");
+    let (cs, os, _) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert!(cs == 0, "pr show must succeed after the refusal");
+    assert!(!os.contains("merged:"), "no pr.merge recorded: {os}");
+}
+
 #[test]
 fn conflict_aborts_cleans_and_leaves_refs_unchanged() {
     let dir = tmpdir("conflict");
@@ -4092,7 +4176,7 @@ fn recycle_partial_leftover_on_removal_failure_base_untouched() {
     let source_before = ref_oid(&dir, "refs/heads/feature").unwrap();
     // Inject the partial-removal: lock the source worktree (debug seam) so
     // the recycle's `git worktree remove --force` fails.
-    let (cm, om, em) = run_forge(
+    let (_cm, om, em) = run_forge(
         &dir,
         None,
         &[("GIT_FORGE_TEST_FAIL_RECYCLE_REMOVE", wts)],
@@ -4106,11 +4190,20 @@ fn recycle_partial_leftover_on_removal_failure_base_untouched() {
             wts,
         ],
     );
-    assert_ne!(cm, 0, "partial removal must exit non-zero: {om} {em}");
+
     let both = format!("{om} {em}");
     assert!(
         both.contains(&format!("partial-leftover({wts})")),
         "outcome must name partial-leftover(<path>) with the exact path: {both}"
+    );
+    // CR-01 (code review): a recycle epilogue failure does NOT undo the merge —
+    // the PR is terminal — so the error output must still carry the merged line
+    // (the adapter's contract: the merged line always precedes the recycle
+    // outcome). A bare `recycle outcome: partial-leftover(...)` would send a
+    // terminal merge into the adapter's bridge-failure catch-all.
+    assert!(
+        both.contains("merged PR #1 into main"),
+        "the merged line must survive the recycle failure: {both}"
     );
     // The merge itself is intact: PR merged onto the source head.
     assert_eq!(
@@ -4190,6 +4283,13 @@ fn recycle_phase2_dirty_refuses_without_force() {
     assert!(
         both.contains("refused-dirty") && both.contains(wts),
         "outcome must be refused-dirty naming the worktree path: {both}"
+    );
+    // CR-01: phase-2 refused-dirty is a TERMINAL merge with a recycle refusal —
+    // the error must carry the merged line so the adapter classifies it as
+    // worktree_partial_removal, never as "PR NOT merged" (the phase-1 class).
+    assert!(
+        both.contains("merged PR #1 into main"),
+        "the merged line must survive the phase-2 refusal: {both}"
     );
     // The merge itself is terminal (recycle refusal never undoes it).
     assert_eq!(

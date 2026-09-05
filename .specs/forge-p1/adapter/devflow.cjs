@@ -1957,15 +1957,6 @@ function forgeEnsureTicketIssue(missionDir, state, feature) {
   return issueId;
 }
 
-/** File every active (non-cancelled) ticket; used at propose and after amend. */
-function forgeFileActiveTickets(missionDir, state, featuresDoc) {
-  for (const f of featuresDoc.features) {
-    if (f.status === 'cancelled') continue;
-    if (!f.issueId) f.issueId = forgeEnsureTicketIssue(missionDir, state, f);
-  }
-  writeFeaturesDoc(missionDir, featuresDoc);
-}
-
 /** PR labels mirror the ticket vocabulary (clause 4): on Issues and PRs alike. */
 function forgePrLabels(state, feature) {
   const labels = forgeIssueLabels(state, feature);
@@ -2077,7 +2068,42 @@ function forgeMergeFeature(missionDir, state, featuresDoc, feature) {
         logEvent(missionDir, 'forge_pr_superseded', { featureId: feature.id, oldPrId: prId, newPrId: null, reason: 'previous PR was abandoned' });
         prId = null;
       } else if (!show.ok) {
-        prId = null;
+        // CR-08 (code review): only a CONFIRMED missing PR (the forge's own
+        // wording) is recreated — a transient `pr show` failure (bridge error,
+        // forge crash, spawn failure) would drop prId and duplicate the PR on
+        // the next gate. Transient → recoverable bridge pause (idempotent
+        // re-run, no duplicate).
+        const err = `${show.stderr}\n${show.stdout}`;
+        if (/PR #\d+ does not exist/.test(err)) {
+          prId = null;
+        } else {
+          const be = forgeBridgeError(`git forge pr show ${prId} failed: ${err.slice(0, 300)}`);
+          state.state = 'paused';
+          state.pauseReason = 'forge_bridge_failed';
+          writeState(missionDir, state);
+          logEvent(missionDir, 'merge_blocked', { featureId: feature.id, code: 'forge_bridge_failed' });
+          logEvent(missionDir, 'forge_bridge_failed', { featureId: feature.id, pauseReason: 'forge_bridge_failed', error: String(be.message).slice(0, 300) });
+          writeFeaturesDoc(missionDir, featuresDoc);
+          return { ok: false, code: 'forge_bridge_failed', message: be.message };
+        }
+      } else {
+        // CR-06 (code review): the forge's PR snapshot is IMMUTABLE — ci run
+        // and pr merge execute against the snapshot refs, never against
+        // refs/heads/<branch>. A gate_failed fix round commits new work to
+        // feature.branch; reusing the persisted prId would run CI against the
+        // OLD snapshot forever (red → fix → red …). Detect a moved source
+        // (the `diff: <base>...<source>` line the PR was created from vs the
+        // live branch tip) and supersede the PR so the next round recreates
+        // it from the fixed branch.
+        const snapMatch = show.stdout.match(/^diff: [0-9a-f]{7,64}\.\.\.([0-9a-f]{7,64})$/m);
+        if (snapMatch) {
+          const live = git(['rev-parse', '--verify', `refs/heads/${feature.branch}`], state.repoRoot);
+          if (live.ok && live.stdout !== snapMatch[1]) {
+            logEvent(missionDir, 'forge_pr_superseded', { featureId: feature.id, oldPrId: prId, newPrId: null, reason: 'source moved since snapshot (fix round); recreating' });
+            forgeRun(state, ['pr', 'abandon', String(prId), '--reason', 'superseded: source moved after a fix round; recreating the snapshot']);
+            prId = null;
+          }
+        }
       }
     }
     if (!prId) {
@@ -2292,6 +2318,12 @@ function forgeMergeFeature(missionDir, state, featuresDoc, feature) {
       return { ok: true, commitId, outcome, partial: true };
     }
     logEvent(missionDir, 'forge_recycle_outcome', { featureId: feature.id, prId, outcome: outcome || 'not-requested' });
+    // CR-05 (code review): milestonesInRepair keys on `feature_completed` to
+    // clear a milestone's gate_failed state after a ci-red round — the probe
+    // path emits it, the clean merge path did not, so a milestone that went
+    // red and then merged clean stayed "in repair" forever (its repair budget
+    // kept being charged for nothing).
+    logEvent(missionDir, 'feature_completed', { featureId: feature.id, commitId, prId });
     // Now clear the pointers per the structured outcome.
     feature.worktree = null;
     if (outcome && /branch-kept/.test(outcome)) {
@@ -4050,16 +4082,28 @@ function applyReceipt(missionDir, state, featuresDoc, feature, workerSessionId, 
       feature.status = 'completed';
       writeState(missionDir, state);
       logEvent(missionDir, 'feature_completed', { featureId: feature.id, commitId: receipt.commitId });
-      // Proof tickets close via the adapter, never the validator: one comment
-      // (evidence pointer + status) + close (clause 2). Only validator features
-      // are proof tickets; a report-only review closes through review flow.
-      if (state.forge === true && feature.validatorKind) {
-        forgeCloseProofTicket(missionDir, state, feature, receipt);
-      }
       recordMilestoneCompletions(missionDir, featuresDoc.features);
       injectMilestoneValidators(missionDir, featuresDoc, state);
       sealCompletedMilestones(missionDir, featuresDoc.features, state);
       writeFeaturesDoc(missionDir, featuresDoc);
+      // Proof tickets close via the adapter, never the validator: one comment
+      // (evidence pointer + status) + close (clause 2). Only validator features
+      // are proof tickets; a report-only review closes through review flow.
+      // CR-07 (code review): this runs AFTER the milestone trio — a close
+      // failure must not abort between `feature_completed` and the trio, which
+      // would wedge the milestone (the probe skips completed features, so a
+      // skipped trio never gets a second chance). The issue stays open for the
+      // reconcile probe / close-forge-ticket to retry; the milestone is done.
+      if (state.forge === true && feature.validatorKind) {
+        try {
+          forgeCloseProofTicket(missionDir, state, feature, receipt);
+        } catch (closeErr) {
+          logEvent(missionDir, 'forge_ticket_close_failed', {
+            featureId: feature.id, issueId: feature.issueId,
+            error: String(closeErr.message || closeErr).slice(0, 300),
+          });
+        }
+      }
       return { settled: true, stop: false, outcome: 'completed' };
     }
     // Everything else has built on its own branch and is not done until that branch has been
@@ -6161,6 +6205,22 @@ function cmdCloseForgeTicket(args) {
   process.stdout.write(`closed ticket issue #${feature.issueId} for ${feature.id} (status: ${status})\n`);
 }
 
+/**
+ * Close one ticket's Issue on the CANCEL / retry-limit path, the way clause 2
+ * names for the non-code exits: one marker comment (the abandon reason) +
+ * close, exactly-one-comment idempotence mirroring forgeCloseTicketIssue.
+ * Called from applyReceipt's retry-limit branch and cmdCancel. The mission is
+ * already terminal (failed/cancelled) — a bridge failure here throws and the
+ * caller's pause keeps the close retryable.
+ */
+function forgeAbandonTicketIssue(missionDir, state, feature, reason) {
+  if (!feature.issueId) return;
+  forgeCloseTicketIssue(missionDir, state, feature, {
+    marker: `forge-abandon-close: ${feature.id}`,
+    body: `reason: ${reason}`,
+  });
+}
+
 
 // ---------------------------------------------------------------------------
 // validation-check subcommand: enforce the acceptance rules in
@@ -7132,8 +7192,18 @@ function cmdWaiveAssertion(args) {
     throw new RejectError(`assertion '${id}' not in this mission's validation contract`, 'unknown_assertion');
   }
   const ledger = missionLedger(missionDir, state);
-  if (ledger.assertions[id] && ledger.assertions[id].status === 'passed') {
+  const st = ledger.assertions[id] ? ledger.assertions[id].status : 'pending';
+  if (st === 'passed') {
     throw new RejectError(`assertion '${id}' is already proven; nothing to waive`, 'assertion_already_proven');
+  }
+  // CR-09 (code review): the documented contract refuses a PENDING assertion —
+  // waiving an un-ran assertion hides work never attempted. Only a verdict
+  // that was actually produced (fail/blocked/skipped) can be discharged.
+  if (st === 'pending') {
+    throw new RejectError(
+      `assertion '${id}' has never been run (pending); waiving an un-ran assertion hides work never attempted — run the validator first`,
+      'assertion_not_attempted'
+    );
   }
   logEvent(missionDir, 'assertion_waiver', { assertionId: id, reason: String(reason) });
   const after = missionLedger(missionDir, state);

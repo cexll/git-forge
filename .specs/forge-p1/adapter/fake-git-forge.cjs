@@ -140,11 +140,14 @@ function prShowText(p) {
   out += `ci: ${p.ci}\n`;
   out += `base: ${p.base}\n`;
   out += `source: ${p.source}\n`;
+  // Real forge contract (cli.rs cmd_pr_show): the immutable snapshot pair.
+  // The adapter's CR-06 stale-snapshot check parses the source OID from it.
+  out += `diff: ${p.base_head}...${p.source_head}\n`;
   if (p.labels.length) out += `labels: ${p.labels.join(', ')}\n`;
   if (p.closes) out += `closes: #${p.closes}\n`;
   for (const c of p.comments) out += `comment: ${c}\n`;
   return out.trimEnd();
-}
+ }
 
 if (group === 'issue') {
   const { flags, positionals } = parse(rest);
@@ -175,6 +178,7 @@ if (group === 'issue') {
     const id = Number(positionals[0]);
     const i = issues.issues.find((x) => x.id === id);
     if (!i) finish(1, '', `issue #${id} does not exist`);
+    if (take('issueCloseFail')) finish(1, '', 'fake-forge: bridge down (issueCloseFail)');
     i.open = sub === 'reopen';
     finish(0, `issue #${id} ${sub === 'close' ? 'closed' : 'reopened'}`);
   }
@@ -222,6 +226,11 @@ if (group === 'pr') {
     const id = Number(positionals[0]);
     const p = prs.prs.find((x) => x.id === id);
     if (!p) finish(1, '', `PR #${id} does not exist`);
+    // CR-08: `prShowFail` is a PERSISTENT injection for the transient-failure
+    // test — a consume-once flag would be eaten by the reconcile probe's own
+    // `pr show` before the merge gate re-runs. The test clears it by removing
+    // the scenario file.
+    if (scenario.prShowFail === true) finish(1, '', 'fake-forge: bridge down (prShowFail)');
     finish(0, prShowText(p));
   } else if (sub === 'review') {
     const id = Number(positionals[0]);
