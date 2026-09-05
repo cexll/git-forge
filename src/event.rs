@@ -349,6 +349,17 @@ pub struct PrState {
     /// older generation cannot satisfy the merge gate (pre-update Checks are
     /// stale).
     pub ci_generation: u64,
+    /// Live base-branch tip the current effective review decision was made
+    /// against (#2 result-bound review): `pr.review` records the base branch
+    /// tip at review time, so the live-base merge gate can require a decision
+    /// bound to the CURRENT base tip when the base has moved since the PR
+    /// snapshot. Legacy events without the field fold as `None`.
+    pub decision_base_head: Option<String>,
+    /// Live base-branch tip the latest CI Check was taken against (#2
+    /// result-bound CI): `ci.check` records the base branch tip at run time
+    /// for the same live-base gate requirement. Legacy events fold as
+    /// `None`.
+    pub ci_base_head: Option<String>,
     /// Timestamp of the latest CI Check.
     pub ci_ts: Option<String>,
 }
@@ -387,6 +398,11 @@ impl PrState {
                         .get("generation")
                         .and_then(JsonValue::as_u64)
                         .unwrap_or(self.generation);
+                    // #2 result-bound review: the decision binds the live
+                    // base-branch tip it was taken against; events without
+                    // the field (pre-#2 chains) fold as None and only the
+                    // unmoved-base merge path accepts them.
+                    self.decision_base_head = str_field(&event.body, "base_head");
                 }
             }
             EventKind::PrMerge => {
@@ -424,6 +440,9 @@ impl PrState {
                     .get("generation")
                     .and_then(JsonValue::as_u64)
                     .unwrap_or(self.generation);
+                // #2 result-bound CI: the Check binds the live base-branch
+                // tip it ran against (same None default as PrReview).
+                self.ci_base_head = str_field(&event.body, "base_head");
             }
             _ => {}
         }

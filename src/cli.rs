@@ -480,6 +480,13 @@ fn cmd_pr_review(args: &[String]) -> Result<String, String> {
         "generation".into(),
         JsonValue::Number(state.generation as i64),
     );
+    // #2 result-bound review: the decision also records the LIVE base-branch
+    // tip at review time, so the live-base merge gate can require a decision
+    // bound to the current base tip when the base has moved since the PR
+    // snapshot.
+    if let Some(bh) = live_base_head_entry(store.repo(), state.base_ref.as_deref()) {
+        body.insert("base_head".into(), bh);
+    }
     let ev = Event::new(EventKind::PrReview, "pr", id, &actor, body);
     store.append_event(&r, &ev).map_err(|e| e.to_string())?;
     Ok(format!("reviewed PR #{id} ({decision})"))
@@ -876,7 +883,12 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
     body.insert("plan".into(), json_str(plan.label()));
     // Generation binding: the Check validates the snapshot it ran against;
     // the merge gate refuses a Check from an older generation.
-    body.insert("generation".into(), JsonValue::Number(generation as i64));
+    // #2 result-bound CI: the Check also records the LIVE base-branch tip at
+    // run time, so the live-base merge gate can require a Check bound to the
+    // current base tip when the base has moved since the PR snapshot.
+    if let Some(bh) = live_base_head_entry(store.repo(), state.base_ref.as_deref()) {
+        body.insert("base_head".into(), bh);
+    }
     let ev = Event::new(EventKind::CiCheck, "pr", id, &actor, body);
     // Record the outcome — a failing plan still appends a `failure` CI Check
     // (VAL-002) before the command exits nonzero.
@@ -913,6 +925,18 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
             plan.label()
         ))
     }
+}
+
+/// #2 result-bound gate input: the LIVE base-branch tip (`base_head` body
+/// entry) for a `ci.check` or `pr.review` event, resolved at write time, so
+/// the live-base merge gate can require gate inputs bound to the current
+/// base tip when the base has moved since the PR snapshot. Extracted from
+/// `cmd_ci_run` (clippy too_many_lines); `cmd_pr_review` calls it too.
+fn live_base_head_entry(repo: &git2::Repository, base_ref: Option<&str>) -> Option<JsonValue> {
+    repo.find_reference(&format!("refs/heads/{}", base_ref.unwrap_or("")))
+        .ok()
+        .and_then(|r| r.target())
+        .map(|o| json_str(&o.to_string()))
 }
 
 /// Dispatch a `git forge ci` subcommand. `argv` excludes the `ci` token.

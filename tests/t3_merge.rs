@@ -153,6 +153,21 @@ fn make_feature(dir: &Path, branch: &str, content: &str) {
     assert!(c == 0, "checkout main failed: {e}");
 }
 
+/// Like [`make_feature`] but the committed FILE is caller-chosen, so two
+/// PRs forked from one base never conflict on the same path (#2 live-base
+/// scenarios).
+fn make_feature_file(dir: &Path, branch: &str, file: &str, content: &str) {
+    let (c, _, e) = git(dir, &["checkout", "-q", "-b", branch]);
+    assert!(c == 0, "checkout -b {branch} failed: {e}");
+    std::fs::write(dir.join(file), content).unwrap();
+    let (c, _, e) = git(dir, &["add", file]);
+    assert!(c == 0, "add {file} failed: {e}");
+    let (c, _, e) = git(dir, &["commit", "-q", "-m", &format!("{branch} commit")]);
+    assert!(c == 0, "commit {branch} failed: {e}");
+    let (c, _, e) = git(dir, &["checkout", "-q", "main"]);
+    assert!(c == 0, "checkout main failed: {e}");
+}
+
 /// Checkout `branch` so a merge runs while the base (`main`) is NOT checked
 /// out anywhere — required by the checked-out base guard.
 fn checkout(dir: &Path, branch: &str) {
@@ -2342,8 +2357,8 @@ fn finalize_failure_after_barrier_leaves_refs_unchanged() {
 
 #[test]
 fn merge_git_spawn_failure_is_clean_error() {
-    // git.rs:44-49 (spawn-failure branch) + 151-152 — the first git call in
-    // the merge flow is the checked-out-base guard's `git worktree list`; with
+    // git.rs:44-49 (spawn-failure branch) — with #2, the FIRST git call in
+    // the merge flow is the live-base `git merge-base` recomputation; with
     // no git on PATH it cannot spawn and the error is user-facing, no panic.
     let dir = tmpdir("nogit");
     init_repo(&dir);
@@ -2361,10 +2376,7 @@ fn merge_git_spawn_failure_is_clean_error() {
     let code = out.status.code().unwrap_or(-1);
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert_ne!(code, 0, "merge must fail when git cannot be spawned");
-    assert!(
-        stderr.contains("git worktree list failed"),
-        "stderr: {stderr}"
-    );
+    assert!(stderr.contains("git merge-base failed"), "stderr: {stderr}");
     assert_eq!(
         ref_oid(&dir, "refs/heads/main").unwrap(),
         base_before,
@@ -3692,10 +3704,12 @@ fn ff_non_ffable_pr_rejected_naming_rebase_remedy() {
 }
 
 #[test]
-fn ff_moved_base_refuses_naming_recreate_or_rebase_and_recheck() {
-    // VAL-103: after the base ref advanced past the snapshot base_head, `--ff`
-    // refuses with the exact remedy phrase recreate-or-rebase-and-recheck;
-    // base/PR refs unchanged.
+fn ff_moved_base_refuses_naming_rebase_remedy() {
+    // VAL-103, superseded by #2 (live-base): a moved base is revalidated
+    // against the CURRENT base tip, not blanket-refused. For `--ff` the
+    // ff-ability precondition is judged against the recomputed merge_base:
+    // a source that does not sit directly on the current tip still refuses,
+    // naming the rebase/recreate remedy; base/PR refs unchanged.
     let dir = tmpdir("ffmoved");
     init_repo(&dir);
     create_approved_pr(&dir, "feature", "ff moved PR");
@@ -3713,10 +3727,10 @@ fn ff_moved_base_refuses_naming_recreate_or_rebase_and_recheck() {
     assert_ne!(base_before, moved_base);
     checkout(&dir, "feature");
     let (cm, _, em) = forge(&dir, &["forge", "pr", "merge", "1", "--ff"]);
-    assert_ne!(cm, 0, "moved base must refuse --ff");
+    assert_ne!(cm, 0, "non-ffable source on a moved base must refuse --ff");
     assert!(
-        em.contains("recreate-or-rebase-and-recheck"),
-        "refusal must name recreate-or-rebase-and-recheck: {em}"
+        em.contains("cannot fast-forward") && em.contains("rebase"),
+        "refusal must name the fast-forward precondition and the rebase remedy: {em}"
     );
     assert_eq!(
         ref_oid(&dir, "refs/heads/main").unwrap(),
@@ -4605,4 +4619,441 @@ fn ci_green_before_update_cannot_merge_post_update_content() {
     assert_eq!(c, 0, "post-update ci run failed: {e}");
     let (c, _, e) = forge(&dir, &["forge", "pr", "merge", "1"]);
     assert_eq!(c, 0, "fresh CI must complete the merge: {e}");
+}
+
+/// #2 result-bound gate inputs: `ci run` and `pr review` record the live
+/// base branch tip (`base_head`) they were taken against, so the live-base
+/// merge gate can require gate inputs bound to the CURRENT base tip when the
+/// base has moved since the PR snapshot.
+#[test]
+fn ci_check_and_review_record_base_head() {
+    let dir = tmpdir("bindbase");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "bound PR");
+    let base_tip = ref_oid(&dir, "refs/heads/main").unwrap();
+    let events = chain_event_jsons(&dir, "refs/forge/prs/1/head");
+    let ci = events
+        .iter()
+        .rev()
+        .find(|j| j.contains("\"kind\":\"ci.check\""))
+        .expect("ci.check on chain");
+    assert!(
+        ci.contains(&format!("\"base_head\":\"{base_tip}\"")),
+        "ci.check must record the live base tip: {ci}"
+    );
+    let review = events
+        .iter()
+        .find(|j| j.contains("\"kind\":\"pr.review\""))
+        .expect("pr.review on chain");
+    assert!(
+        review.contains(&format!("\"base_head\":\"{base_tip}\"")),
+        "pr.review must record the live base tip: {review}"
+    );
+}
+
+/// #2 / VAL-207 live-base merge: two PRs on one base. The first merges; the
+/// second's snapshot base has moved. The second merge REFUSES while its gate
+/// inputs are only bound to the old base tip (no re-validation), then PASSES
+/// after a fresh `ci run` + fresh approve (both bound to the moved base tip):
+/// the merge recomputes merge_base against the CURRENT base tip and the
+/// result contains the concurrent base advance.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn live_base_merge_refuses_then_passes_after_fresh_gate() {
+    let dir = tmpdir("livebase");
+    init_repo(&dir);
+    // PR #1 and PR #2 both fork from main at the same commit.
+    create_approved_pr(&dir, "feature", "first PR");
+    let shared_base = ref_oid(&dir, "refs/heads/main").unwrap();
+    make_feature_file(&dir, "feature2", "feature2.txt", "feat2\n");
+    let (c, _, e) = git(&dir, &["checkout", "-q", "feature2"]);
+    assert_eq!(c, 0, "checkout feature2 failed: {e}");
+    add_passing_ci_plan(&dir);
+    let (c, _, e) = git(&dir, &["checkout", "-q", "main"]);
+    assert_eq!(c, 0, "checkout main failed: {e}");
+    let (c, o, e) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "create",
+            "--source",
+            "feature2",
+            "--base",
+            "main",
+            "second PR",
+        ],
+    );
+    assert_eq!(c, 0, "pr create 2 failed: {e} {o}");
+    let (c, _, e) = forge(&dir, &["forge", "ci", "run", "2"]);
+    assert_eq!(c, 0, "ci run 2 failed: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "review", "2", "--approve"]);
+    assert_eq!(c, 0, "approve 2 failed: {e}");
+
+    // Merge PR #1: main advances past the shared base.
+    checkout(&dir, "feature");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_eq!(c, 0, "first merge failed: {e}");
+    let moved_base = ref_oid(&dir, "refs/heads/main").unwrap();
+    assert_ne!(shared_base, moved_base, "first merge must advance main");
+
+    // PR #2's base has moved. With gate inputs bound only to the OLD base
+    // tip, the merge refuses (no re-validation) with refs unchanged.
+    checkout(&dir, "feature2");
+    let head_before = ref_oid(&dir, "refs/forge/prs/2/head").unwrap();
+    let (cm, _, em) = forge(&dir, &["forge", "pr", "merge", "2"]);
+    assert_ne!(
+        cm, 0,
+        "moved-base merge without fresh gate must refuse: {em}"
+    );
+    assert!(
+        em.contains("re-validate"),
+        "refusal must name the re-validate remedy: {em}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        moved_base,
+        "base unchanged by the refusal"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/2/head").unwrap(),
+        head_before,
+        "PR head unchanged by the refusal"
+    );
+    let (_cs, os, _) = forge(&dir, &["forge", "pr", "show", "2"]);
+    assert!(!os.contains("merged:"), "PR 2 must remain unmerged: {os}");
+
+    // Fresh gate inputs bound to the MOVED base tip: fresh CI run + fresh
+    // approve, then the live-base merge passes and the result contains the
+    // concurrent base advance.
+    let (c, _, e) = forge(&dir, &["forge", "ci", "run", "2"]);
+    assert_eq!(c, 0, "fresh ci run failed: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "review", "2", "--approve"]);
+    assert_eq!(c, 0, "fresh approve failed: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "merge", "2"]);
+    assert_eq!(c, 0, "live-base merge with fresh gate must pass: {e}");
+    // The moved-base commit is in the merged result.
+    let (c, _, _) = git(
+        &dir,
+        &[
+            "merge-base",
+            "--is-ancestor",
+            &moved_base,
+            "refs/heads/main",
+        ],
+    );
+    assert_eq!(c, 0, "result must contain the concurrent base advance");
+    let (c, _, _) = git(
+        &dir,
+        &["merge-base", "--is-ancestor", "feature2", "refs/heads/main"],
+    );
+    assert_eq!(c, 0, "result must contain the PR 2 source");
+    let (_cs, os, _) = forge(&dir, &["forge", "pr", "show", "2"]);
+    assert!(os.contains("merged:"), "PR 2 must be merged: {os}");
+}
+
+/// #2 / VAL-208: the finalize CAS binds the gate-validated CURRENT base tip
+/// (F-007/F-008 binding redesign, base side). A base move between gate
+/// validation and finalize — injected in the GIT_FORGE_TEST_MERGE_BARRIER
+/// window — fails the base CAS, the whole completion transaction aborts
+/// (refs unchanged, no partial write), and the pending result ref is left
+/// in place per the failure contract.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn live_base_finalize_cas_conflict_leaves_no_partial_write() {
+    let dir = tmpdir("lbcas");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "live-base cas PR");
+    make_feature_file(&dir, "feature2", "feature2.txt", "feat2\n");
+    let (c, _, e) = git(&dir, &["checkout", "-q", "feature2"]);
+    assert_eq!(c, 0, "checkout feature2 failed: {e}");
+    add_passing_ci_plan(&dir);
+    let (c, _, e) = git(&dir, &["checkout", "-q", "main"]);
+    assert_eq!(c, 0, "checkout main failed: {e}");
+    let (c, _, e) = forge(
+        &dir,
+        &[
+            "forge", "pr", "create", "--source", "feature2", "--base", "main", "cas PR2",
+        ],
+    );
+    assert_eq!(c, 0, "pr create 2 failed: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "ci", "run", "2"]);
+    assert_eq!(c, 0, "ci run 2 failed: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "review", "2", "--approve"]);
+    assert_eq!(c, 0, "approve 2 failed: {e}");
+    // Move the base: PR #2's merge becomes live-base.
+    checkout(&dir, "feature");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_eq!(c, 0, "first merge failed: {e}");
+    let validated_base = ref_oid(&dir, "refs/heads/main").unwrap();
+    // Re-take the gate bound to the validated current tip.
+    checkout(&dir, "feature2");
+    let (c, _, e) = forge(&dir, &["forge", "ci", "run", "2"]);
+    assert_eq!(c, 0, "fresh ci run failed: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "review", "2", "--approve"]);
+    assert_eq!(c, 0, "fresh approve failed: {e}");
+    let head_before = ref_oid(&dir, "refs/forge/prs/2/head").unwrap();
+
+    // Park the merge in the pending window (pending result ref exists, temp
+    // worktree gone, before the first completion transaction).
+    let barrier = tmpdir("lbcas-window");
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let child: Child = Command::new(bin)
+        .args(["forge", "pr", "merge", "2"])
+        .current_dir(&dir)
+        .env("GIT_FORGE_TEST_MERGE_BARRIER", &barrier)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !barrier.join("ready").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "live-base merge never reached the barrier window"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Inject the CAS clash: advance the base ref past the tip the gate
+    // validated. The clash commit is built with plumbing (commit-tree of the
+    // current base tree, empty delta) so no checkout of main is needed.
+    let tree_before = {
+        let (_, o, _) = git(&dir, &["rev-parse", &format!("{validated_base}^{{tree}}")]);
+        o.trim().to_string()
+    };
+    let (c, o3, e3) = git(
+        &dir,
+        &["commit-tree", &tree_before, "-m", "concurrent base advance"],
+    );
+    assert_eq!(c, 0, "commit-tree failed: {e3} {o3}");
+    let moved = o3.trim().to_string();
+    let (c, _, e) = git(
+        &dir,
+        &["update-ref", "refs/heads/main", &moved, &validated_base],
+    );
+    assert_eq!(c, 0, "advance base ref: {e}");
+    assert_eq!(ref_oid(&dir, "refs/heads/main").unwrap(), moved);
+
+    let release_path = barrier.join("release");
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&release_path)
+            .expect("release sentinel must be created atomically");
+        let _ = f.write_all(b"go\n");
+    }
+    let output = child.wait_with_output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "the CAS-clashed live-base merge must fail: {stderr}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        moved,
+        "base must hold the concurrent value (merge wrote nothing)"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/2/head").unwrap(),
+        head_before,
+        "PR head chain must be unchanged"
+    );
+    let events = chain_event_jsons(&dir, "refs/forge/prs/2/head");
+    assert!(
+        events.iter().all(|j| !j.contains("\"kind\":\"pr.merge\"")),
+        "no pr.merge event may exist: {events:?}"
+    );
+    let result_ref_before = ref_oid(&dir, "refs/forge/prs/2/result")
+        .expect("pending result ref left in place per the failure contract");
+    assert_ne!(
+        result_ref_before, moved,
+        "pending result ref pins the merge result, not the base"
+    );
+    let (_, os2, _) = forge(&dir, &["forge", "pr", "show", "2"]);
+    assert!(!os2.contains("merged:"), "PR 2 must remain unmerged: {os2}");
+    assert_no_temp_worktree_pr(&dir, 2);
+}
+
+/// #2 / VAL-207 (per-gate-input binding): on a moved base, EACH gate input
+/// must be re-taken against the current base tip. A fresh approve alone
+/// (the latest Check still bound to the pre-move tip) refuses; a fresh CI
+/// run alone (the decision still bound to the pre-move tip) refuses; both
+/// re-taken against the moved tip let the merge pass.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn live_base_merge_requires_each_gate_input_rebound() {
+    let dir = tmpdir("bindboth");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "bind first PR");
+    make_feature_file(&dir, "feature2", "feature2.txt", "feat2\n");
+    let (c, _, e) = git(&dir, &["checkout", "-q", "feature2"]);
+    assert_eq!(c, 0, "checkout feature2 failed: {e}");
+    add_passing_ci_plan(&dir);
+    let (c, _, e) = forge(
+        &dir,
+        &[
+            "forge", "pr", "create", "--source", "feature2", "--base", "main", "bind PR2",
+        ],
+    );
+    assert_eq!(c, 0, "pr create 2 failed: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "ci", "run", "2"]);
+    assert_eq!(c, 0, "ci run 2 failed: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "review", "2", "--approve"]);
+    assert_eq!(c, 0, "approve 2 failed: {e}");
+    // Move the base via PR #1's merge.
+    checkout(&dir, "feature");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_eq!(c, 0, "first merge failed: {e}");
+    checkout(&dir, "feature2");
+    // Fresh approve alone: the latest Check is still bound to the pre-move
+    // tip → refuse naming the CI re-validation. (The approve IS fresh — it
+    // binds the moved tip — but the gate requires EVERY input bound to the
+    // current tip.)
+    let (c, _, e) = forge(&dir, &["forge", "pr", "review", "2", "--approve"]);
+    assert_eq!(c, 0, "fresh approve failed: {e}");
+    let (cm, _, em) = forge(&dir, &["forge", "pr", "merge", "2"]);
+    assert_ne!(
+        cm, 0,
+        "fresh approve alone must not satisfy the moved-base gate"
+    );
+    assert!(
+        em.contains("CI Check"),
+        "refusal must name the stale Check binding: {em}"
+    );
+
+    // Fresh CI completes the re-validation: now BOTH inputs bind the moved
+    // tip and the live-base merge passes.
+    let (c, _, e) = forge(&dir, &["forge", "ci", "run", "2"]);
+    assert_eq!(c, 0, "fresh ci run failed: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "merge", "2"]);
+    assert_eq!(
+        c, 0,
+        "live-base merge with both inputs rebound must pass: {e}"
+    );
+
+    // Mirror leg: a PR whose only fresh input is the CI Check (decision
+    // still bound to the pre-move tip) refuses naming the review.
+    let dir2 = tmpdir("bindboth2");
+    init_repo(&dir2);
+    create_approved_pr(&dir2, "feature", "bind first PR");
+    make_feature_file(&dir2, "feature2", "feature2.txt", "feat2\n");
+    let (c, _, e) = git(&dir2, &["checkout", "-q", "feature2"]);
+    assert_eq!(c, 0, "checkout feature2 failed: {e}");
+    add_passing_ci_plan(&dir2);
+    let (c, _, e) = git(&dir2, &["checkout", "-q", "main"]);
+    assert_eq!(c, 0, "checkout main failed: {e}");
+    let (c, _, e) = forge(
+        &dir2,
+        &[
+            "forge", "pr", "create", "--source", "feature2", "--base", "main", "bind PR2",
+        ],
+    );
+    assert_eq!(c, 0, "pr create 2 failed: {e}");
+    let (c, _, e) = forge(&dir2, &["forge", "ci", "run", "2"]);
+    assert_eq!(c, 0, "ci run 2 failed: {e}");
+    let (c, _, e) = forge(&dir2, &["forge", "pr", "review", "2", "--approve"]);
+    assert_eq!(c, 0, "approve 2 failed: {e}");
+    checkout(&dir2, "feature");
+    let (c, _, e) = forge(&dir2, &["forge", "pr", "merge", "1"]);
+    assert_eq!(c, 0, "first merge failed: {e}");
+    checkout(&dir2, "feature2");
+    let (c, _, e) = forge(&dir2, &["forge", "ci", "run", "2"]);
+    assert_eq!(c, 0, "fresh ci run failed: {e}");
+    let (cm, _, em) = forge(&dir2, &["forge", "pr", "merge", "2"]);
+    assert_ne!(cm, 0, "fresh CI alone must not satisfy the moved-base gate");
+    assert!(
+        em.contains("review"),
+        "refusal must name the stale decision binding: {em}"
+    );
+}
+
+/// #2 (identify what CI verified with the result): the fresh Check validated
+/// the SOURCE snapshot tree; the live-base RESULT tree is what actually
+/// lands. When the two differ, the CI plan from the RESULT tree runs against
+/// the result and must be green — a plan that fails on the result refuses
+/// the merge with refs unchanged, even though the source-side Check was
+/// green and the review was fresh.
+#[test]
+#[allow(clippy::cognitive_complexity)]
+fn live_base_result_ci_failure_refuses_merge() {
+    let dir = tmpdir("lbresci");
+    init_repo(&dir);
+    make_feature(&dir, "feature", "feat\n");
+    let (c, _, e) = git(&dir, &["checkout", "-q", "feature"]);
+    assert_eq!(c, 0, "checkout feature failed: {e}");
+    // The PR's plan is green exactly while the flag file is absent.
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    std::fs::write(
+        dir.join(".forge").join("ci.sh"),
+        "#!/bin/bash\n[ ! -f .forge/flag ]\n",
+    )
+    .unwrap();
+    let (c, _, e) = git(&dir, &["add", ".forge/ci.sh"]);
+    assert_eq!(c, 0, "add ci.sh failed: {e}");
+    let (c, _, e) = git(&dir, &["commit", "-q", "-m", "ci plan"]);
+    assert_eq!(c, 0, "commit ci.sh failed: {e}");
+    let (c, _, e) = git(&dir, &["checkout", "-q", "main"]);
+    assert_eq!(c, 0, "checkout main failed: {e}");
+    let (c, _, e) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "create",
+            "--source",
+            "feature",
+            "--base",
+            "main",
+            "result ci PR",
+        ],
+    );
+    assert_eq!(c, 0, "pr create failed: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_eq!(c, 0, "ci run failed: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "review", "1", "--approve"]);
+    assert_eq!(c, 0, "approve failed: {e}");
+    // The base moves and brings a flag file with it: the RESULT tree flips
+    // the plan red while the SOURCE-side plan stays green.
+    let (c, _, e) = git(&dir, &["checkout", "-q", "main"]);
+    assert_eq!(c, 0, "checkout main failed: {e}");
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    std::fs::write(dir.join(".forge").join("flag"), "moved\n").unwrap();
+    let (c, _, e) = git(&dir, &["add", ".forge/flag"]);
+    assert_eq!(c, 0, "add flag failed: {e}");
+    let (c, _, e) = git(&dir, &["commit", "-q", "-m", "base moves with flag"]);
+    assert_eq!(c, 0, "commit flag failed: {e}");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    checkout(&dir, "feature");
+    // head is captured HERE (after the fresh appends); the merge refusal must
+    // not touch it.
+    // Fresh gate inputs bound to the moved tip: the result-bound gates pass,
+    // and only the result-tree CI identification can refuse.
+    let (c, _, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_eq!(c, 0, "fresh ci run (source tree green) failed: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "review", "1", "--approve"]);
+    assert_eq!(c, 0, "fresh approve failed: {e}");
+    let (cm, _, em) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_ne!(
+        cm, 0,
+        "a red result-tree plan must refuse the live-base merge: {em}"
+    );
+    let head_before = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+    assert!(
+        em.contains("result CI"),
+        "refusal must name the result-tree CI failure: {em}"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").unwrap(),
+        base_before,
+        "base unchanged by the result-CI refusal"
+    );
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        head_before,
+        "PR head unchanged by the result-CI refusal"
+    );
+    let (_cs, os, _) = forge(&dir, &["forge", "pr", "show", "1"]);
+    assert!(!os.contains("merged:"), "PR must remain unmerged: {os}");
 }

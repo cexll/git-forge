@@ -462,5 +462,37 @@ git checkout -q feat/gf-update
 at "fresh approve+CI merge passes" 0 "git forge pr merge 22"
 at "merged base contains post-update commit" 0 "git merge-base --is-ancestor \$U2 \"\$BASE_BRANCH\""
 
+# ── t2 / #2 live-base merge: two PRs on one base; the second's base moves —
+# refuse without fresh gate, pass with fresh CI + fresh approve bound to the
+# moved base tip; the result contains the concurrent base advance ──
+git checkout -q -B feat/gf-lb1 "$BASE_BRANCH"
+printf 'l1\n' > gf-lb1.txt && git add gf-lb1.txt && git commit -qm "lb1 c1"
+git checkout -q "$BASE_BRANCH"
+git forge pr create --source feat/gf-lb1 --base "$BASE_BRANCH" "lb first PR" >/dev/null
+git forge pr review 23 --approve >/dev/null
+git forge ci run 23 >/dev/null
+git checkout -q -B feat/gf-lb2 "$BASE_BRANCH"
+printf 'l2\n' > gf-lb2.txt && git add gf-lb2.txt && git commit -qm "lb2 c1"
+git checkout -q "$BASE_BRANCH"
+git forge pr create --source feat/gf-lb2 --base "$BASE_BRANCH" "lb second PR" >/dev/null
+git forge pr review 24 --approve >/dev/null
+git forge ci run 24 >/dev/null
+git checkout -q feat/gf-lb1
+ck "lb first merge ok" 0 git forge pr merge 23
+LB_MOVED="$(git rev-parse "$BASE_BRANCH")"
+git checkout -q feat/gf-lb2
+at "lb second merge refused without fresh gate" 0 "! git forge pr merge 24 2>/dev/null"
+at "lb refusal names re-validate" 0 "git forge pr merge 24 2>&1 | grep -q 're-validate'"
+at "lb refusal leaves base ref" 0 "[ \"\$(git rev-parse \"\$BASE_BRANCH\")\" = \"\$LB_MOVED\" ]"
+at "lb refusal leaves PR unmerged" 0 "! git forge pr show 24 | grep -q 'merged:'"
+git forge ci run 24 >/dev/null
+at "lb fresh CI alone still refused" 0 "! git forge pr merge 24 2>/dev/null"
+at "lb CI-alone refusal names review" 0 "git forge pr merge 24 2>&1 | grep -q 'review'"
+git forge pr review 24 --approve >/dev/null
+ck "lb live-base merge passes with fresh gate" 0 git forge pr merge 24
+at "lb result contains the moved base" 0 "git merge-base --is-ancestor \$LB_MOVED \"\$BASE_BRANCH\""
+at "lb result contains the second PR source" 0 "git merge-base --is-ancestor feat/gf-lb2 \"\$BASE_BRANCH\""
+at "lb pr show merged" 0 "git forge pr show 24 | grep -q 'merged:'"
+
 echo "=========== DOGFOOD SUMMARY pass=$PASS fail=$FAIL ==========="
 [ "$FAIL" -eq 0 ]

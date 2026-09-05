@@ -135,6 +135,86 @@ pub(crate) fn validate_merge_gate_at(
     Ok(state)
 }
 
+/// ── #2 result-bound gates (F-007/F-008 gate_head binding redesign, applied
+/// to the merge RESULT's inputs) ── The merge result is a function of
+/// (source snapshot, CURRENT base tip). When the base has moved since the
+/// PR snapshot, a review decision or CI Check recorded against a pre-move
+/// base tip validated a different result; the live-base merge may proceed
+/// ONLY with gate inputs bound to the CURRENT base tip. Each gate input
+/// names its own re-validation remedy; the refusal precedes every side
+/// effect (no worktree, no pending ref, no event).
+pub(crate) fn validate_result_bound_gate(
+    id: u64,
+    state: &crate::event::PrState,
+    base_ref: &str,
+    snapshot_base: Oid,
+    current_base: Oid,
+) -> Result<(), String> {
+    if state.ci_base_head.as_deref() != Some(&current_base.to_string()) {
+        return Err(format!(
+            "PR #{id} base branch '{base_ref}' has moved since the PR snapshot \
+             ({current_base} != snapshot {snapshot_base}) and the latest CI Check \
+             was taken against a different base; re-validate against the current \
+             base tip: run `git forge ci run {id}` and re-approve, then merge"
+        ));
+    }
+    if state.decision_base_head.as_deref() != Some(&current_base.to_string()) {
+        return Err(format!(
+            "PR #{id} base branch '{base_ref}' has moved since the PR snapshot \
+             ({current_base} != snapshot {snapshot_base}) and the effective review \
+             decision was made against a different base; re-validate against the \
+             current base tip: run `git forge pr review {id} --approve`, then merge"
+        ));
+    }
+    Ok(())
+}
+
+/// ── #2 identify what CI verified with the result ── `source_oid`'s tree is
+/// what the latest Check validated; `result_commit`'s tree is what the
+/// merge lands. Equal trees prove the Check already validated the result
+/// ("prove result tree == the tree CI checked"). Differing trees require the
+/// CI plan resolved from the RESULT tree to run against the result worktree
+/// (`tmp`, already at the result commit) and be green; the caller routes a
+/// failure through the strategy cleanup (worktree removed, no ref changes)
+/// and reports the plan verdict.
+pub(crate) fn verify_result_ci(
+    repo: &git2::Repository,
+    tmp: &std::path::Path,
+    source_oid: Oid,
+    result_commit: Oid,
+) -> Result<(), String> {
+    let source_tree = repo
+        .find_commit(source_oid)
+        .and_then(|c| c.tree())
+        .map(|t| t.id())
+        .map_err(|_| "cannot read the PR source snapshot tree".to_string())?;
+    let result_tree = repo
+        .find_commit(result_commit)
+        .and_then(|c| c.tree())
+        .map(|t| t.id())
+        .map_err(|_| "cannot read the merge result tree".to_string())?;
+    if source_tree == result_tree {
+        return Ok(());
+    }
+    let plan = crate::ci::snapshot_ci_plan(repo, result_commit)?;
+    let plan_label = plan.label();
+    let run = crate::ci::run_ci_plan(
+        repo,
+        result_commit,
+        tmp,
+        &plan,
+        crate::ci::ci_timeout(std::env::var("GIT_FORGE_CI_TIMEOUT").ok().as_deref()),
+    );
+    if run.status == Some(0) && !run.timed_out {
+        Ok(())
+    } else {
+        Err(format!(
+            "result CI ({plan_label}) failed against the live-base merge result: the \
+             source-side Check validated a different tree; fix or re-run, then merge"
+        ))
+    }
+}
+
 /// Shared best-effort pending-result cleanup, used by the finalize early-return
 /// sites in `cmd_pr_merge` (seam worktree-lock failure / removal failed / dir
 /// still exists / list failed / still registered / barrier deadline) and by
@@ -258,10 +338,13 @@ pub(crate) fn finalize_pr_merge(
     let mut lines = vec![
         // delete pending result ref (expected presence).
         format!("update {result} {ZERO_OID} {}", spec.result_commit),
-        // CAS base branch from snapshot base_head to result_commit.
+        // F-007/F-008 gate_head binding redesign (base side): CAS the base
+        // branch from the GATE-VALIDATED CURRENT base tip (`gate_base_oid`,
+        // #2 live-base) to result_commit — a base move after gate validation
+        // fails this CAS and nothing applies.
         format!(
             "update {base_branch_ref} {} {}",
-            spec.result_commit, spec.base_oid
+            spec.result_commit, spec.gate_base_oid
         ),
         // CAS PR head chain from the gate-validated tip to pr.merge commit.
         format!("update {head_ref} {head_new} {head_expected}"),
@@ -280,7 +363,14 @@ pub(crate) fn finalize_pr_merge(
 pub(crate) struct MergeFinalizeSpec<'a> {
     pub id: u64,
     pub base_ref: &'a str,
-    pub base_oid: Oid,
+    /// The base tip the gate validated (F-007/F-008 gate_head binding redesign,
+    /// base side): the finalize CAS moves `refs/heads/<base_ref>` FROM this
+    /// tip — the CURRENT branch tip at gate-read time (#2 live-base), which
+    /// equals the immutable snapshot base_head only when the base has not
+    /// moved. A base move between gate validation and finalize fails this CAS
+    /// and the whole transaction (no partial write), exactly as a head move
+    /// fails the head CAS from `gate_head`.
+    pub gate_base_oid: Oid,
     pub result_commit: Oid,
     pub actor: &'a str,
     pub strategy: &'a str,
@@ -362,14 +452,14 @@ fn refresh_base_worktrees(
         if let Err(rerr) = crate::git::refresh_base_worktree(
             wt,
             &spec.result_commit.to_string(),
-            &spec.base_oid.to_string(),
+            &spec.gate_base_oid.to_string(),
         ) {
             let base_branch_ref = format!("refs/heads/{}", spec.base_ref);
             let mut rollback = vec![
                 // Revert the base branch CAS (result_commit → base_head).
                 format!(
                     "update {base_branch_ref} {} {}",
-                    spec.base_oid, spec.result_commit
+                    spec.gate_base_oid, spec.result_commit
                 ),
             ];
             // Restore the PR head chain from the tip the transaction left it
@@ -412,7 +502,7 @@ fn refresh_base_worktrees(
             if rolled.is_ok() {
                 for done in &refreshed {
                     let (okh, tip, _) = crate::git::git_in(done, &["rev-parse", "HEAD"]);
-                    if !okh || tip != spec.base_oid.to_string() {
+                    if !okh || tip != spec.gate_base_oid.to_string() {
                         stale_trees.push(format!("{} (HEAD not on the base tip)", done.display()));
                         continue;
                     }

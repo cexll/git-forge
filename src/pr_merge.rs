@@ -111,14 +111,12 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
     // cannot substitute a forged snapshot (shared invariant, one owner in
     // the store).
     crate::store::EventStore::validate_snapshot_against_state(id, &state, source_oid, base_oid)?;
-    let merge_base = state
-        .merge_base
-        .as_deref()
-        .map(|s| s.parse::<git2::Oid>())
-        .transpose()
-        .map_err(|_| "PR merge_base invalid".to_string())?
-        .ok_or_else(|| "PR has no merge_base".to_string())?;
-    // Stale-base rejection: current base branch tip must equal PR base_head.
+    // ── #2 live-base merge ── The base branch's CURRENT tip. When it differs
+    // from the snapshot base_head the merge is NOT refused outright:
+    // merge_base is recomputed against this tip, the strategy executes
+    // against it, and the finalize CAS expectation is THIS tip — the
+    // gate-validated current base tip, the base-side counterpart of the
+    // gate_head binding (F-007/F-008 binding redesign, named below).
     let current_base = store
         .repo()
         .find_reference(&format!("refs/heads/{base_ref}"))
@@ -127,33 +125,38 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
                 .ok_or(git2::Error::from_str("base branch has no target"))
         })
         .map_err(|_| format!("base branch '{base_ref}' does not exist"))?;
-    // --ff preconditions (VAL-102, VAL-103): the snapshot source must sit
-    // directly on top of the snapshot base (merge_base == base_head), and —
-    // until #2 (live-base refresh) lands — the current base ref must still
-    // equal the snapshot base_head. Distinct remedies, checked BEFORE the
-    // generic stale-base refusal so the ff path names its own remedy.
-    if strategy == "ff" {
-        if merge_base != base_oid {
-            return Err(format!(
-                "PR #{id} cannot fast-forward: the source does not sit directly \
-                 on top of the snapshot base (merge_base != base_head); \
-                 use `pr merge --rebase` to replay the source or recreate the PR"
-            ));
-        }
-        if current_base != base_oid {
-            return Err(format!(
-                "base branch '{base_ref}' has moved since PR #{id} was created \
-                 ({current_base} != snapshot {base_oid}); \
-                 recreate-or-rebase-and-recheck"
-            ));
-        }
-    }
-
-    if current_base != base_oid {
+    let moved = current_base != base_oid;
+    // merge_base recomputed against the CURRENT base tip. When the base has
+    // not moved the recomputation is deterministic over the snapshot OIDs,
+    // so one code path serves both the unmoved and the live-base merge.
+    let exec_merge_base =
+        crate::git::require_single_merge_base(store.repo(), source_oid, current_base)?;
+    // --ff precondition (VAL-102): the source must sit directly on top of
+    // the CURRENT base tip (recomputed merge_base == base tip), whether or
+    // not the base has moved since the snapshot. A moved base is revalidated,
+    // never blanket-refused (supersedes the pre-#2 VAL-103 refusal).
+    if strategy == "ff" && exec_merge_base != current_base {
         return Err(format!(
-            "base branch '{base_ref}' has moved since PR #{id} was created \
-             ({current_base} != snapshot {base_oid}); recreate the PR or merge manually"
+            "PR #{id} cannot fast-forward: the source does not sit directly on \
+             top of the current base tip of '{base_ref}' (merge_base \
+             {exec_merge_base} != base tip {current_base}); use \
+             `pr merge --rebase` to replay the source or recreate the PR"
         ));
+    }
+    if moved {
+        // ── #2 result-bound gates ── F-007/F-008 gate_head binding redesign,
+        // review/CI side: the merge result is a function of (source snapshot,
+        // CURRENT base tip), so a Check or approve recorded against a
+        // pre-move base tip validated a different result. Each gate input
+        // must be re-taken bound to the current base tip before the merge
+        // proceeds, naming its own re-validation remedy.
+        crate::merge_state::validate_result_bound_gate(
+            id,
+            &state,
+            &base_ref,
+            base_oid,
+            current_base,
+        )?;
     }
 
     // Temporary worktree, detached at the immutable base OID. worktree
@@ -213,11 +216,13 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
     let nonce = hasher.finish();
     // Rebase must start detached at /source so `git rebase --onto /base
     // <merge_base>` can replay the snapshot commits; everything else starts
-    // detached at the immutable /base OID.
+    // detached at the base OID the strategy executes against — the CURRENT
+    // base tip (#2 live-base), identical to the immutable snapshot base when
+    // the base has not moved.
     let detach_oid = if strategy == "rebase" {
         source_oid
     } else {
-        base_oid
+        current_base
     };
     // Reserve the temp path atomically via a SIBLING lock file (`create_new`,
     // O_EXCL): two concurrent merges on the same repo compute the same path,
@@ -290,8 +295,8 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
         &tmp,
         strategy,
         source_oid,
-        base_oid,
-        merge_base,
+        current_base,
+        exec_merge_base,
         state.title.as_deref().unwrap_or(""),
     )?;
     let result_commit = result_commit.parse::<git2::Oid>().map_err(|_| {
@@ -302,6 +307,16 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
             "invalid result commit".into(),
         )
     })?;
+
+    // ── #2 identify what CI verified with the result ── The fresh Check
+    // validated the SOURCE snapshot tree; the RESULT tree is what lands.
+    if let Err(ci_err) =
+        crate::merge_state::verify_result_ci(store.repo(), &tmp, source_oid, result_commit)
+    {
+        return Err(crate::git::cleanup_failed_worktree(
+            &repo_dir, &tmp, strategy, ci_err,
+        ));
+    }
 
     // Keep result_commit reachable across worktree removal (GC could prune the
     // merge commit before the final transaction pins it).
@@ -432,7 +447,11 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
         crate::merge_state::MergeFinalizeSpec {
             id,
             base_ref: &base_ref,
-            base_oid,
+            // The gate-validated CURRENT base tip (F-007/F-008 binding
+            // redesign, base side): the finalize CASes refs/heads/<base_ref>
+            // FROM this tip, never from the snapshot base_head and never
+            // from a re-read tip.
+            gate_base_oid: current_base,
             result_commit,
             actor: &actor,
             strategy,
