@@ -2164,7 +2164,10 @@ function forgeMergeFeature(missionDir, state, featuresDoc, feature) {
     }
     // The ceremony approve mirrors the mission review that already passed to reach
     // this gate (reviewGate verdicts were checked above the forge path).
-    const review = forgeRun(state, ['pr', 'review', String(prId), '--approve', '--body', `mission review passed for ${feature.id} (session ${state.sessionId})`]);
+    // The FORGE's own `pr review` takes no --body (drilled against the real
+    // binary: 'unknown option --body'); the mission-review linkage lives in
+    // the adapter's event mirror, never in a review body this forge rejects.
+    const review = forgeRun(state, ['pr', 'review', String(prId), '--approve']);
     if (!review.ok) {
       // A bridge failure like every other: persist the RECOVERABLE pause and
       // mirror the event — an unrecorded return left nothing on the record

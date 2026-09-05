@@ -237,6 +237,8 @@ if (group === 'pr') {
     const p = prs.prs.find((x) => x.id === id);
     if (!p) finish(1, '', `PR #${id} does not exist`);
     if (take('reviewFail')) finish(1, '', 'fake-forge: bridge down (reviewFail)');
+    // Real forge contract (drilled): `pr review` takes no --body.
+    if (flags.body !== undefined) finish(2, '', `unknown option '--body'`);
     p.decision = flags.approve ? 'approve' : flags.reject ? 'reject' : null;
     finish(0, `review recorded on PR #${id}: ${p.decision}`);
   } else if (sub === 'comment') {
