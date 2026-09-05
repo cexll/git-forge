@@ -24,7 +24,7 @@ Per issue #7 spec amendment (1)-(5):
 
 ### Validation
 Fulfills: VAL-201, VAL-202, VAL-203
-- Verification: cargo test (exit zero) + adapter matrix (JSON fixture) (exit zero)
+- Verification: `cargo test` (exit zero)
 - Command / scenario: each command with --json; schema fixture byte-compare; version output; adapter matrix green with --json
 - Evidence expected: schema fixtures byte-identical; version exits 0; adapter matrix (--json path) green
 

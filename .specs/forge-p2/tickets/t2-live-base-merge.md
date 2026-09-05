@@ -23,7 +23,7 @@ Per issue #2 spec amendment (bind review and CI to the MERGE RESULT):
 
 ### Validation
 Fulfills: VAL-207, VAL-208
-- Verification: cargo test (exit zero) + dogfood assertions (exit zero)
+- Verification: `cargo test` (exit zero)
 - Command / scenario: PR1 + PR2 on one base; merge PR1; try PR2 → refused (stale); fresh ci + approve → merge PR2 → passes; inject CAS conflict → refused no partial
 - Evidence expected: refuse + pass tests green; CAS conflict no-partial green; dogfood green
 

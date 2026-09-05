@@ -24,7 +24,7 @@ Per issue #8's amendment (identity coverage):
 
 ### Validation
 Fulfills: VAL-204, VAL-209
-- Verification: cargo test (exit zero) + dogfood role-attribution assertions (exit zero)
+- Verification: `cargo test` (exit zero)
 - Command / scenario: three worktrees with distinct identities; event chain shows distinct actors; gate refuses self-approve
 - Evidence expected: event chain actors distinct; gate refusal test green; docs updated
 

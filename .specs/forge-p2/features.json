@@ -82,7 +82,7 @@
         "steps": [
           {
             "id": "check",
-            "command": "cargo test (exit zero) + dogfood assertions",
+            "command": "cargo test",
             "expectedExit": "zero"
           }
         ]
@@ -122,7 +122,7 @@
         "steps": [
           {
             "id": "check",
-            "command": "cargo test (exit zero) + dogfood assertions",
+            "command": "cargo test",
             "expectedExit": "zero"
           }
         ]
@@ -162,7 +162,7 @@
         "steps": [
           {
             "id": "check",
-            "command": "cargo test (exit zero) + adapter matrix (JSON fixture)",
+            "command": "cargo test",
             "expectedExit": "zero"
           }
         ]
@@ -198,7 +198,7 @@
         "steps": [
           {
             "id": "check",
-            "command": "cargo test (exit zero) + dogfood role-attribution assertions",
+            "command": "cargo test",
             "expectedExit": "zero"
           }
         ]

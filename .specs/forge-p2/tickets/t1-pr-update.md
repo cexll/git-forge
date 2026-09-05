@@ -26,7 +26,7 @@ Per issue #1 spec amendment (per-generation snapshot contract):
 
 ### Validation
 Fulfills: VAL-205, VAL-206
-- Verification: cargo test (exit zero) + dogfood assertions (exit zero)
+- Verification: `cargo test` (exit zero)
 - Command / scenario: create PR → approve → update the source branch → merge → refused (stale approve); update → fresh approve + CI → merge → passes
 - Evidence expected: gate refusal + pass tests green; dogfood green
 
