@@ -39,13 +39,15 @@ close <n>  /  reopen <n>
 ```
 create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]...
 list
-show <n>                                     # snapshot fields + effective review decision + CI status
+show <n>                                     # snapshot fields + generation + effective review decision + CI status
 comment <n> <body>
 review <n> --approve|--reject [--file <f> --line <l> --commit <c>]
-diff <n>                                     # three-dot diff base_head...source_head from snapshot refs
+diff <n>                                     # three-dot diff merge_base...source_head from generation-current snapshot refs
+update <n>                                   # re-pin to the source branch tip as a NEW immutable snapshot generation
+prepare <n> --strategy merge|squash|rebase|ff  # materialize the merge result (candidate) against the CURRENT base tip
 merge [<n>] [--merge|--squash|--rebase|--ff] [--recycle-worktree <path>] [--force]
 abandon <n> --reason <text>                    # terminal: merge/review/CI refuse it afterwards
-ci:  git forge ci run <n>                    # run CI plan against the snapshot, record a ci.check event
+ci:  git forge ci run <n>                    # run CI plan against the generation snapshot (or prepared candidate), record a ci.check event
 ```
 
 `--source`/`--base` must be **canonical local branches** (`refs/heads/*`; bare name or full form). Tags, remote-tracking refs, OIDs, and revision expressions are rejected.
@@ -67,20 +69,19 @@ git forge issue close <n>                               # 8. close the loop on t
 
 ## Semantics that bite (read before merging)
 
-- **Ids come from ONE counter shared by issues and PRs.** After `issue new` returns #1, the first `pr create` is #2. Never hardcode ids in scripts — parse them from the create output (`issue #<n> created:`, `PR #<n> created:`).
-- **PRs are immutable snapshots.** `pr create` freezes `source_head`, `base_head`, and `merge_base` into `refs/forge/prs/<n>/{source,base,head,meta}`. Later commits on the source branch are NOT in the PR — recreate the PR to include them. The snapshot also keeps commits reachable, so `diff`/`merge` still work after the source branch is deleted or `git gc` runs.
+- **PRs are immutable snapshots per generation.** `pr create` freezes `source_head`, `base_head`, and `merge_base` into `refs/forge/prs/<n>/{source,base,head,meta}` (generation 0). Later commits on the source branch are NOT in the PR — `git forge pr update <n>` re-pins the PR to the branch tip as a NEW immutable generation (`refs/forge/prs/<n>/gen/<k>/...`); a pre-update approve or CI Check is stale and cannot satisfy the merge gate (re-review + fresh `ci run` after update). The snapshot refs also keep commits reachable, so `diff`/`merge` still work after the source branch is deleted or `git gc` runs.
 - **Self-PRs are rejected**: same source/base, or distinct branches resolving to the same commit, fail `pr create` with a non-zero exit.
-- **Merge gate is two-part**: the *last reachable* review must be `approve` AND the *latest* `ci.check` must be `success`. A later `--reject` flips the effective decision and blocks merge. No CI Check (or a failed/pending one) refuses with a message naming `git forge ci run <n>` as the remedy.
-- **CI plan comes from the snapshot**: `ci run` executes `.forge/ci.sh` when it is a regular file in the PR snapshot, else the `just check` fallback (which requires a self-contained justfile — no `import`/`mod`, no `set fallback`). A failing plan still records a `failure` Check, then exits non-zero.
-- **Stale base refuses**: if the base branch tip moved since `pr create`, merge exits non-zero (`recreate the PR or merge manually`).
+- **Merge gate is generation-bound and two-part**: the *last reachable* review must be `approve` on the PR's CURRENT snapshot generation AND the *latest* `ci.check` must be `success` on that same generation. A later `--reject` flips the effective decision and blocks merge. No CI Check (or a failed/pending/stale one) refuses with a message naming `git forge ci run <n>` as the remedy.
+- **CI plan comes from the generation snapshot** (or the prepared candidate, when one is current): `ci run` executes `.forge/ci.sh` when it is a regular file, else the `just check` fallback (which requires a self-contained justfile — no `import`/`mod`, no `set fallback`). A failing plan still records a `failure` Check, then exits non-zero.
+- **Moved base goes through `pr prepare`**: a base branch that moved since the snapshot does not refuse outright, but the merge REQUIRES a prepared candidate — `git forge pr prepare <n> --strategy <s>` materializes the result against the current base tip, then a candidate-bound `ci run` + candidate-bound `pr review --approve` re-take the gate before merge. A moved base without a candidate refuses naming `pr prepare`; `pr update` invalidates a candidate (re-prepare remedy).
 - **Checked-out base**: a clean worktree holding the base branch merges fine — after the merge its tree is refreshed to the result commit; only a DIRTY base worktree refuses (untracked counts as dirty; no flag unlocks it). `--recycle-worktree <path>` removes the merged source worktree afterwards (`--force` recycles a dirty one).
-- **Merge is terminal and atomic**: a merged PR cannot merge again; base + PR-chain finalize in one ref transaction, and a failed hook/conflict cleans up without touching refs. Strategies are mutually exclusive.
+- **Merge is terminal and atomic**: a merged PR cannot merge again; base + PR-chain finalize in one ref transaction, and a failed hook/conflict cleans up without touching refs (any expected pending-result ref is best-effort deleted; a surviving one is reported as a leftover). Strategies are mutually exclusive.
 - **Merge runs in a disposable worktree** — the user's dirty main worktree is safe.
 
 ## Common recipes
 
 - Inline review anchored to a line: `git forge pr review 2 --approve --file src/lib.rs --line 42 --commit <hash>` — `--file`/`--line` require `--commit`; the anchor must resolve to a real commit object (deliberately NOT constrained to the PR snapshot — spec permits anchoring to any commit) and the resolved OID is stored, so the anchor never drifts.
-- Re-run CI after fixing the plan: fix `.forge/ci.sh` (or the justfile) on the source branch, recreate the PR (snapshots are immutable), then `ci run` + `merge`.
+- Re-run CI after fixing the plan: fix `.forge/ci.sh` (or the justfile) on the source branch, then `git forge pr update <n>` (new snapshot generation), `ci run`, re-approve, and merge — no recreate needed.
 - Inspect why a merge refused: `git forge pr show <n>` shows the effective decision and latest CI status; the error message names the failing gate.
 
 ## Reference

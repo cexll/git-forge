@@ -5217,6 +5217,161 @@ fn in_flight_gen0_ci_after_update_is_stale() {
     assert_eq!(c, 0, "fresh gen1 CI must complete the merge: {e}");
 }
 
+// ── F-006 regression: pr.review generation binding ─────────────────────────
+
+/// F-006 writer-level: every `pr.review` body records the snapshot generation
+/// current at review time — gen0 on a never-updated PR (the review-time
+/// generation, not a hardcoded constant) and gen1 after `pr update` + a fresh
+/// review.
+#[test]
+fn review_records_generation_binding() {
+    let dir = tmpdir("reviewgen");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "gen bound PR");
+    let events = chain_event_jsons(&dir, "refs/forge/prs/1/head");
+    let review = events
+        .iter()
+        .rev()
+        .find(|j| j.contains("\"kind\":\"pr.review\""))
+        .expect("pr.review on chain");
+    assert!(
+        review.contains("\"generation\":0"),
+        "pr.review must record the generation it was taken against: {review}"
+    );
+
+    // A review taken AFTER `pr update` captures the NEW generation.
+    fix_round_commit(&dir, "feature", "feature.txt", "feat\nfix\n");
+    checkout(&dir, "main");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "update", "1"]);
+    assert_eq!(c, 0, "pr update failed: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "review", "1", "--approve"]);
+    assert_eq!(c, 0, "post-update review failed: {e}");
+    let events = chain_event_jsons(&dir, "refs/forge/prs/1/head");
+    let review = events
+        .iter()
+        .rev()
+        .find(|j| j.contains("\"kind\":\"pr.review\""))
+        .expect("fresh pr.review on chain");
+    assert!(
+        review.contains("\"generation\":1"),
+        "post-update review must record generation 1: {review}"
+    );
+}
+
+/// F-006 race-level (mirror of the F-001 CI race): a gen0 review parked
+/// between the fold and the append (a git-shim park on the identity
+/// `git config --null --get` read, which `cmd_pr_review` makes AFTER the fold
+/// and BEFORE the body build/append) while `pr update` lands appends its event
+/// AFTER the gen1 tip. The review must still carry generation 0 (captured at
+/// review time — the CAS retry re-parents the SAME body), so the merge gate
+/// sees the approval as stale and refuses — never merging updated content on
+/// a gen0 approval.
+#[test]
+fn in_flight_gen0_review_after_update_is_stale() {
+    let dir = tmpdir("reviewrace");
+    init_repo(&dir);
+    // Passing CI plan committed on the feature branch BEFORE `pr create`, so
+    // every generation's snapshot carries it and a fresh gen1 `ci run` can
+    // isolate the APPROVE gate as the sole refusal reason.
+    make_feature(&dir, "feature", "feat\n");
+    checkout(&dir, "feature");
+    add_passing_ci_plan(&dir);
+    checkout(&dir, "main");
+    let (c, o, e) = forge(
+        &dir,
+        &[
+            "forge", "pr", "create", "--source", "feature", "--base", "main", "race PR",
+        ],
+    );
+    assert_eq!(c, 0, "pr create failed: {e} {o}");
+
+    // Park the gen0 review between fold and append: the shim blocks the
+    // identity `git config --null --get user.email` read until released.
+    let park = tmpdir("reviewrace-park");
+    let shim = make_git_shim(
+        "reviewrace-shim",
+        "if [ \"$3\" = \"config\" ] && [ \"$4\" = \"--null\" ] && \
+         [ \"$5\" = \"--get\" ] && [ \"$6\" = \"user.email\" ]; then\n\
+         \x20 touch \"$GF_PARK/started\"\n\
+         \x20 while [ ! -f \"$GF_PARK/release\" ]; do sleep 0.05; done\n\
+         fi",
+    );
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let mut cmd = Command::new(bin);
+    cmd.args(["forge", "pr", "review", "1", "--approve"])
+        .current_dir(&dir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut path = shim.display().to_string();
+    if let Ok(p) = std::env::var("PATH") {
+        path.push(':');
+        path.push_str(&p);
+    }
+    cmd.env("PATH", &path);
+    cmd.env("GF_PARK", park.display().to_string());
+    let child: Child = cmd.spawn().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !park.join("started").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "parked review never reached the identity read"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // While the gen0 review is parked: fix round + `pr update` → gen1.
+    fix_round_commit(&dir, "feature", "feature.txt", "feat\nfix\n");
+    checkout(&dir, "main");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "update", "1"]);
+    assert_eq!(c, 0, "pr update failed: {e}");
+
+    // Release: the gen0 review appends onto the gen1 tip (CAS retry).
+    {
+        use std::io::Write as _;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(park.join("release"))
+            .expect("release sentinel must be created atomically");
+        let _ = f.write_all(b"go\n");
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        output.status.success(),
+        "parked gen0 review must succeed after release: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The appended review carries generation 0 (captured at review time).
+    let events = chain_event_jsons(&dir, "refs/forge/prs/1/head");
+    let review = events
+        .iter()
+        .rev()
+        .find(|j| j.contains("\"kind\":\"pr.review\""))
+        .expect("pr.review on chain");
+    assert!(
+        review.contains("\"generation\":0"),
+        "in-flight gen0 review must record generation 0: {review}"
+    );
+
+    // Fresh gen1 CI isolates the approve gate: the effective decision is the
+    // in-flight gen0 approve, whose captured generation (0) no longer matches
+    // the PR's current generation (1) → refuse.
+    let (c, _, e) = forge(&dir, &["forge", "ci", "run", "1"]);
+    assert_eq!(c, 0, "fresh gen1 ci run failed: {e}");
+    let (cm, _, em) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_ne!(cm, 0, "gen0 approve must not authorize a gen1 merge: {em}");
+    assert!(
+        em.contains("approve is stale"),
+        "refusal must name the stale approval: {em}"
+    );
+    // Fresh gen1 approve completes the merge.
+    let (c, _, e) = forge(&dir, &["forge", "pr", "review", "1", "--approve"]);
+    assert_eq!(c, 0, "fresh gen1 approve failed: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "merge", "1"]);
+    assert_eq!(c, 0, "fresh gen1 approve + CI must complete the merge: {e}");
+}
+
 // F-002: `pr prepare <n> --strategy <s>` materializes the candidate against
 /// the CURRENT base tip, pins `refs/forge/prs/<n>/result`, appends the
 /// `pr.prepared` event (generation/source_head/base_head/strategy/

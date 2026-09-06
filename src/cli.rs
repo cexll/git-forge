@@ -482,9 +482,18 @@ fn cmd_pr_review(args: &[String]) -> Result<String, String> {
         // diff changes).
         body.insert("commit".into(), json_str(&c));
     }
-    // Generation binding: the decision authorizes the snapshot generation
-    // current at review time; the merge gate refuses a decision from an
-    // older generation (pre-update approve is stale).
+    // Generation binding (F-006): the decision authorizes the snapshot
+    // generation CAPTURED at review time — the fold state read at command
+    // start, before the append. `append_event`'s CAS retry re-parents the
+    // SAME event body onto a moved tip, so an in-flight gen0 review whose
+    // append lands after a concurrent `pr update` still carries generation 0;
+    // the merge gate refuses it as stale instead of folding it as gen1.
+    // (The gate's decision check compares this captured generation with the
+    // PR's CURRENT generation at merge time.)
+    body.insert(
+        "generation".into(),
+        JsonValue::Number(state.generation as i64),
+    );
     // #2 result-bound review: the decision also records the LIVE base-branch
     // tip at review time, so the live-base merge gate can require a decision
     // bound to the current base tip when the base has moved since the PR
