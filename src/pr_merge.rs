@@ -11,6 +11,10 @@ use crate::store::EventStore;
 
 /// `git forge pr diff <n>` — three-dot diff from the immutable snapshot refs.
 pub(crate) fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String, String> {
+    // Same strict guard as `pr show`: one positional, no options — any
+    // dash-leading leftover is a usage error naming the flag (VAL-202).
+    let (_, args) = crate::machine::json_requested(args);
+    crate::machine::reject_leftover_flags(&args[1..], "usage: git forge pr diff <n>")?;
     let id = crate::cli::parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
     let head = crate::store::pr_head_ref(id);
     if !crate::cli::store_has_ref(store, &head) {
@@ -674,7 +678,12 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
 pub(crate) fn cmd_pr_update(args: &[String]) -> Result<String, String> {
     const USAGE: &str = "usage: git forge pr update <n>";
     if args.len() != 1 {
-        return Err(USAGE.into());
+        // Name the offending token so a rejected flag is diagnosable
+        // (unknown flag keeps exit-1, VAL-202).
+        return Err(match args.first() {
+            Some(a) if a.starts_with('-') => format!("unknown option '{a}'; {USAGE}"),
+            _ => USAGE.into(),
+        });
     }
     let id = crate::cli::parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
     // Read-only refusals first: every terminal/consistency check resolves

@@ -122,6 +122,16 @@ ck "issue invalid id clean error" nonzero git forge issue show abc
 ck "issue empty title rejected" nonzero git forge issue new "   "
 ck "issue comment on missing" nonzero git forge issue comment 99 x
 
+
+# ── VAL-202 (t7-fix-flags): unknown flags are REJECTED, never silently
+# ignored — the target entities exist here (#1 issue, #2 PR), so a non-zero
+# exit can only be the usage error naming the flag.
+at "issue list rejects unknown flag" 0 "! git forge issue list --bogus 2>/dev/null"
+at "issue list refusal names the flag" 0 "git forge issue list --bogus 2>&1 | grep -q -- '--bogus'"
+at "pr show rejects unknown flag" 0 "! git forge pr show 2 --bogus 2>/dev/null"
+at "pr show refusal names the flag" 0 "git forge pr show 2 --bogus 2>&1 | grep -q -- '--bogus'"
+ck "issue new --bogus rejected" nonzero git forge issue new "bogus-created" --bogus
+at "issue new with unknown flag wrote nothing" 0 "! git forge issue list | grep -q 'bogus-created'"
 # ── FR-002 / AC-002 / AC-002a..e / AC-002i / VAL-021/028: PR create guards ──
 git checkout -B feat/dogfood "$BASE_BRANCH"
 printf '\n# dogfood change\n' >> PLAN.md

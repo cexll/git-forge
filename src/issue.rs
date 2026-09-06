@@ -57,6 +57,7 @@ fn cmd_new(args: &[String]) -> Result<String, String> {
                 }
                 labels.push(v);
             }
+            a if a.starts_with('-') => return Err(format!("unknown option '{a}'; {USAGE}")),
             _ => positional.push(args[i].clone()),
         }
         i += 1;
@@ -107,7 +108,8 @@ fn cmd_new(args: &[String]) -> Result<String, String> {
 
 /// `git forge issue list`
 fn cmd_list(store: &EventStore, args: &[String]) -> Result<String, String> {
-    let (json, _) = machine::json_requested(args);
+    let (json, args) = machine::json_requested(args);
+    machine::reject_leftover_flags(&args, "usage: git forge issue list")?;
     let states = machine::fold_all_issues(store)?;
     if json {
         return Ok(machine::issue_list_json(&states));
@@ -130,6 +132,7 @@ fn cmd_list(store: &EventStore, args: &[String]) -> Result<String, String> {
 /// `git forge issue show <n>`
 fn cmd_show(store: &EventStore, args: &[String]) -> Result<String, String> {
     let (json, args) = machine::json_requested(args);
+    machine::reject_leftover_flags(&args[1..], "usage: git forge issue show <n>")?;
     let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
     let r = crate::store::issue_ref(id);
     if !store_has_ref(store, &r) {
@@ -171,6 +174,14 @@ fn cmd_show(store: &EventStore, args: &[String]) -> Result<String, String> {
 /// `git forge issue comment <n> <body>`
 fn cmd_comment(args: &[String]) -> Result<String, String> {
     const USAGE: &str = "usage: git forge issue comment <n> <body>";
+    // Same strict flag/token split as every other issue subcommand: an
+    // unknown option is a clean usage error naming the flag (VAL-202),
+    // never a silently-ignored prefix of the comment body.
+    let (_, args) = machine::json_requested(args);
+    // The grammar is `<n> <body>` — positionals ARE the body. Only flag
+    // tokens are rejected here (naming the flag, VAL-202); existence and
+    // emptiness are checked below, as before.
+    machine::reject_flags(&args, USAGE)?;
     if args.len() < 2 {
         return Err(USAGE.into());
     }
@@ -196,6 +207,20 @@ fn cmd_comment(args: &[String]) -> Result<String, String> {
 
 /// `git forge issue close <n>` / `reopen <n>`
 fn cmd_state(kind: EventKind, args: &[String]) -> Result<String, String> {
+    // One positional, no options: anything dash-leading is a usage error
+    // naming the flag (VAL-202).
+    let (_, args) = machine::json_requested(args);
+    let verb = match kind {
+        EventKind::IssueClose => "close",
+        EventKind::IssueReopen => "reopen",
+        _ => unreachable!(),
+    };
+    // Flag tokens first (naming the flag, VAL-202); arity is a plain usage
+    // error. One positional, no options.
+    machine::reject_flags(&args, &format!("usage: git forge issue {verb} <n>"))?;
+    if args.len() != 1 {
+        return Err(format!("usage: git forge issue {verb} <n>"));
+    }
     let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
     let (store, actor) = open_mutation_store()?;
     let r = crate::store::issue_ref(id);

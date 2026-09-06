@@ -281,6 +281,7 @@ fn cmd_pr_create(args: &[String]) -> Result<String, String> {
 /// `git forge pr show <n>`
 fn cmd_pr_show(store: &EventStore, args: &[String]) -> Result<String, String> {
     let (json, args) = machine::json_requested(args);
+    machine::reject_leftover_flags(&args[1..], "usage: git forge pr show <n>")?;
     let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
     let r = crate::store::pr_head_ref(id);
     if !store_has_ref(store, &r) {
@@ -378,7 +379,8 @@ fn cmd_pr_show(store: &EventStore, args: &[String]) -> Result<String, String> {
 
 /// `git forge pr list`
 fn cmd_pr_list(store: &EventStore, args: &[String]) -> Result<String, String> {
-    let (json, _) = machine::json_requested(args);
+    let (json, args) = machine::json_requested(args);
+    machine::reject_leftover_flags(&args, "usage: git forge pr list")?;
     let states = machine::fold_all_prs(store)?;
     if json {
         return Ok(machine::pr_list_json(&states));
@@ -398,9 +400,13 @@ fn cmd_pr_list(store: &EventStore, args: &[String]) -> Result<String, String> {
     Ok(out.trim_end().to_string())
 }
 
-/// `git forge pr comment <n> <body>`
 fn cmd_pr_comment(args: &[String]) -> Result<String, String> {
     const USAGE: &str = "usage: git forge pr comment <n> <body>";
+    // Same strict flag/token split as its issue sibling: an unknown option
+    // is a clean usage error naming the flag (VAL-202), never a
+    // silently-ignored prefix of the comment body.
+    let (_, args) = machine::json_requested(args);
+    machine::reject_flags(&args, USAGE)?;
     if args.len() < 2 {
         return Err(USAGE.into());
     }
@@ -722,23 +728,17 @@ fn worktree_leftover(repo_dir: &std::path::Path, tmp: &std::path::Path) -> Optio
 /// source snapshot as a regular file, otherwise the `just check` fallback; a
 /// `.forge/ci.sh` that is a symlink or otherwise not a regular file is refused
 /// up front (F-001), so the plan always comes from immutable PR content.
-fn cmd_ci_run(args: &[String]) -> Result<String, String> {
-    // `--json` (#7): the recorded Check's outcome as one JSON line on stdout
-    // (success path only; failures keep the prose stderr + exit 1 contract).
-    let (json, args) = machine::json_requested(args);
-    if args.len() != 1 {
-        return Err(format!(
-            "usage: git forge ci run <pr> (got {} argument(s), expected exactly 1)",
-            args.len()
-        ));
-    }
-    let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
-    // Read-only path first: PR existence and terminality are validated WITHOUT
-    // resolving the mutable identity, so every refusal resolves nothing and
-    // writes nothing. The run below reopens the store bound to the actor.
-    let store = open_store()?;
+/// The `ci run` READ-ONLY refusal path: PR existence, anchored chain (F-008)
+/// and the abandoned-terminal check, before any identity resolution or
+/// worktree is created — every refusal resolves nothing and writes nothing.
+/// Returns the head ref (for the later append) and the folded state. Split
+/// from `cmd_ci_run` so that function stays under the too_many_lines cap.
+fn ci_run_read_only_check(
+    store: &EventStore,
+    id: u64,
+) -> Result<(String, crate::event::PrState), String> {
     let head = crate::store::pr_head_ref(id);
-    if !store_has_ref(&store, &head) {
+    if !store_has_ref(store, &head) {
         return Err(format!("PR #{id} does not exist"));
     }
     // Anchored read (F-008): the WHOLE chain folded here must be anchored to
@@ -765,6 +765,30 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
     if let Some(reason) = &state.abandoned {
         return Err(format!("PR #{id} is abandoned: {reason}"));
     }
+    Ok((head, state))
+}
+fn cmd_ci_run(args: &[String]) -> Result<String, String> {
+    // `--json` (#7): the recorded Check's outcome as one JSON line on stdout
+    // (success path only; failures keep the prose stderr + exit 1 contract).
+    let (json, args) = machine::json_requested(args);
+    if args.len() != 1 {
+        // Name the offending token so a rejected flag is diagnosable
+        // (unknown flag keeps exit-1, VAL-202).
+        return Err(match args.first() {
+            Some(a) if a.starts_with('-') => {
+                format!("unknown option '{a}'; usage: git forge ci run <pr>")
+            }
+            _ => format!(
+                "usage: git forge ci run <pr> (got {} argument(s), expected exactly 1)",
+                args.len()
+            ),
+        });
+    }
+    let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
+    // Read-only refusal path + identity binding live in the extracted helper
+    // below (keeps this function under the too_many_lines cap).
+    let store = open_store()?;
+    let (head, state) = ci_run_read_only_check(&store, id)?;
     let (store, actor) = open_mutation_store()?;
     // The plan runs against the PR's CURRENT generation's immutable source
     // snapshot (its own commits), never the developer's working tree.

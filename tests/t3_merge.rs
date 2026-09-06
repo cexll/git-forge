@@ -5852,32 +5852,111 @@ fn t7_version_rejects_arguments() {
     assert_ne!(c, 0, "version with a positional must exit nonzero");
 }
 
-/// VAL-202: injecting an unknown flag on a JSON-enabled command keeps exit-1
-/// (the `--json` flag must not loosen the parsers).
+/// VAL-202: injecting an unknown flag on any forge subcommand exits non-zero
+/// with a clean usage error naming the flag — before any side effect. The 9
+/// historically-silent surfaces (issue new/list/show/comment/close/reopen,
+/// pr list/show/comment/diff) are exercised against fixtures whose target
+/// entities EXIST, so a refusal can never be the vacuous "does not exist"
+/// error; the already-strict surfaces (pr create, ci run) are re-asserted so
+/// a parser loosening cannot land unnoticed; and the known `--json` flag is
+/// proven to still parse on every JSON-enabled surface (with `--json=x`
+/// staying an unknown option).
 #[test]
+#[allow(clippy::cognitive_complexity)]
 fn t7_unknown_flag_still_exits_nonzero() {
     let dir = tmpdir("t7unk");
     init_repo(&dir);
     make_feature(&dir, "feature", "feat\n");
-    let (c, _, e) = forge(
-        &dir,
-        &[
-            "forge", "pr", "create", "--source", "feature", "--base", "main", "P", "--bogus",
-        ],
-    );
-    assert_ne!(c, 0, "pr create --bogus: {e}");
-    assert!(e.contains("unknown option"), "{e}");
-    let (c, o, _) = forge(
+    // Entities first: issue #1 and PR #2 (shared counter) must EXIST so an
+    // exit-1 below cannot be the "does not exist" mask the pre-fix-flags
+    // fixture hid behind (its scenario never created issue #1).
+    let (c, o, e) = forge(&dir, &["forge", "issue", "new", "target issue"]);
+    assert_eq!(c, 0, "issue setup failed: {o} {e}");
+    let (c, o, e) = forge(
         &dir,
         &[
             "forge", "pr", "create", "--source", "feature", "--base", "main", "P",
         ],
     );
-    assert_eq!(c, 0, "{o}");
-    let (c, _, _) = forge(&dir, &["forge", "ci", "run", "1", "--bogus"]);
+    assert_eq!(c, 0, "pr setup failed: {o} {e}");
+
+    // ── the 9 silently-ignoring surfaces: the flag must be NAMED in the error.
+    // Before this fix every one of these exited 0 (issue new even created the
+    // entity with the flag folded into its fields).
+    let (c, _, e) = forge(&dir, &["forge", "issue", "new", "t", "--bogus"]);
+    assert_ne!(c, 0, "issue new --bogus must exit nonzero");
+    assert!(e.contains("--bogus"), "error must name the flag: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "issue", "list", "--bogus"]);
+    assert_ne!(c, 0, "issue list --bogus must exit nonzero");
+    assert!(e.contains("--bogus"), "error must name the flag: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "issue", "show", "1", "--bogus"]);
+    assert_ne!(c, 0, "issue show 1 --bogus must exit nonzero");
+    assert!(e.contains("--bogus"), "error must name the flag: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "issue", "comment", "1", "body", "--bogus"]);
+    assert_ne!(c, 0, "issue comment --bogus must exit nonzero");
+    assert!(e.contains("--bogus"), "error must name the flag: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "issue", "close", "1", "--bogus"]);
+    assert_ne!(c, 0, "issue close --bogus must exit nonzero");
+    assert!(e.contains("--bogus"), "error must name the flag: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "issue", "reopen", "1", "--bogus"]);
+    assert_ne!(c, 0, "issue reopen --bogus must exit nonzero");
+    assert!(e.contains("--bogus"), "error must name the flag: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "list", "--bogus"]);
+    assert_ne!(c, 0, "pr list --bogus must exit nonzero");
+    assert!(e.contains("--bogus"), "error must name the flag: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "show", "2", "--bogus"]);
+    assert_ne!(c, 0, "pr show 2 --bogus must exit nonzero");
+    assert!(e.contains("--bogus"), "error must name the flag: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "comment", "2", "body", "--bogus"]);
+    assert_ne!(c, 0, "pr comment --bogus must exit nonzero");
+    assert!(e.contains("--bogus"), "error must name the flag: {e}");
+    let (c, _, e) = forge(&dir, &["forge", "pr", "diff", "2", "--bogus"]);
+    assert_ne!(c, 0, "pr diff --bogus must exit nonzero");
+    assert!(e.contains("--bogus"), "error must name the flag: {e}");
+
+    // ── strict surfaces unchanged: the already-exiting parsers stay strict ──
+    let (c, _, e) = forge(
+        &dir,
+        &[
+            "forge", "pr", "create", "--source", "feature", "--base", "main", "Q", "--bogus",
+        ],
+    );
+    assert_ne!(c, 0, "pr create --bogus must exit nonzero");
+    assert!(e.contains("unknown option"), "stderr: {e}");
+    let (c, _, _) = forge(&dir, &["forge", "ci", "run", "2", "--bogus"]);
     assert_ne!(c, 0, "ci run --bogus must exit nonzero");
-    let (c, _, _) = forge(&dir, &["forge", "issue", "show", "1", "--bogus"]);
-    assert_ne!(c, 0, "issue show --bogus must exit nonzero");
+
+    // ── no partial side effects: the store holds exactly what the successful
+    // setup commands created (one issue, one PR); every rejected invocation
+    // above wrote nothing (a silent `issue new --bogus` used to allocate an
+    // id and a silent `issue close --bogus` used to close).
+    let (c, o, _) = forge(&dir, &["forge", "issue", "list"]);
+    assert_eq!(c, 0);
+    assert_eq!(o.lines().count(), 1, "exactly the setup issue: {o}");
+    let (c, o, _) = forge(&dir, &["forge", "pr", "list"]);
+    assert_eq!(c, 0);
+    assert_eq!(o.lines().count(), 1, "exactly the setup PR: {o}");
+
+    // ── the known `--json` flag keeps parsing on every JSON-enabled surface
+    // (the strictness must not have swallowed the machine flag) ──
+    for args in [
+        vec!["forge", "issue", "new", "--json", "j"],
+        vec!["forge", "issue", "list", "--json"],
+        vec!["forge", "issue", "show", "1", "--json"],
+        vec!["forge", "pr", "list", "--json"],
+        vec!["forge", "pr", "show", "2", "--json"],
+    ] {
+        let (c, o, e) = forge(&dir, &args);
+        assert_eq!(c, 0, "--json must stay a known flag: {:?} {o} {e}", args);
+        let t = o.trim_start();
+        assert!(t.starts_with('{') || t.starts_with('['), "not JSON: {o:?}");
+    }
+
+    // `--json=x` is NOT the known flag: the bare-token matcher never matched
+    // it, so the per-command parser must still reject it as an unknown option.
+    let (c, _, e) = forge(&dir, &["forge", "issue", "list", "--json=x"]);
+    assert_ne!(c, 0, "--json=x is an unknown option, not --json");
+    assert!(e.contains("--json=x"), "error must name it: {e}");
 }
 
 /// `ci run --json` is a success-path result surface: a RED run still exits 1

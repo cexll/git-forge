@@ -21,12 +21,17 @@ fn json_escape(s: &str) -> String {
     crate::event::json_escape_for_machine(s)
 }
 
-/// Strip every bare `--json` flag token from `args`, returning whether at
-/// least one was present plus the remaining arguments. `--json` is a pure
+/// Strip bare `--json` flag tokens from `args`, returning whether at least
+/// one was present plus the remaining arguments. `--json` is a pure
 /// output-mode switch, so — unlike value-taking options — it is recognized in
-/// ANY position (before or after positionals); `--json=x` is NOT matched and
-/// stays an unknown-option error in the per-command parser. Unknown options
-/// still error — exit-1 is unchanged (VAL-202).
+/// ANY position (before or after positionals); `--json=x` is NOT matched.
+/// This seam ONLY owns the machine-flag split: whether the leftovers are
+/// grammatical belongs to each per-command parser, which rejects any token it
+/// does not know — including a leftover `--json=x` — with a clean
+/// `unknown option '<flag>'` usage error before any side effect (exit-1 is
+/// unchanged, VAL-202). Commands with NO options at all call
+/// [`reject_leftover_flags`] on the remainder; option-taking parsers reject
+/// in their own match arms, where `--source` etc. are known.
 pub(crate) fn json_requested(args: &[String]) -> (bool, Vec<String>) {
     let mut json = false;
     let mut rest = Vec::with_capacity(args.len());
@@ -38,6 +43,40 @@ pub(crate) fn json_requested(args: &[String]) -> (bool, Vec<String>) {
         }
     }
     (json, rest)
+}
+
+/// Reject any FLAG token among the leftovers of a command whose grammar
+/// takes no options: a usage error naming the flag (`--json=x` gets the
+/// bare-flag hint), exit-1, before any side effect (VAL-202). Positionals are
+/// NOT judged here — grammars that consume them (`<n> <body>`) validate
+/// their own arity/existence. Shared by the pure-positional surfaces
+/// (`issue list/show/close/reopen`, `pr list/show/diff`) and both comment
+/// parsers (flags only) so an unknown flag can never be silently ignored.
+pub(crate) fn reject_flags(args: &[String], usage: &str) -> Result<(), String> {
+    for a in args {
+        if a.starts_with('-') {
+            return Err(if a == "--json=x" {
+                format!("unknown option '{a}' (the machine flag is bare `--json`); {usage}")
+            } else {
+                format!("unknown option '{a}'; {usage}")
+            });
+        }
+    }
+    Ok(())
+}
+
+/// [`reject_flags`] plus an unexpected-positional refusal for grammars with
+/// NO positionals at all (`issue list`, `pr list`): anything left over after
+/// the flag check is a `too many` usage error.
+pub(crate) fn reject_leftover_flags(args: &[String], usage: &str) -> Result<(), String> {
+    reject_flags(args, usage)?;
+    if !args.is_empty() {
+        return Err(format!(
+            "{usage} (got {} unexpected argument(s))",
+            args.len()
+        ));
+    }
+    Ok(())
 }
 
 /// Render an `Option<&str>` JSON string member: `null` when absent (and for an
