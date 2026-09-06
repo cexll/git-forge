@@ -1,0 +1,72 @@
+{
+ "feature": "t2 live-base-merge independent repairs (F-001..F-005, all five findings from t2-r1.json)",
+ "worktree": "/Users/chenwenjie/.loop-worktrees/git-forge-66e3ca6d/forge-p2/t2",
+ "branch": "loop/forge-p2/t2",
+ "base": "bc164d2",
+ "head": "ba96be6 (uncommitted working tree changes)",
+ "generatedBy": "RepairT2Review",
+ "status": "IMPLEMENTED AND VERIFIED — central gate pass per Main (clippy/fmt/size/test301); size-gate repair complete (all src files ≤792 tokei code lines)",
+ "scope": "All five blocking findings from /Users/chenwenjie/workspaces/git-forge/.specs/forge-p2/forge-p2/missions/reviews/t2-r1.json repaired or refuted with evidence. F-003 deterministic: finalize now refuses when the revalidated head carries a different generation/source/candidate.",
+ "changedPaths": [
+  "src/event.rs",
+  "src/store.rs",
+  "src/merge_state.rs",
+  "src/pr_merge.rs",
+  "src/pr_prepare.rs (new module)",
+  "src/cli.rs",
+  "src/lib.rs",
+  "src/event_tests.rs",
+  "tests/t3_merge.rs",
+  "docs/architecture/git-forge.md",
+  "scripts/gf-dogfood.sh"
+ ],
+ "verified": true,
+ "validationOwnedBy": "Worker ran validation after Main flagged compile errors (cargo check + cargo test all suites green); Main still owns final central validation + dogfood.",
+ "notes": {
+  "F-001": "Restored generation binding in cmd_ci_run (F-001 writer + race tests added)",
+  "F-002": "User-approved prepare flow implemented; explicit --strategy required",
+  "F-003": "MergeFinalizeSpec.generation + identity revalidation in run_finalize",
+  "F-004": "cleanup_pending_result on genuine finalize failures; tests flipped",
+  "F-005": "docs/architecture/git-forge.md + dogfood updated; ~/.agents mirror out of scope"
+ },
+ "cliContractSnippet": {
+  "prepare": "git forge pr prepare <n> --strategy merge|squash|rebase|ff  (flag REQUIRED); stdout: prepared PR #<n> for strategy <s> (candidate <hex>, generation <g>, base <hex>); pr show additive: prepared: strategy <s> result <hex>",
+  "preparedCandidate": "Appended pr.prepared event (generation, source_head, base_head=CURRENT base tip, strategy, result_commit, result_tree, merge_base) + CAS pin refs/forge/prs/<n>/result -> result_commit; re-prepare replaces (CAS old->new), no generation bump",
+  "merge": "With valid candidate: gate validate_prepared_candidate (generation==current, base_head==base tip, strategy match, decision+CI bound to candidate identity); finalize CASes base candidate.base_head -> candidate.result_commit, no rematerialization. Moved base w/o candidate: refuses naming pr prepare. Stale candidate (post-update): refuses re-prepare remedy. Unmoved + no candidate: legacy path preserved",
+  "ciRun": "With valid candidate: plan runs against candidate result commit; ci.check bound (strategy/result_commit/result_tree/generation/base_head). No candidate: legacy source-snapshot run",
+  "review": "pr review --approve records candidate binding (strategy/result_commit/result_tree) when a current candidate exists; gate requires decision identity == candidate identity"
+ },
+ "testCommandsForMain": [
+  "cargo test",
+  "cargo test --test t3_merge",
+  "./scripts/gf-dogfood.sh"
+ ],
+ "remainingRisks": [
+  "Prepared candidate pin reuses refs/forge/prs/<n>/result; a stale isolated pinned ref with no pr.prepared event keeps the legacy create-time refusal (unchanged test).",
+  "race test cirace depends on temp-worktree liveness detection timing; bounded 30s deadline.",
+  "Result-bound CI on the candidate path: verify_result_ci is now unused (dead) — candidate CI runs against result commit directly."
+ ],
+ "note": " Clippy gates fixed by extraction: cmd_ci_run record/report helper, run_finalize validate_adopted_finalize_tip helper, cmd_pr_prepare materialize_candidate helper (grouped MaterializeInputs struct); PreparedCandidate derives Default; ok_or_else->ok_or.",
+ "sizeGateRepair": {
+  "done": true,
+  "moves": [
+   "store.rs prepare_pr → pr_prepare.rs (store.rs 847→782)",
+   "merge_state.rs validate_prepared_candidate → pr_prepare.rs (820→747)",
+   "cli.rs record_and_report_ci_check+live_base_head_entry → pr_prepare.rs (849→785)"
+  ],
+  "verified": [
+   "just size-gate exit 0",
+   "cargo check 0 errors",
+   "cargo fmt --check clean"
+  ],
+  "dogfoodFixed": true
+ },
+ "dogfoodRepair": {
+  "status": "FIXED AND VERIFIED",
+  "changes": [
+   "scripts/gf-dogfood.sh: after `git forge ci run 24` (lb setup) inserted `git forge pr merge 23 >/dev/null` + `LB_MOVED=\"$(git rev-parse \"$BASE_BRANCH\")\"` — base genuinely moves so the no-candidate refusal and the base-ref assertion hold",
+   "scripts/gf-dogfood.sh: candidate `git forge ci run 24` moved BEFORE the 'lb candidate CI alone still refused' / 'lb CI-alone refusal names approve' assertions (CI-bound-but-decision-unbound genuine CI-alone case); approve stays after refusals; assertion count unchanged"
+  ],
+  "verified": "real bash scripts/gf-dogfood.sh run: 135 pass / 0 fail (all 13 lb checks green); bash -n clean; uncommitted"
+ }
+}

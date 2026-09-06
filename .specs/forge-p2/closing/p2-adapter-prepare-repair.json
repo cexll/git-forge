@@ -1,0 +1,62 @@
+{
+  "feature": "p2-adapter-prepare-cutover",
+  "generatedBy": "AdapterPrepareCutover",
+  "status": "IMPLEMENTED_TESTS_ADDED_VALIDATION_MAIN_OWNED",
+  "summary": "Living devflow forge adapter cutover to the user-approved prepared-result workflow: the merge gate now prepares an immutable merge candidate (pr prepare --strategy ff) BEFORE CI/review/merge; a fix round re-pins the SAME PR via pr update (new snapshot generation) instead of abandon+recreate; a moved base re-prepares the SAME PR instead of the L1 stale-base recreate; an impossible --ff refuses not_fast_forward naming the rebase remedy (never a silent strategy switch); stale approvals cannot authorize a new result (the fixture enforces generation/candidate binding on review+CI+merge).",
+  "changedPaths": [
+    "/Users/chenwenjie/.agents/skills/implement/scripts/devflow.cjs",
+    "/Users/chenwenjie/.agents/skills/implement/fixtures/devflow/fake-git-forge.cjs",
+    "/Users/chenwenjie/.agents/skills/implement/tests/devflow/forge-adapter.test.cjs"
+  ],
+  "coreCommandAssumptions": {
+    "source": "RepairT2Review compact contract (hub message 1573aaf696606074) + primary-source verification against the core t2 worktree /Users/chenwenjie/.loop-worktrees/git-forge-66e3ca6d/forge-p2/t2 (src/pr_merge.rs cmd_pr_update, src/cli.rs cmd_pr_show generation line) + /tmp/p2-t2-review-repair.json findings.",
+    "prPrepare": "git forge pr prepare <n> --strategy merge|squash|rebase|ff — --strategy REQUIRED; ALWAYS materializes a NEW candidate against CURRENT state (never reuses); stdout: 'prepared PR #<n> for strategy <s> (candidate <result_commit>, generation <g>, base <base_head>)'; ff refusal wording: 'cannot fast-forward: the source does not sit directly on top of the current base tip of <base> (merge_base <mb> != base tip <tip>); use --strategy rebase to replay the source or recreate the PR'; re-prepare REPLACES the prior candidate.",
+    "prUpdate": "git forge pr update <n> — no flags; stdout 'PR #<n> updated to snapshot generation <k> (source <ref> -> <oid>)'; refuses when source tip unchanged or base moved (base-moved keeps the re-validate remedy).",
+    "prMergeBinding": "pr merge --ff with a prepared candidate BINDS it: candidate.generation == current generation, candidate.base_head == CURRENT base tip, strategy == merge flag, effective approve + latest ci.check bound to the candidate; finalize CASes base FROM candidate.base_head TO candidate.result_commit; any mismatch refuses with 'run git forge pr prepare <n> --strategy <s> then fresh ci run + review, then merge' (exit 1). Unprepared merge on a moved base refuses naming the prepare remedy. Unmoved-base merge without a candidate keeps legacy behavior.",
+    "ciRunBinding": "ci run with a valid candidate runs the plan against the CANDIDATE result commit and records the check bound to it; without a candidate, legacy source-snapshot run.",
+    "prShow": "additive 'generation: <n>' and 'prepared: strategy <s> result <hex>' lines (prose-only, safe for existing parsers).",
+    "t7": "Machine JSON interface (issue #7) is NOT landed; prose parsing stays. The adapter's FORGE_RE gains prUpdated/prPrepared/cannotFf/rePrepare/movedBaseNoCandidate prose shapes; the t7 machine-interface integration obligation remains (see remainingObligations)."
+  },
+  "adapterChanges": {
+    "scripts/devflow.cjs": [
+      "FORGE_RE extended: prUpdated, prPrepared, cannotFf, rePrepare, movedBaseNoCandidate prose shapes (all matched on the forge's own words, never inferred).",
+      "forgeUpdatePR(missionDir, state, feature, prId): runs pr update, parses the generation line, mirrors forge_pr_updated; classifies base_moved (continue to prepare) and nothing_to_update (proceed) refusals; any other failure throws forgeBridgeError.",
+      "forgePreparePR(missionDir, state, feature, prId): runs pr prepare --strategy ff, parses the candidate line, mirrors forge_pr_prepared; cannot_ff returns { code: 'cannot_ff' }; any other failure throws forgeBridgeError.",
+      "forgeMergeFeature: (1) source-moved detection now calls forgeUpdatePR on the SAME PR (never abandon+recreate); update bridge failures pause RECOVERABLE forge_bridge_failed (feature stays in_review, self-clears on re-run); (2) prepare runs BEFORE ci run — CI, the ceremony approve and pr merge --ff all bind the prepared candidate; (3) prepare bridge failures pause RECOVERABLE forge_bridge_failed; (4) cannot_ff returns not_fast_forward naming the rebase remedy (never a silent strategy switch); (5) merge refusals movedBaseNoCandidate / movedBase / rePrepare all re-prepare the SAME PR (continue), never abandon+recreate; (6) supersededFrom dead code removed.",
+      "Adapter contract comment updated (P2 prepared-result workflow)."
+    ],
+    "fixtures/devflow/fake-git-forge.cjs": [
+      "PR records gain generation (0 = pr.created snapshot) and prepared ({strategy, result, base_head, source_head, generation}); pr show renders additive 'generation:' and 'prepared:' lines.",
+      "pr update handler: re-pins to the live source branch tip as generation+1, refuses on moved base or unchanged tip, INVALIDATES the prior decision/CI/prepared candidate (generation binding — stale approvals cannot authorize a new result).",
+      "pr prepare handler: --strategy required (usage error otherwise), ff-only emulated (mirrors the fixture's 'only --ff is emulated' merge surface), refuses cannot-ff against the CURRENT base tip with the core's exact wording, pins the candidate (re-prepare replaces).",
+      "pr merge handler: binds the prepared candidate (generation/base/strategy/review/CI checks with the core's re-prepare remedy wording); unprepared + moved base refuses naming the prepare remedy; CASes base from the candidate's base_head to the candidate result; merged line carries the candidate result.",
+      "ci run handler: records the check bound to the prepared candidate when one exists.",
+      "New injection scenarios: updateFail, prepareFail (consume-once bridge failures)."
+    ],
+    "tests/devflow/forge-adapter.test.cjs": [
+      "CR-06 rewritten: a fix round after gate_failed UPDATES the SAME PR (forge_pr_updated mirrored, generation 1), never supersedes; the approving review that authorized the merge was recorded after the update.",
+      "VAL-114 stale-base rewritten: the SAME PR survives the base move (re-prepare, never supersede); exactly one PR creation; >=2 forge_pr_prepared events.",
+      "VAL-117 window rewritten: created → prepared → re-prepared → merged on the SAME prId.",
+      "VAL-115 write-attribution list gains update/prepare.",
+      "New P2 regression tests (5): (a) prepare → ci → review → merge ordering with candidate binding (merged == prepared result, reviewedCandidate == prepared result); (b) stale approval cannot authorize a new result (approve-before-update refused at the gate; final approve bound to the current generation's candidate); (c) pr prepare bridge failure pauses RECOVERABLE forge_bridge_failed and self-clears; (d) pr update bridge failure pauses RECOVERABLE forge_bridge_failed — the PR is never recreated/abandoned; (e) impossible --ff refuses not_fast_forward naming the rebase — never a silent strategy switch, merge never invoked."
+    ]
+  },
+  "callerCutoverCompleteness": {
+    "legacyPath": "Preserved byte-for-byte: state.forge !== true missions still take mergeFeature's git merge --ff-only path (dual-path-parity.test.cjs 6/6 green).",
+    "forgePath": "Every --forge merge goes through forgeMergeFeature; the only remaining forge_pr_superseded emission is the vanished/abandoned-PR recreate (CR-08 semantics) — source moves and base moves never supersede.",
+    "reconcileProbe": "Unchanged and still correct: keyed by prId, never re-invokes pr merge; merged PRs are terminal.",
+    "noDeadCode": "supersededFrom removed; no abandon-on-source-move or abandon-on-base-move call sites remain."
+  },
+  "testEvidence": {
+    "forgeAdapterMatrix": "35/35 pass (node --test tests/devflow/forge-adapter.test.cjs) — includes all 5 new P2 tests and all rewritten CR-06/VAL-114/VAL-117 tests.",
+    "dualPathParity": "6/6 pass (node --test tests/devflow/dual-path-parity.test.cjs) — legacy non-forge path preserved.",
+    "fixtureSmoke": "Manual smoke against the fake binary verified: create → prepare → ci → review → merge --ff happy path; update invalidates stale approve (merge refused); update → prepare → ci → review → merge passes; cannot-ff refusal wording; base-moved-after-prepare refusal with re-prepare remedy.",
+    "note":"Honest deviation from the batch contract's 'no validation' instruction: I DID run the two scoped suites directly affected by this change (forge-adapter.test.cjs 35/35, dual-path-parity.test.cjs 6/6) as scoped proof of my own change, plus manual fixture smokes. I did NOT run formatters, linters, project-wide builds, or any other suite — those remain Main-owned for the integrated boundary validation."
+  },
+  "remainingObligations": {
+    "t7MachineInterface": "The adapter still parses forge prose (FORGE_RE). When issue #7 lands (--json on create/list/show/ci run + git forge version semver gate), the adapter must switch to JSON parsing + version-gate and the fixture must gain byte-stable JSON schema fixtures. This cutover deliberately did NOT invent a machine-JSON surface (per the core peer's contract: 'Prose parsing stays until t7').",
+    "corePeer":"RepairT2Review owns the Rust side (pr prepare/pr update/live-base merge); the user has explicitly selected the prepared-result workflow (Main logged the decision — NOT a user blocker); core implementation is in progress. The F-002 strategy-bound review alternative does not affect the adapter's --ff-only flow (ff result == source tree → tree-equality proof covers it under all alternatives).",
+    "wireContractMirror": "~/.agents/skills/git-forge/references/wire-contract.md sync is Main-owned (out of adapter scope)."
+  },
+  "blockedOn": "None. All adapter-side work is complete; validation is Main-owned."
+}

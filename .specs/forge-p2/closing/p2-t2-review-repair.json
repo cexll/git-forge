@@ -1,0 +1,188 @@
+{
+ "feature": "t2",
+ "round": 1,
+ "generatedBy": "RepairT2Review",
+ "status": "IMPLEMENTED AND VERIFIED — central gate pass per Main (clippy/fmt/size/test301); size-gate repair done (store.rs 847→782, merge_state.rs 820→747, cli.rs 849→785; all ≤792 now); dogfood lb-block failure under FixPreparedDogfood ownership",
+ "reviewSource": "/Users/chenwenjie/workspaces/git-forge/.specs/forge-p2/forge-p2/missions/reviews/t2-r1.json",
+ "worktree": "/Users/chenwenjie/.loop-worktrees/git-forge-66e3ca6d/forge-p2/t2",
+ "branch": "loop/forge-p2/t2",
+ "base": "bc164d2",
+ "head": "ba96be6",
+ "note": "Implemented in worktree /Users/chenwenjie/.loop-worktrees/git-forge-66e3ca6d/forge-p2/t2 (branch loop/forge-p2/t2, uncommitted). F-002 repair = user-approved explicit `pr prepare` candidate flow. Validation run by worker after Main flagged compile errors: cargo check clean, cargo test all suites green (t0 53, t1a 11, t1b 26, t2_pr 93, t3_merge 86, plus unit suites). Clippy gates fixed by extraction: cmd_ci_run record/report helper, run_finalize validate_adopted_finalize_tip helper, cmd_pr_prepare materialize_candidate helper (grouped MaterializeInputs struct); PreparedCandidate derives Default; ok_or_else->ok_or. Size-gate repair (Main directive, just size-gate was red): moved `prepare_pr` from store.rs to pr_prepare.rs as pub(crate) free fn over the crate-visible store API (store.rs 847→782 tokei code lines); moved `validate_prepared_candidate` from merge_state.rs to pr_prepare.rs (820→747); moved `record_and_report_ci_check` + `live_base_head_entry` from cli.rs to pr_prepare.rs (849→785); made MAX_APPEND_RETRIES pub(crate). pr_prepare.rs now 489 code lines. `just size-gate` exit 0, cargo fmt --check clean, cargo check 0 errors. verify_result_ci retained (still used by unmoved legacy path in pr_merge.rs). 5 pre-existing `uninlined_format_args` warnings (cli.rs:65/330, git.rs:849, event_tests.rs:204/321) fail `just lint` under `-D warnings`; not introduced by these moves — flagged to Main.",
+ "findings": [
+  {
+   "itemId": "F-001",
+   "severity": "blocking",
+   "verdict": "REPAIR_PLANNED (unambiguous, no decision needed)",
+   "verified": true,
+   "anchor": "src/cli.rs:886-897 (cmd_ci_run body: status+plan inserted, then only base_head; the `generation` insert was REPLACED, not kept additive). Fold default: src/event.rs:444-448 `ci_generation = body.get(\"generation\").and_then(as_u64).unwrap_or(self.generation)`.",
+   "analysis": "t1's generation binding (bc164d2) recorded the CI generation in the ci.check body; the t2 diff (ba96be6) deleted `body.insert(\"generation\", ...)` from cmd_ci_run and left the base_head block. Corrected trigger (per Main + review text): `ci run` reads state.generation=0, starts testing gen0 source; `pr update` appends gen1 while the plan runs; `ci run`'s append_event CAS-retries and re-parents the completed check onto the gen1 tip. Because the body lacks `generation`, the fold defaults ci_generation to the fold-time generation (1), so the gen0-results check looks gen1-current; a fresh gen1 approve then lets the gate merge updated source using CI that validated gen0. Regression of t1/VAL-206 in the in-flight race.",
+   "repairPlan": [
+    "Restore `body.insert(\"generation\", JsonValue::Number(generation as i64))` in cmd_ci_run BEFORE the base_head block (generation var already in scope). Keep base_head additive.",
+    "Regression tests (tests/t3_merge.rs): (a) writer-level — after ci run on gen0, assert emitted ci.check event JSON contains \"generation\":0 (mirrors ci_check_and_review_record_base_head); (b) race-level — park the CI plan on a marker file, start `ci run` as a child, run `pr update` (requires a fix-round commit first) while parked, then release; assert the emitted check carries generation 0 AND `pr merge` after a fresh gen1 approve refuses ('stale ... generation 0, current ... generation 1'); then fresh ci + merge passes."
+   ]
+  },
+  {
+   "itemId": "F-002",
+   "severity": "blocking",
+   "verdict": "REPAIR_BLOCKED_ON_DECISION (user-visible flow change required; alternatives below)",
+   "verified": true,
+   "anchor": "src/cli.rs:486-497 (cmd_pr_review writes generation + base_head, no strategy); src/merge_state.rs:146-178 (validate_result_bound_gate: ci_base_head == current tip && decision_base_head == current tip, no strategy/result identity); src/merge_state.rs:180-218 (verify_result_ci: tree-equality proof OR unrecorded result-tree plan run); src/pr_merge.rs:153-160 (moved-base gate call site).",
+   "analysis": "Spec authority (issue #2 amendment, refs/forge/issues/2, comment b79a87e): clause 1 allows 'run the CI plan against the result tree, or prove result tree == the tree CI checked' (verify_result_ci implements this). Clause 2: 'A review decision must be bound to the result being merged'. Clause 3: 'no path merges an unreviewed or unchecked result'. The reviewer's case: the same approval is accepted for --merge/--squash/--rebase; the result-tree CI run is unrecorded and cannot make the earlier review authorize the result; a merger can silently choose a different result-producing strategy while the gate passes. Primary-source facts: (1) on an UNMOVED base, all four strategies produce result tree == source tree (merge commit tree == squash tree == rebase replay tree == ff source tree; base is an ancestor), so tree-equality proof covers every strategy; (2) on a MOVED base (the live-base #2 path), the result tree genuinely differs from the source tree, so the strategy and the materialized result identity are NOT covered by an input-bound approve + source check. Therefore the exact-result binding is required exactly on the moved-base path. KEY CONSTRAINT: VAL-207's evidence 'fresh CI+review 后通过' and the reviewer's own summary ('VAL-207's two-PR happy/refusal path ... are present, but integration is blocked') plus the acceptance flow in tests/t3_merge.rs:4729-4734 (fresh ci + plain `pr review --approve` then `pr merge` expects exit 0) and adapter devflow.cjs:2170/2553 (`pr review <id> --approve` then `pr merge <id> --ff`; adapter is out of scope / must not be altered). This is the core tension: pre-materialization approval cannot literally record a result commit that does not exist yet; the acceptance flow is a single merge invocation after one approve.",
+   "decisionRequired": true,
+   "decisionQuestion": "For moved-base (live-base) merges, how must the approval bind to the materialized result? Choose minimal alternative below; each is a user-visible flow change that must be approved by the user (adapter flow `review --approve` then `merge --ff` stays valid under all four because ff result == source tree → tree-equality proof covers it).",
+   "alternatives": [
+    {
+     "id": "ALT-1 strategy-bound review (recommended, smallest)",
+     "userVisibleFlow": "Live-base merges require the approval to name the strategy: `git forge pr review <n> --approve --strategy merge|squash|rebase|ff`. `pr merge <n> --<strategy>` on a moved base then requires the effective review's bound strategy to EQUAL the requested strategy; mismatch refuses with a re-review remedy (re-approve with the matching --strategy). Unmoved-base merges keep legacy plain approve (tree equality proves the result tree == tree CI checked, so any strategy's content is the reviewed tree). pr.merge event already records {strategy, result_commit}; optionally also record result_tree. Existing live-base tests + dogfood gain `--strategy` on the fresh approve; all unmoved-base tests and the adapter stay byte-identical.",
+     "satisfies": "Clause 2 (review bound to the result via deterministic strategy+source+base inputs, with the materialized tree CI-proved equal or re-run); reviewer's 'same approval accepted for all strategies' closed on the moved-base path; VAL-207 passes (fresh CI + fresh strategy-bound approve → merge passes, one invocation); adapter untouched.",
+     "cost": "CLI surface: pr review gains --strategy; gate enforces equality; 3-4 t3 tests + dogfood live-base section gain the flag. About 60-100 lines + tests."
+    },
+    {
+     "id": "ALT-2 post-materialization re-review (reviewer's literal suggested fix)",
+     "userVisibleFlow": "Moved-base merge materializes the result FIRST, pins it (pending result ref + result identity = strategy+commit+tree), and REFUSES the merge until a fresh result-bound review (and result-bound CI check) is recorded against that exact identity; the finalize only accepts a candidate whose identity exactly equals the recorded one. Unmoved-base merges need no re-review (tree equality). Adapter --ff path unaffected.",
+     "satisfies": "Reviewer's literal 'record it on both the successful Check and approving Review, and require exact equality with the candidate passed to finalize; otherwise require re-review after materialization'.",
+     "cost": "Changes the acceptance/dogfood live-base flow to TWO merge invocations with an intermediate result-bound approve+ci (tests/t3_merge.rs:4729-4734, dogfood lb section, live_base_merge_requires_each_gate_input_rebound ALL change shape); merge command grows a resume/finalize-on-pinned-result mode; new CLI surface (review/ci bound to the pending result; merge resume). Significantly larger; conflicts with the reviewer's own 'VAL-207 path is present' stance and with 'single approve then merge passes' reading of the ticket acceptance."
+    },
+    {
+     "id": "ALT-3 hybrid: strategy-bound review + strategy/result recorded on pr.merge + result-tree CI recorded as a result-bound ci.check in the finalize transaction",
+     "userVisibleFlow": "Same as ALT-1 (moved-base approve must carry --strategy), plus the finalize transaction atomically writes a result-bound ci.check event (status, plan, generation, base_head, strategy, result_commit) as an intermediate parent of the pr.merge event, so the 'successful Check' is ALSO recorded bound to the materialized result identity. This is ALT-1 + the full 'record it on both' ask.",
+     "satisfies": "ALT-1 + reviewer's 'record it on both the successful Check and approving Review'.",
+     "cost": "ALT-1 + finalize transaction change (write two unappended event commits in one update-ref batch; head CAS parent chain: head_expected → result ci.check → pr.merge). Moderate extra complexity; must keep VAL-208 atomicity tests green (nothing applied on CAS failure — the extra commit is dangling on failure, refs unchanged)."
+    }
+   ],
+   "recommendation": "ALT-3 if the user accepts a moved-base flow where the approving review must name the strategy; ALT-1 if minimality dominates. Explicitly recommended NOT to ship the current behavior (unbound approval valid for moved-base results) — that is exactly F-002's unresolved defect.",
+   "forbidden": "Do not implement unbound-legacy-valid approvals for moved-base results (Main directive)."
+  },
+  {
+   "itemId": "F-003",
+   "severity": "blocking",
+   "verdict": "REPAIR_PLANNED (unambiguous, no decision needed)",
+   "verified": true,
+   "anchor": "src/merge_state.rs:581-745 run_finalize retry loop; adoption at 712-742 (head_extends_pr_chain → validate_merge_gate_at(tip) → head_expected = tip → retry with the SAME merge_event built once at run_finalize start carrying the OLD spec.result_commit). Spec construction src/pr_merge.rs:445-468 (no generation carried; source_head hex present as &str).",
+   "analysis": "Candidate verified against (generation, source) read at merge start; if `pr update` + fresh approve + valid CI land during the pending window, the retry revalidates the moved tip (gate passes on the fresh gen) and adopts it, then finalizes the OLD generation's result_commit under the NEW generation head, falsely marking updated content merged. The head CAS prevents unvalidated appends but not this validated-yet-different result substitution.",
+   "repairPlan": [
+    "MergeFinalizeSpec gains `generation: u64` (source identity already carried as source_head hex; snapshot base already carried).",
+    "In run_finalize, after a head-move adoption candidate passes validate_merge_gate_at, require `revalidated.generation == spec.generation && revalidated.source_head.as_deref() == Some(spec.source_head)`; on identity change REFUSE + cleanup_pending_result + name the generation/source change (refuse-and-cleanup, per finding; no silent rematerialize).",
+    "Regression (tests/t3_merge.rs): park merge in GIT_FORGE_TEST_MERGE_BARRIER window; while parked commit a fix round, `pr update`, fresh `ci run`, fresh `review --approve`; release; assert merge refuses naming the snapshot change, base/head refs unchanged, no pr.merge event, pending result ref cleaned (absent)."
+   ]
+  },
+  {
+   "itemId": "F-004",
+   "severity": "blocking",
+   "verdict": "REPAIR_PLANNED (unambiguous, no decision needed)",
+   "verified": true,
+   "anchor": "src/merge_state.rs:686-695 (head vanished branch returns 'pending result ref ... left in place' without cleanup), 705-722 (unchanged-head genuine failure — the base-CAS-conflict branch — retains the pending ref), 722-731 (non-append move refuses retaining it). Test encoding the wrong expectation: tests/t3_merge.rs:4853-4872 (live_base_finalize_cas_conflict_leaves_no_partial_write asserts refs/forge/prs/2/result EXISTS '.expect(\"pending result ref left in place per the failure contract\")'); also tests/t3_merge.rs:2668-2684 (head-vanished test asserts ref remains).",
+   "analysis": "Wire contract (docs/architecture/git-forge.md:123-124) says the pending ref is 'deleted in final transaction or reported as leftover on failure' — the report-leftover fallback must be reserved for when the best-effort CAS deletion itself fails; the unchanged-head genuine-failure branch instead deliberately retains it, leaving a partial ref that contradicts VAL-208's 'refs unchanged' and the transaction-failure cleanup contract. cleanup_pending_result already implements exactly the needed best-effort CAS delete + leftover-suffix-on-failure.",
+   "repairPlan": [
+    "run_finalize: in the head-vanished, unchanged-head genuine, and non-append failure branches, call cleanup_pending_result BEFORE returning and append its 'left in place' suffix only when the CAS deletion fails.",
+    "Flip the encoded tests: VAL-208 CAS test asserts refs/forge/prs/2/result ABSENT; head-vanished test asserts absent. finalize_failure_after_barrier (t3:2259) keeps passing unchanged because its pending ref is MOVED (sabotage) so the cleanup CAS legitimately fails and 'left in place' is reported.",
+    "Update wire contract sentence about the pending-ref lifecycle (F-005)."
+   ]
+  },
+  {
+   "itemId": "F-005",
+   "severity": "blocking",
+   "verdict": "REPAIR_PLANNED (docs, no decision needed)",
+   "verified": true,
+   "anchor": "docs/architecture/git-forge.md: ref layout 121-126 (no generation refs), schema table 170-176 (pr.review/ci.check bodies without generation/base_head; no pr.update row), PR lifecycle 189-201 (stale-base rejection; snapshot-base execution/CAS), merge completion 227-228 (CAS from snapshot base_head, not gate-validated tip), Known Limitations 253-254 and 256 (stale-base L1; no-pr.update). AGENTS.md:104 makes the doc normative; AGENTS.md:191 requires docs to change with behavior.",
+   "analysis": "The patch changed v1 event payloads and merge semantics but left the normative wire contract describing stale-base refusal, snapshot-base execution/CAS, and generation/base_head/strategy bindings absent — producers and consumers contradict the contract.",
+   "repairPlan": [
+    "Update docs/architecture/git-forge.md: generation refs (gen/<k>/{source,base}) + pr.update event row; pr.review/ci.check bodies (generation, base_head, strategy); live-base recompute + result-bound gates; finalize CAS from gate-validated current base tip; pending-ref best-effort deletion on genuine finalization failure; pr.merge result identity.",
+    "Update repo-local skill mirror .agents/skills/git-forge/SKILL.md consistently (stale-base bullet → live-base; merge-gate bullet; review/CI binding notes).",
+    "Note: the ~/.agents/skills/git-forge/references/wire-contract.md mirror is OUT of my ownership (contract: do not edit ~/.agents living files) — Main must sync it after merge."
+   ]
+  }
+ ],
+ "crossCutting": {
+  "integrationImpact": "F-002 decision gates test/dogfood edits for live-base paths; F-001/F-003/F-004/F-005 are independent of the F-002 choice and can be implemented once the decision lands.",
+  "preservedContracts": "VAL-207/208 and the t1 generation contract are preserved under ALL F-002 alternatives for unmoved-base merges; only the moved-base live-base approve gains the strategy flag (ALT-1/3) or the extra re-review round (ALT-2)."
+ },
+ "testCommandsForMain": [
+  "cargo test",
+  "cargo test --test t3_merge",
+  "./scripts/gf-dogfood.sh"
+ ],
+ "changedPaths": [
+  "src/event.rs",
+  "src/store.rs",
+  "src/merge_state.rs",
+  "src/pr_merge.rs",
+  "src/pr_prepare.rs (new)",
+  "src/cli.rs",
+  "src/lib.rs",
+  "src/event_tests.rs",
+  "tests/t3_merge.rs",
+  "docs/architecture/git-forge.md",
+  "scripts/gf-dogfood.sh"
+ ],
+ "remainingRisks": [
+  "F-002 decision is the single open blocker; every alternative changes the user-visible moved-base approval flow and must be user-approved (named explicitly above).",
+  "~/.agents wire-contract mirror sync must be performed by Main (out of my ownership).",
+  "F-001 race regression needs a parked-CI-plan test; timing must be deterministic (marker-file handshake, not sleeps)."
+ ],
+ "blockedOn": {
+  "kind": "design-decision-user-input",
+  "summary": "Choose ALT-1 / ALT-2 / ALT-3 for F-002 (recommend ALT-3 or ALT-1). Until decided, no production edits are made.",
+  "question": "May the moved-base (live-base) approval require an explicit merge strategy (--strategy merge|squash|rebase|ff), enforced at the gate with mismatch refusal + re-review remedy, while unmoved-base merges keep the legacy plain approve (tree-equality proof)?",
+  "options": [
+   "ALT-1 strategy-bound review",
+   "ALT-2 post-materialization re-review",
+   "ALT-3 ALT-1 + recorded result-bound ci.check + strategy on pr.merge",
+   "reject all and amend acceptance flow"
+  ]
+ },
+ "perFindingImplementation": {
+  "F-001": {
+   "implemented": true,
+   "details": "cmd_ci_run body.restored body.insert(\"generation\", Number(generation as i64)) before base_head (cli.rs); generation captured at run START and stamped after the run (captured identity, not fresh fold). Added writer test ci_check_records_generation_binding + race test in_flight_gen0_ci_after_update_is_stale (parked CI plan via marker file, pr update during the run, assert check carries generation 0 and gen0 check cannot green gen1 merge).",
+   "anchor": "src/cli.rs cmd_ci_run; event.rs ci_generation fold default preserved."
+  },
+  "F-002": {
+   "implemented": true,
+   "details": "User-approved prepare flow: `git forge pr prepare <n> --strategy merge|squash|rebase|ff` (flag REQUIRED). New src/pr_prepare.rs cmd_pr_prepare: validates PR/not abandoned/not merged, base exists, single merge base, ff precondition; materializes strategy in temp worktree (detach current base tip; rebase detaches source), reads result_commit+result_tree, appends pr.prepared event + CAS-pins refs/forge/prs/<n>/result atomically (BoundEventStore::prepare_pr; replace allowed; no generation bump). stdout: `prepared PR #<n> for strategy <s> (candidate <c>, generation <g>, base <b>)`; pr show additive `prepared: strategy <s> result <hex>` line. Merge binds candidate: validate_prepared_candidate (generation/base_head/strategy + decision/CI bound to candidate); finalize CASes base candidate.base_head->result_commit; moved-base w/o candidate refuses naming prepare; stale candidate (update) refuses re-prepare. ci run with valid candidate runs plan against result commit, records bound check. pr review records candidate binding. Tests: prepare_pins_candidate_and_show_renders, re_prepare_replaces_candidate_and_stale_approval_refuses, update_invalidates_prepared_candidate_and_strategy_mismatch_refuses + VAL-207/208 + rebind + result-ci rewritten to prepare flow.",
+   "anchor": "src/cli.rs, src/pr_merge.rs, src/merge_state.rs, src/pr_prepare.rs, src/store.rs"
+  },
+  "F-003": {
+   "implemented": true,
+   "details": "MergeFinalizeSpec.generation + prepared_result; run_finalize adoption requires revalidated.generation==spec.generation && revalidated.source_head==spec.source_head && candidate identity unchanged, else refuse+cleanup naming snapshot change. Test finalize_refuses_snapshot_change_during_pending_window.",
+   "anchor": "src/merge_state.rs run_finalize"
+  },
+  "F-004": {
+   "implemented": true,
+   "details": "run_finalize head-vanished/unchanged-head/non-append branches call cleanup_pending_result before returning (leftover suffix only when CAS delete fails). Flipped VAL-208 (refs/forge/prs/2/result absent) + head-vanished test (absent, no \"left in place\"). finalize_failure_after_barrier (ref moved) remains \"left in place\".",
+   "anchor": "src/merge_state.rs 686-731"
+  },
+  "F-005": {
+   "implemented": true,
+   "details": "docs/architecture/git-forge.md updated: ref layout (gen refs + result lifecycle), schema table (pr.update/pr.prepared/review/ci.check bodies), live-base prepare bullets, pending-ref failure sentence, Known Limitations. scripts/gf-dogfood.sh live-base section rewritten. ~/.agents mirror out of ownership (Main syncs).",
+   "anchor": "docs/architecture/git-forge.md"
+  }
+ },
+ "sizeGateRepair": {
+  "violationsAfter": [
+   "none — all src files ≤792 tokei code lines (git.rs 792, cli.rs 785, store.rs 782, event.rs 759, merge_state.rs 747, pr_prepare.rs 489)"
+  ],
+  "moves": [
+   "store.rs: prepare_pr method → pr_prepare.rs pub(crate) fn prepare_pr(store:&BoundEventStore,...) via store.store()/write_event_commit/run_update_ref_stdin; MAX_APPEND_RETRIES → pub(crate)",
+   "merge_state.rs: validate_prepared_candidate (77 lines + doc) → pr_prepare.rs",
+   "cli.rs: record_and_report_ci_check + live_base_head_entry (90 lines) → pr_prepare.rs"
+  ],
+  "callsiteUpdates": [
+   "pr_merge.rs: crate::merge_state::validate_prepared_candidate → crate::pr_prepare::validate_prepared_candidate"
+  ],
+  "verified": [
+   "just size-gate exit 0",
+   "cargo check 0 errors",
+   "cargo fmt --check clean"
+  ]
+ },
+ "dogfoodRepair": {
+  "status": "FIXED AND VERIFIED",
+  "changes": [
+   "scripts/gf-dogfood.sh: after `git forge ci run 24` (lb setup) inserted `git forge pr merge 23 >/dev/null` + `LB_MOVED=\"$(git rev-parse \"$BASE_BRANCH\")\"` — base genuinely moves so the no-candidate refusal and the base-ref assertion hold",
+   "scripts/gf-dogfood.sh: candidate `git forge ci run 24` moved BEFORE the 'lb candidate CI alone still refused' / 'lb CI-alone refusal names approve' assertions (CI-bound-but-decision-unbound genuine CI-alone case); approve stays after refusals; assertion count unchanged"
+  ],
+  "verified": "real bash scripts/gf-dogfood.sh run: 135 pass / 0 fail (all 13 lb checks green); bash -n clean; uncommitted"
+ }
+}

@@ -1,0 +1,247 @@
+{
+  "generated": "2026-09-07",
+  "audit_scope": "forge-p2 leftover debt; read-only. Repos: git-forge @ master e1ea778 (clean working tree), living adapter repo /Users/chenwenjie/.agents (branch main) @ a9f22072.",
+  "root_cause_note": "The forge-p2 pipeline closed the REAL-flow twins of every ticket (PRs #26-#32 closed issues #20-#23, #30, #19) but the ORIGINAL tickets filed before/alongside the pipeline (#3-#6, #9-#12, #14-#17, #24) never received issue-close events. Findings only; no success claims.",
+  "issues": [
+    {
+      "id": 3,
+      "title": "Post-merge base refresh / allow merge while base is checked out",
+      "implemented": true,
+      "evidence": [
+        "Commit e15fb43 'feat(forge-p1/t1): #3 live-base refresh - merge with clean checked-out base, never-split refresh rollback (VAL-105..108)' directly names the issue",
+        "Hardening: a0f6340 (refresh dirty re-check), 4865103 (refresh-failure rollback re-anchors CASes, VAL-107)",
+        "Flow contract .agents/qa/flows/forge-ff-live-base-merge.md proves VAL-105/106/108 all pass at forge @7871091 (clean checked-out base merges + worktree refreshed; untracked dirt refused, ignored-only passes; docs declare sparse-checkout/submodules out of scope)",
+        "Spec amendment satisfied: refresh failure leaves refs unchanged + leftover reported (VAL-107 in flow, code in src/store.rs/merge_state.rs)"
+      ],
+      "recommendation": "close-with-comment",
+      "comment": "Implemented in forge-p1 t1 (e15fb43) with rollback hardening (4865103, a0f6340); flow contract forge-ff-live-base-merge.md carries VAL-105..108, all pass."
+    },
+    {
+      "id": 4,
+      "title": "Source worktree/branch cleanup after pr merge (--recycle-worktree)",
+      "implemented": true,
+      "evidence": [
+        "Commit 5f40af4 'feat(forge-p1/t2): #4 pr merge --recycle-worktree - source worktree/branch recycle (VAL-109..112)'",
+        "Review fixes: a0f6340 (merged line on recycle Err), ba5de54/7871091 (adapter snapshot sync)",
+        "Flow contract .agents/qa/flows/forge-recycle-worktree.md: six-state outcome vocabulary (removed | refused-dirty | refused-not-contained | partial-leftover | branch-deleted | branch-kept) exactly matches the spec amendment; VAL-109..112 all pass at forge @7871091"
+      ],
+      "recommendation": "close-with-comment",
+      "comment": "Implemented by 5f40af4 (+a0f6340 review fixes); flow contract forge-recycle-worktree.md carries VAL-109..112, all pass."
+    },
+    {
+      "id": 5,
+      "title": "Issue-PR linkage (--closes)",
+      "implemented": true,
+      "evidence": [
+        "Commit 27c9b7f 'pr create --closes records and shows the closes relationship' (forge-p0/t1)",
+        "Commit 3fadb06 'finalize transaction closes the linked issue in the same update-ref batch' (forge-p0/t2) - matches the transactional-close amendment",
+        "Commit 3f4c2f8 'failed merges keep the linked issue open (VAL-004)'; rollback fix 4865103",
+        "Flow contract .agents/qa/flows/forge-PR-closes-issue.md VAL-001..004 all pass at 125dba3 (incl. pre-closed no-op VAL-003, failed-merge-stays-open VAL-004)",
+        "P2 sweep VAL-209 pass re-verified closes linkage on the real repo"
+      ],
+      "recommendation": "close-with-comment",
+      "comment": "Implemented in forge-p0 (27c9b7f + 3fadb06, hardened by 4865103); flow contract forge-PR-closes-issue.md carries VAL-001..004, all pass."
+    },
+    {
+      "id": 6,
+      "title": "Abandon / close-without-merge terminal state",
+      "implemented": true,
+      "evidence": [
+        "Commits 7b9454c 'pr abandon terminal state - merge refuses abandoned PRs (VAL-005/006)', 78519da 'review and ci run refuse abandoned PRs (VAL-007/008)', 82a44ca 'complete the abandon boundary matrix (VAL-009/010)', docs sync 928ebd9",
+        "Flow contract .agents/qa/flows/forge-PR-abandon.md VAL-005..010 all pass at 125dba3; amendment clauses (abandon refuses after merge; second abandon refused with ORIGINAL reason; no reopen) all covered",
+        "Live proof: PR #25 in this repo is in the abandoned terminal state ('abandoned: superseded: source moved after a fix round') - the feature is in production use"
+      ],
+      "recommendation": "close-with-comment",
+      "comment": "Implemented in forge-p0 t4-t6 (7b9454c, 78519da, 82a44ca); flow contract forge-PR-abandon.md carries VAL-005..010, all pass."
+    },
+    {
+      "id": 9,
+      "title": "pr merge --ff fast-forward strategy",
+      "implemented": true,
+      "evidence": [
+        "Commit 5b2c845 'feat(forge-p1/t0): pr merge --ff fast-forward strategy (#9, VAL-101..104)' directly names the issue",
+        "Flow contract .agents/qa/flows/forge-ff-live-base-merge.md: VAL-101 (result==source_head, single-parent), VAL-102 (non-ff refusal names rebase remedy), VAL-103 (moved-base refusal), VAL-104 (exact-base CAS, no partial write) - all pass at forge @7871091"
+      ],
+      "recommendation": "close-with-comment",
+      "comment": "Implemented by 5b2c845; flow contract forge-ff-live-base-merge.md carries VAL-101..104, all pass."
+    },
+    {
+      "id": 10,
+      "title": "Forge adapter: embedded devflow.cjs integration (--forge)",
+      "implemented": true,
+      "evidence": [
+        "Adapter-side (living repo, branch main): 20dac153 'feat(implement): forge adapter - devflow.cjs --forge (forge-p1 t3, #10)', fixes 09a97d29 (F-002..F-010), dcf64757 (CR-04..CR-10), 2c0ab65e, a9f22072",
+        "Forge-side snapshots: 88b767c, ba5de54, 7871091, 5901393",
+        "Flow contract .agents/qa/flows/forge-adapter-pipeline.md: VAL-113..117 all pass (filing idempotence, failure taxonomy, proof close + caller attribution, crash reconcile), adapter matrix 24/24 at snapshot 09a97d29, later 35/35 + parity 6/6",
+        "scripts/devflow.cjs is NOT in the living repo's modified-file set (git status), so the P2 prepared-result cutover (forgeUpdatePR/forgePreparePR, first introduced in commit a9f22072 per pickaxe) is committed, not dangling"
+      ],
+      "recommendation": "close-with-comment",
+      "comment": "Adapter implemented and proven (VAL-113..117, flow contract forge-adapter-pipeline.md). Implementation commits live in the adapter repo (~/.agents main): 20dac153 + fix rounds through a9f22072."
+    },
+    {
+      "id": 11,
+      "title": "a-final (session forge-p2)",
+      "implemented": true,
+      "evidence": [
+        "Duplicate twin #18 (same description, same labels) is CLOSED with a forge-proof-close comment: status success, evidence reports/a-final.json",
+        "The report exists at .specs/forge-p2/forge-p2/missions/reports/a-final.json and honestly records VAL-202=fail at master 9f7b88b (pre-remediation, expected per brief); remediation landed at 41ea9a0 (PR #31)",
+        "Issue #11 has no comments - it was never proof-closed"
+      ],
+      "recommendation": "close-as-duplicate",
+      "comment": "Duplicate of #18 (closed with proof-close). Note #18's a-final report records VAL-202 fail (pre-fix at 9f7b88b); remediation at 41ea9a0 + reprobe artifact VAL-202-post-fix-reprobe.txt (TOTAL_SILENT=0) is the closure tail."
+    },
+    {
+      "id": 12,
+      "title": "p-promote: P2 flows into .agents/qa/flows flow contracts",
+      "implemented": true,
+      "evidence": [
+        "Duplicate twin #19 closed via PR #32 (merged 4f5beab, 'closes: #19')",
+        "Commit 4f5beab 'docs(qa): add four P2 flow contracts (machine-interface, identity-actor, pr-update, live-base-merge)' - exactly the four flows the ticket names",
+        "The four contract files exist and carry Proven-by lines citing the P2 sweeps",
+        "The living-repo seam test for this feature (promotion-flow-contract.test.cjs) is still untracked there"
+      ],
+      "recommendation": "close-as-duplicate",
+      "comment": "Delivered by PR #32 / commit 4f5beab, which closed the twin #19."
+    },
+    {
+      "id": 14,
+      "title": "t2: live-base result-bound merge",
+      "implemented": true,
+      "evidence": [
+        "PR #27 (t2) merged at bda92fd, 'closes: #21' - #21 is the closed twin; #14 is the never-closed original",
+        "Substantive commits: ba96be6 (#2 live-base merge), review rounds f713c6d and e022443, docs bda92fd; new module src/pr_prepare.rs",
+        "Flow contract .agents/qa/flows/forge-live-base-merge.md: VAL-207 pass (two-PR scenario), VAL-208 pass (live CAS injection, zero partial writes); evidence under .specs/forge-p2/.../evidence/{v-p2,a-final}/",
+        "t2 review-repair record /tmp/p2-t2-review-repair.json documents F-001..F-005 repairs incl. the user-approved prepare flow decision"
+      ],
+      "recommendation": "close-as-duplicate",
+      "comment": "Delivered by PR #27 (ba96be6..bda92fd) which closed twin #21; proven by forge-live-base-merge.md VAL-207/208."
+    },
+    {
+      "id": 15,
+      "title": "t7: machine interface (--json, version, unknown flags)",
+      "implemented": true,
+      "evidence": [
+        "PR #28 (t7) merged at 2b85aae, 'closes: #22' - #22 is the closed twin",
+        "Unknown-flag remediation: PR #31 merged at 41ea9a0 closed #30 (t7-fix-flags); post-fix reprobe artifact TOTAL_SILENT=0",
+        "Flow contract .agents/qa/flows/forge-machine-interface.md: VAL-201 pass, VAL-203 pass, VAL-202 fixed at 41ea9a0"
+      ],
+      "recommendation": "close-as-duplicate",
+      "comment": "Delivered by PR #28 (2b85aae, closed twin #22) plus PR #31 (41ea9a0, closed twin #30)."
+    },
+    {
+      "id": 16,
+      "title": "t8: actor distinguishability (GIT_FORGE_ROLE)",
+      "implemented": true,
+      "evidence": [
+        "PR #29 (t8) merged at 077150d, 'closes: #23' - #23 is the closed twin",
+        "Flow contract .agents/qa/flows/forge-identity-actor.md: VAL-204 pass (three-role chain, self-approval gate refusal + cross-role recovery), committed t4_identity 11/11",
+        "Commit 077150d message names #8 (the feature issue); #16 is its t8 ticket twin"
+      ],
+      "recommendation": "close-as-duplicate",
+      "comment": "Delivered by PR #29 / commit 077150d, which closed twin #23."
+    },
+    {
+      "id": 17,
+      "title": "v-p2 validation sweep",
+      "implemented": "sweep-executed-but-not-proof-closed",
+      "evidence": [
+        "Twin #24 (identical description/labels) is ALSO open - neither was proof-closed",
+        "The sweep ran: .specs/forge-p2/forge-p2/missions/reports/v-p2.json exists with VAL-201 pass, VAL-203..209 pass, VAL-202 FAIL (unknown-flag half, 9 surfaces) at pre-fix master",
+        "Remediation merged at 41ea9a0 (PR #31) and reprobe artifact VAL-202-post-fix-reprobe.txt shows TOTAL_SILENT=0",
+        "DISCREPANCY vs goal text: the task context says 'a full validation sweep is pending', but v-p2.json + a-final.json (both 2h old at audit time) exist; what is genuinely missing is a re-issued per-assertion report showing VAL-202 pass and the proof-close bookkeeping on #17/#24"
+      ],
+      "recommendation": "keep-open",
+      "reason": "No proof-close comment, and no re-issued sweep report recording VAL-202 pass post-41ea9a0 (a-final.json predates the fix; only the reprobe artifact covers it). Close with a comment naming 41ea9a0 + the reprobe artifact IF the orchestrator accepts the reprobe as closure evidence; otherwise re-run the unknown-flag half and proof-close."
+    },
+    {
+      "id": 24,
+      "title": "v-p2 validation sweep (second filing)",
+      "implemented": "sweep-executed-but-not-proof-closed",
+      "evidence": [
+        "Same state as #17: sweep report exists (v-p2.json, VAL-202 fail pre-fix, remediation 41ea9a0 + reprobe), no proof-close"
+      ],
+      "recommendation": "keep-open",
+      "reason": "Same as #17. Recommend keeping ONE of #17/#24 as the canonical tracking issue and closing the other as duplicate; #24 is the later filing (post-switchover), so #17 could close as its duplicate."
+    }
+  ],
+  "uncommitted_living_repo_tests": {
+    "repo": "/Users/chenwenjie/.agents (branch main @ a9f22072); files live under skills/implement/tests/devflow/",
+    "files": [
+      {
+        "path": "skills/implement/tests/devflow/acceptance.test.cjs",
+        "delta": "+58 lines (5 tests), modified, uncommitted",
+        "what": "v6 environment gate on acceptance receipts: receipt-check rejects a success receipt whose handoff lacks environment (missing-handoff-environment, status 2), rejects environment without healthCheck (missing-environment-healthCheck) or with tornDown!=true (environment-not-torn-down, status 1); obligation exempt for non-acceptance features; the claim brief names handoff.environment/tornDown",
+        "owed_by": "implement-skill v6 harness iteration (acceptance.md section 2 made structural) - NOT forge-p2's p-promote/t2",
+        "production_present": "Yes, committed: scripts/devflow.cjs:2961-2968 (gate), :5164 (brief line). devflow.cjs is not in the dirty set."
+      },
+      {
+        "path": "skills/implement/tests/devflow/chain-compile.test.cjs",
+        "delta": "+38 lines (2 tests), modified, uncommitted",
+        "what": "v6 assertion-seam schedule warning: a feature claiming a rendered-output assertion (tool ui) with no template-shaped touches warns (assertion-seam) while validate still passes; template touches silence it",
+        "owed_by": "implement-skill v6 harness iteration",
+        "production_present": "Yes, committed: scripts/devflow.cjs:1744-1747 (kind assertion-seam)."
+      },
+      {
+        "path": "skills/implement/tests/devflow/proves-runtime.test.cjs",
+        "delta": "+14 lines (1 test), modified, uncommitted",
+        "what": "Regression for the dogfood wedge: when next-feature reports an assertions_unproven pause it must also name the record-verdicts --feature move that clears it",
+        "owed_by": "implement-skill v6 harness iteration (assertions_unproven remedy UX)",
+        "production_present": "Yes, committed: scripts/devflow.cjs:5987-5992 prints the 'to clear: record-verdicts ...' line.",
+        "extra_evidence": "The identical test text appears PASSING (ok 339) in committed migration sweep outputs under skills/implement/devflow/migration/evidence/reference-full.stdout.txt and local-environment/reference-full/stdout.tap"
+      },
+      {
+        "path": "skills/implement/tests/devflow/promotion-flow-contract.test.cjs",
+        "delta": "untracked, 77 lines, 3 tests",
+        "what": "Promotion seam check (its own header: 'The promotion ticket (to-spec section 5) writes .agents/qa/flows/*.md in the shape install-e2e's flow contracts take'): validates a flow document against install-e2e's REQUIRED_FLOW_CONTRACT_HEADINGS via markdown_headings_outside_fences_and_comments; missing heading fails naming it; headings inside code fences do not count",
+        "owed_by": "p-promote (forge-p2 #12/#19) - the promotion of P2 flows into install-e2e-shaped contracts",
+        "production_present": "References verified: ~/.agents/skills/install-e2e/scripts/qa_contract_lib/constants.py:38 (REQUIRED_FLOW_CONTRACT_HEADINGS, exactly the 5 headings the GOOD_FLOW fixture uses) and flows.py:15 (fence-aware parser). QA_LIB path resolves to the sibling skill dir. Depends on python3 at runtime.",
+        "not_executed": true
+      }
+    ],
+    "complete_and_passing_looking": "Read-only assessment (tests NOT run, per instruction): all four files' production counterparts are present at HEAD; helper functions used by the additions (run, planDir, write, claimBrief, release, propose, drive, roleScripts) pre-exist in the committed parts of the same files; the proves-runtime addition demonstrably passed in recorded migration sweeps. Static shape of the promotion test matches install-e2e's parser/constants exactly.",
+    "recommended_commits": [
+      {
+        "files": ["skills/implement/tests/devflow/acceptance.test.cjs", "skills/implement/tests/devflow/chain-compile.test.cjs", "skills/implement/tests/devflow/proves-runtime.test.cjs"],
+        "message": "test(implement): commit the v6 gate tests - acceptance receipt environment, assertion-seam warning, assertions_unproven remedy line\n\nThe production halves are already committed (devflow.cjs receipt-environment gate, assertion-seam warn, record-verdicts remedy); these pin them: a success receipt without a health-checked, torn-down handoff.environment is shape-rejected; rendered-output claims without template touches warn via assertion-seam; the paused next-feature output names the record-verdicts move that clears it."
+      },
+      {
+        "files": ["skills/implement/tests/devflow/promotion-flow-contract.test.cjs"],
+        "message": "test(implement): promotion flow contracts must parse under install-e2e's required headings (p-promote seam)\n\nValidates promotion artifacts with install-e2e's own markdown_headings_outside_fences_and_comments + REQUIRED_FLOW_CONTRACT_HEADINGS (the seam, not a reimplementation); fenced headings do not count."
+      }
+    ]
+  },
+  "dangling_state": {
+    "git_forge_repo": {
+      "working_tree": "clean (git status --porcelain empty)",
+      "worktrees": "only the main checkout - clean",
+      "branches_of_note": [
+        "feat/rf: tip ad03b29 (spec amend t4-fix-rollback variant) + cf3447e ('rf') atop 5f40af4; ad03b29 and cf3447e are NOT ancestors of master (rewritten elsewhere as 4de55eb lineage). Leftover scratch/VAL-107-rehearsal branch; two unreferenced commits. Candidate for deletion after confirmation, or leave as-is (cheap).",
+        "salvage/forge-p2/t1-b20fcc9f: b20fcc9 (merge of master into loop/forge-p2/t1) NOT in master - salvage copy of the pre-rewrite t1 line (ec5d353 vs shipped bc164d2). Intentional salvage ref.",
+        "salvage/forge-p2/t7-14963588: 1496358 NOT in master - salvage copy of the pre-rewrite t7 line (vs shipped 2b85aae/077150d lineage). Intentional salvage ref.",
+        "PR #25 (t1 first attempt) is in the abandoned terminal state ('superseded: source moved after a fix round') - correct bookkeeping, no action."
+      ]
+    },
+    "living_repo": {
+      "worktrees": [
+        {"path": "/private/var/folders/.../tmp.MLWKTHiqfT", "head": "2c0ab65e (detached)", "verdict": "STALE - 2c0ab65e IS an ancestor of main; OS temp-dir worktree, prunable"},
+        {"path": "/Users/chenwenjie/.agents-review-fix", "head": "4c684664 (detached, 'fix(missions): close v4 skill inventory')", "verdict": "STALE - 4c684664 IS an ancestor of main; review-fix leftover, prunable"},
+        {"path": "/Users/chenwenjie/.cache/devflow-go-execution/20260905-160254/integration", "head": "a5467aaf on branch devflow-go/20260905-160254", "verdict": "UNMERGED WORK - a5467aaf NOT in main (p1-t2 rounds 2-4: Number grammar, raw contract ids, F-060..F-070). Keep until the devflow-go p1 mission lands or is dispositioned."},
+        {"path": "/Users/chenwenjie/.loop-worktrees/integration-6af48cee/devflow-go-p1/p1-t3", "head": "a5467aaf on branch loop/devflow-go-p1/p1-t3", "verdict": "UNMERGED WORK - same commit; in-flight worker worktree. Keep."},
+        {"path": "/Users/chenwenjie/missions-self-evolution-wt", "head": "c6abc60a (detached, 'evolve: compress README self-evolution boundary')", "verdict": "UNMERGED WORK - c6abc60a NOT in main; only reachable here. Keep or disposition deliberately."}
+      ],
+      "branches": [
+        "loop/devflow-go-p1/p1-t3 (a5467aaf, not in main) - holds unmerged work",
+        "salvage/devflow-go-p1/p1-t2-216e6eea - salvage ref"
+      ],
+      "other_working_tree_state": "Beyond the four test files, the working tree carries: mass deletion of skills/reverse-skill/** (~350 files), deleted skills/eng-init/references/*, modified grill/to-spec/write/review-fix-loop SKILL.md files, .skill-lock.json, loop-engineering, and untracked dirs skills/implement/devflow/ (migration census/evidence), skills/git-forge/, skills/harness-init/, skills/show-me/, skills/ego-browser, plus ~15 scratch files in skills/implement/ (pl.txt, kk.txt, gf-live.txt, ...). Not owned by forge-p2; flagged only."
+    },
+    "tmp_reports": [
+      {"path": "/tmp/p2-t2-review-repair.json", "lines": 187, "value": "HIGH - t2 review round 1 findings F-001..F-005 with code anchors, the F-002 alternatives (ALT-1/2/3) and the user-approved prepare-flow decision, per-finding implementation record. Preserve into the mission evidence dir (.specs/forge-p2/forge-p2/missions/evidence/ or reviews/)."},
+      {"path": "/tmp/p2-t2-independent-repairs.json", "lines": 71, "value": "MEDIUM - compact completion record of the same repairs (clippy/size-gate/dogfood)."},
+      {"path": "/tmp/p2-adapter-prepare-repair.json", "lines": 62, "value": "HIGH - the living-adapter prepared-result cutover record (forgeUpdatePR/forgePreparePR, fixture binding, remainingObligations). The corresponding commit a9f22072's message does not describe this cutover, so this file is the only durable narrative. Preserve."},
+      {"path": "/tmp/p2-amend-t7fix.json", "lines": 17, "value": "LOW-MEDIUM - t7-fix-flags feature definition (VAL-202); content largely duplicated in issue #30 description. Cheap to keep."},
+      {"path": "/tmp/p2-diff.json", "lines": 896, "value": "LOW - devflow-candidate differential validation transcript (TestValidateDifferential, candidate commit 'unavailable'); disposable harness output. Archive only if the differential run needs to stay auditable."}
+    ],
+    "audit_scratch": "/tmp/p2-audit-raw/ contains the raw read-only evidence (git logs, issue/pr show outputs, diffs, listings) backing this report."
+  }
+}
