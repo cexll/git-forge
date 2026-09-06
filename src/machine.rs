@@ -134,7 +134,7 @@ pub(crate) fn pr_json(state: &crate::event::PrState) -> String {
         None => "null".to_string(),
     };
     format!(
-        "{{\"id\":{},\"title\":{},\"description\":{},\"labels\":{},\"source\":{},\"base\":{},\"source_head\":{},\"base_head\":{},\"merge_base\":{},\"closes\":{},\"decision\":{},\"merged\":{},\"abandoned\":{},\"ci\":{},\"generation\":{},\"prepared\":{}}}",
+        "{{\"id\":{},\"title\":{},\"description\":{},\"labels\":{},\"source\":{},\"base\":{},\"source_head\":{},\"base_head\":{},\"merge_base\":{},\"closes\":{},\"decision\":{},\"decision_role\":{},\"merged\":{},\"abandoned\":{},\"ci\":{},\"generation\":{},\"prepared\":{},\"creator_role\":{}}}",
         num(state.id),
         opt_str(state.title.as_deref()),
         opt_str(state.description.as_deref()),
@@ -149,11 +149,13 @@ pub(crate) fn pr_json(state: &crate::event::PrState) -> String {
             None => "null".to_string(),
         },
         opt_str(state.effective_decision.as_deref()),
+        opt_str(state.decision_role.as_deref()),
         opt_str(state.merge_result.as_deref()),
         opt_str(state.abandoned.as_deref()),
         ci_json(state.ci_status.as_deref(), state.ci_plan.as_deref()),
         num(state.generation),
         prepared,
+        opt_str(state.creator_role.as_deref()),
     )
 }
 

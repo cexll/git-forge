@@ -11,7 +11,8 @@ git-forge puts a forge inside the repo itself. Every issue/PR is an **event chai
 
 - Never read or write `refs/forge/*` directly, and never hand-craft event JSON — use the CLI. The store owns counter CAS, event schema v1, and ref transactions; bypassing it corrupts forge state.
 - Forge state is **not** synced across clones in L1. `git push`/`git pull` do not carry it (L2 scope).
-- The author recorded on every event is `git config user.email` — check it is set meaningfully before creating/reviewing.
+- The author recorded on every event is `git config user.email` — check it is set meaningfully before creating/reviewing. Per-worktree identity (`extensions.worktreeConfig` + `git config --worktree user.email`) and the per-invocation `GIT_CONFIG_COUNT`/`GIT_CONFIG_KEY_0`/`GIT_CONFIG_VALUE_0` env override are **promised interfaces**: identity is whatever `git config` resolves for the invoking worktree.
+- Events MAY carry a **role** (`worker` | `reviewer` | `orchestrator`) from `GIT_FORGE_ROLE` — the pipeline seat that ran the command. Unset/empty means no role (single-user default, wire unchanged); an unknown value fails closed. The merge gate refuses a **self-approval**: when roles are configured and the effective approve comes from the SAME role that created the PR, merge exits non-zero — re-review under a different role is the remedy. Without roles on both events the gate is unchanged.
 
 ## Setup check
 
@@ -41,7 +42,7 @@ create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]..
 list
 show <n>                                     # snapshot fields + generation + effective review decision + CI status
 comment <n> <body>
-review <n> --approve|--reject [--file <f> --line <l> --commit <c>]
+review <n> --approve|--reject [--file <f> --line <l> --commit <c>]  # honors GIT_FORGE_ROLE for role attribution
 diff <n>                                     # three-dot diff merge_base...source_head from generation-current snapshot refs
 update <n>                                   # re-pin to the source branch tip as a NEW immutable snapshot generation
 prepare <n> --strategy merge|squash|rebase|ff  # materialize the merge result (candidate) against the CURRENT base tip

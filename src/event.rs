@@ -420,6 +420,14 @@ pub struct PrState {
     /// Candidate result tree the latest CI Check ran against; `None` for
     /// legacy source-snapshot Checks.
     pub ci_result_tree: Option<String>,
+    /// Role of the `pr.created` actor (#8, t8): the `role` body field the
+    /// creating command stamped (`worker`/`reviewer`/`orchestrator`), `None`
+    /// when no role was configured — the unchanged single-user default.
+    pub creator_role: Option<String>,
+    /// Role of the current effective review decision's actor (#8): the
+    /// `role` body field of the last reachable `pr.review`. `None` for a
+    /// roleless decision (default) or no decision yet.
+    pub decision_role: Option<String>,
 }
 
 impl PrState {
@@ -438,6 +446,8 @@ impl PrState {
                 self.base_head = str_field(&event.body, "base_head");
                 self.merge_base = str_field(&event.body, "merge_base");
                 self.closes = event.body.get("closes").and_then(JsonValue::as_u64);
+                // t8 (#8): the creating command's role, when it stamped one.
+                self.creator_role = str_field(&event.body, "role");
             }
             EventKind::PrComment => {
                 if let Some(body) = str_field(&event.body, "body") {
@@ -468,6 +478,9 @@ impl PrState {
                     self.decision_strategy = str_field(&event.body, "strategy");
                     self.decision_result_commit = str_field(&event.body, "result_commit");
                     self.decision_result_tree = str_field(&event.body, "result_tree");
+                    // t8 (#8): the reviewing command's role, when it
+                    // stamped one — the self-approval gate reads this.
+                    self.decision_role = str_field(&event.body, "role");
                 }
             }
             EventKind::PrMerge => {

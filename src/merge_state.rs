@@ -99,6 +99,23 @@ pub(crate) fn validate_merge_gate_at(
             state.decision_generation, state.generation
         ));
     }
+    // Gate (t8 #8): an approve from the SAME role that created the PR does
+    // not satisfy "someone other than the implementer approved" — the
+    // distinguishability the roles exist to provide. Runs only when BOTH the
+    // pr.created and the effective approve record roles: without roles the
+    // actors are indistinguishable, which is NOT self-approval — the
+    // single-user default (one identity, no role) keeps its pre-t8 gate.
+    // The refusal is policy-documented, not an event error: re-review by a
+    // different role (or an orchestrator-driven approve) is the remedy.
+    if let (Some(created_role), Some(decision_role)) = (&state.creator_role, &state.decision_role) {
+        if created_role == decision_role && state.effective_decision.as_deref() == Some("approve") {
+            return Err(format!(
+                "PR #{id} is self-approved: the effective approve was recorded by the \
+                 same role ('{decision_role}') that created the PR; the merge gate requires \
+                 an approval from a different role when roles are configured"
+            ));
+        }
+    }
     // Already merged: a pr.merge event exists → no double merge.
     if state.merge_result.is_some() {
         return Err(format!("PR #{id} is already merged"));

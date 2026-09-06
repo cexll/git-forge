@@ -603,7 +603,12 @@ impl BoundEventStore {
         parents: &[Oid],
         message: &str,
     ) -> Result<Oid, StoreError> {
-        self.write_forge_commit("event.json", event.to_json().as_bytes(), parents, message)
+        // t8 (#8): serialize through the identity layer, which stamps the
+        // command's resolved role onto the wire JSON when one is configured
+        // (no role configured → `Event::to_json()` verbatim, byte-identical
+        // to pre-t8). One stamping point for every event write path.
+        let wire = crate::identity::stamped_event_json(event);
+        self.write_forge_commit("event.json", wire.as_bytes(), parents, message)
     }
 
     /// Write the initial pending CI Check `ci.check` child for a freshly

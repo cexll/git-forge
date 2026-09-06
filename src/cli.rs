@@ -307,6 +307,18 @@ fn cmd_pr_show(store: &EventStore, args: &[String]) -> Result<String, String> {
     if let Some(r) = &state.merge_result {
         out.push_str(&format!("merged: {}\n", sanitize_terminal(r)));
     }
+    // t8 (#8): role attribution, additive lines (absent on roleless chains,
+    // so prose parsers and the single-user default see no change).
+    if let Some(r) = &state.creator_role {
+        out.push_str(&format!("created-by: {}\n", sanitize_terminal(r)));
+    }
+    if let (Some(d), Some(r)) = (&state.effective_decision, &state.decision_role) {
+        out.push_str(&format!(
+            "decision-by: {} ({})\n",
+            sanitize_terminal(r),
+            sanitize_terminal(d)
+        ));
+    }
     if let Some(reason) = &state.abandoned {
         out.push_str(&format!("abandoned: {}\n", sanitize_terminal(reason)));
     }
