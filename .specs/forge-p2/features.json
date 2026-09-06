@@ -244,6 +244,27 @@
       ],
       "origin": "plan",
       "addressesItemId": []
+    },
+    {
+      "dependsOn": [],
+      "touches": [],
+      "fulfills": [],
+      "expectedBehavior": [
+        "unknown flag on any forge subcommand exits 1 with a usage error naming the flag; no partial side effect"
+      ],
+      "addressesItemId": [],
+      "id": "t7-fix-flags",
+      "description": "Unknown flags are silently ignored (exit 0) on issue new/list/show/comment and pr list/show/comment/diff — machine.rs:28-29 strips them without rejecting. Fix: per-command parsers reject leftover/unrecognized args with a clean usage error (exit 1), matching pr review/update/abandon/merge, ci run, pr create, version which already exit 1. Also fix the vacuous t7 test (t7_unknown_flag_still_exits_nonzero creates no issue #1, so 'does not exist' masks the ignored flag).",
+      "milestone": "machine-interface",
+      "proves": [
+        "VAL-202"
+      ],
+      "skillName": "tdd",
+      "cause": {
+        "kind": "assertion",
+        "itemId": "F-001"
+      },
+      "origin": "amend"
     }
   ]
 }
