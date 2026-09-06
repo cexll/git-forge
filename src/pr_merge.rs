@@ -143,20 +143,53 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
              `pr merge --rebase` to replay the source or recreate the PR"
         ));
     }
-    if moved {
-        // ── #2 result-bound gates ── F-007/F-008 gate_head binding redesign,
-        // review/CI side: the merge result is a function of (source snapshot,
-        // CURRENT base tip), so a Check or approve recorded against a
-        // pre-move base tip validated a different result. Each gate input
-        // must be re-taken bound to the current base tip before the merge
-        // proceeds, naming its own re-validation remedy.
-        crate::merge_state::validate_result_bound_gate(
+    // F-002 prepared-candidate routing: the merge of a moved base (or any
+    // candidate-pinned PR) binds the PREPARED candidate — result committed
+    // at prepare time, never re-materialized. When a current, validated
+    // candidate exists, the three checks below (candidate current + strategy
+    // match + every gate input bound to the candidate) replace the old
+    // result-bound gate; when the base has MOVED and no candidate exists,
+    // the merge refuses naming the `pr prepare` remedy (the legacy strategy
+    // re-execution path cannot bind a review to a result it never saw);
+    // when the base has NOT moved and no candidate exists, the legacy
+    // path is preserved exactly (the transient result ref lifecycle keeps
+    // its existing contract).
+    let candidate = match &state.prepared {
+        Some(c) if c.generation == state.generation => Some(c),
+        _ => None,
+    };
+    if let Some(c) = candidate {
+        crate::pr_prepare::validate_prepared_candidate(
             id,
             &state,
+            c,
             &base_ref,
-            base_oid,
             current_base,
+            strategy,
         )?;
+    } else if moved {
+        return Err(format!(
+            "PR #{id} base branch '{base_ref}' has moved since the PR snapshot \
+             ({current_base} != snapshot {base_oid}); prepare the merge result \
+             first: run `git forge pr prepare {id} --strategy {strategy}`, then \
+             `git forge ci run {id}` and `git forge pr review {id} --approve`, \
+             then merge"
+        ));
+    } else if state.prepared.is_some() {
+        // A STALE prepared candidate (e.g. superseded by `pr update`) still
+        // pins `refs/forge/prs/<n>/result`; the legacy path's
+        // create_pending_result_ref expects absence, so refuse EARLY with
+        // the re-prepare remedy instead of a confusing mid-merge failure.
+        // (A manually-created ref with no prepared event keeps the legacy
+        // create-time refusal — that path is unchanged.)
+        return Err(format!(
+            "PR #{id} has a stale prepared candidate (prepared on generation {}, \
+             current snapshot generation {}); re-run `git forge pr prepare {id} \
+             --strategy {strategy}`, then `git forge ci run {id}` and `git forge pr \
+             review {id} --approve`, then merge",
+            state.prepared.as_ref().map(|c| c.generation).unwrap_or(0),
+            state.generation
+        ));
     }
 
     // Temporary worktree, detached at the immutable base OID. worktree
@@ -207,6 +240,92 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
     // never a libgit2 config read at write time.
     let (signature, actor) = resolve_identity()?;
     let (store, actor) = bind_identity(store, signature, actor);
+
+    // ── F-002 prepared candidate path ── The candidate was materialized at
+    // prepare time and is already pinned (`refs/forge/prs/<n>/result`). The
+    // merge binds it directly: no new worktree, no re-materialization, no
+    // verify_result_ci (the candidate-bound CI Check already validated the
+    // result tree). The finalize CASes the base FROM `candidate.base_head`
+    // (the gate-validated current base tip) TO `candidate.result_commit`.
+    if let Some(c) = candidate {
+        // Never-split posture: the merged base_worktrees check already ran.
+        // If the pinned result ref VANISHED (concurrent cleanup for another
+        // finalize or a stale leftover), refuse — the candidate identity is
+        // corroborated by the pin, and its absence is unexplained state.
+        let pin = store
+            .repo()
+            .find_reference(&crate::store::pr_result_ref(id))
+            .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
+            .map_err(|_| {
+                format!("PR #{id} prepared candidate ref missing (refs/forge/prs/{id}/result)")
+            })?;
+        if pin.to_string() != c.result_commit {
+            return Err(format!(
+                "PR #{id} prepared candidate ref refs/forge/prs/{id}/result does not \
+                 point at the folded candidate ({pin} != {}); re-run \
+                 `git forge pr prepare {id} --strategy {strategy}`",
+                c.result_commit
+            ));
+        }
+        let result_commit = c
+            .result_commit
+            .parse::<git2::Oid>()
+            .map_err(|_| "PR prepared candidate result_commit invalid".to_string())?;
+        // The candidate result must exist as an object (a garbled pin would
+        // otherwise fail at finalize; refuse EARLY with nothing touched).
+        store.repo().find_commit(result_commit).map_err(|_| {
+            format!("PR #{id} prepared candidate result {result_commit} is not a known commit")
+        })?;
+        // The candidate was built against `candidate.base_head` = current
+        // base tip (validated above by validate_prepared_candidate); the
+        // finalize CAS uses that exact tip.
+        let gate_base_oid = c
+            .base_head
+            .parse::<git2::Oid>()
+            .map_err(|_| "PR prepared candidate base_head invalid".to_string())?;
+        if gate_base_oid != current_base {
+            return Err(format!(
+                "PR #{id} prepared candidate base change during merge ({gate_base_oid} != \
+                 current {current_base}); re-run `git forge pr prepare {id} --strategy \
+                 {strategy}`"
+            ));
+        }
+        // No temp worktree on the candidate path; pass a unique temp path so
+        // the failure-path cleanup's lock-file removal is a no-op on a path
+        // that never exists (never a user file).
+        let prepared_tmp = std::env::temp_dir().join(format!(
+            "git-forge-pr{id}-prepared-finalize-{}",
+            std::process::id()
+        ));
+        let mut no_lock: Option<std::fs::File> = None;
+        #[cfg(debug_assertions)]
+        if let Err(b) = crate::merge_state::maybe_run_test_barrier() {
+            return Err(format!(
+                "{b} (pending result ref refs/forge/prs/{id}/result left in place)"
+            ));
+        }
+        return crate::merge_state::run_finalize(
+            &store,
+            crate::merge_state::MergeFinalizeSpec {
+                id,
+                base_ref: &base_ref,
+                gate_base_oid,
+                result_commit,
+                actor: &actor,
+                strategy,
+                gate_head,
+                closes_issue: state.closes,
+                base_worktrees: &base_worktrees,
+                recycle: recycle.as_deref().map(|p| (p, force)),
+                source_ref: state.source_ref.as_deref(),
+                source_head: &c.source_head,
+                generation: state.generation,
+                prepared_result: Some(&c.result_commit),
+            },
+            &mut no_lock,
+            &prepared_tmp,
+        );
+    }
 
     // Repo-specific temp worktree path: hash the canonical workdir so parallel
     // test repos (same pid) never collide on the global temp dir.
@@ -461,6 +580,8 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
             recycle: recycle.as_deref().map(|p| (p, force)),
             source_ref: state.source_ref.as_deref(),
             source_head: &source_oid.to_string(),
+            generation: state.generation,
+            prepared_result: None,
         },
         &mut lock_handle,
         &tmp,

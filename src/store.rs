@@ -26,7 +26,7 @@ pub const COUNTER_REF: &str = "refs/forge/meta/counter";
 const GENESIS_MSG: &str = "forge:genesis";
 
 /// Number of bounded CAS append retries (wire contract default).
-const MAX_APPEND_RETRIES: u32 = 3;
+pub(crate) const MAX_APPEND_RETRIES: u32 = 3;
 
 /// Number of bounded allocation retries on counter collision.
 const MAX_ALLOC_RETRIES: u32 = 3;

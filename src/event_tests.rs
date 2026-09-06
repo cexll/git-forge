@@ -76,6 +76,7 @@ fn event_kind_string_roundtrip_all_kinds() {
         EventKind::IssueReopen,
         EventKind::PrCreated,
         EventKind::PrUpdate,
+        EventKind::PrPrepared,
         EventKind::PrComment,
         EventKind::PrReview,
         EventKind::PrMerge,
@@ -200,7 +201,7 @@ fn labels_from_string_items_only_and_lenient() {
 fn fold_sets_labels_from_created_events() {
     let mk = |kind: EventKind, entity: &str, id: u64, body: HashMap<String, JsonValue>| {
         Event::new_with_id(
-            &format!("22222222-2222-4222-8222-{:012x}", id),
+            &format!("22222222-2222-4222-8222-{id:012x}"),
             kind,
             entity,
             id,
@@ -317,7 +318,7 @@ fn ci_check_event_roundtrips_status_plan_actor() {
 fn fold_keeps_latest_ci_check_status() {
     let mk = |id: u64, status: &str| {
         Event::new_with_id(
-            &format!("44444444-4444-4444-8444-{:012x}", id),
+            &format!("44444444-4444-4444-8444-{id:012x}"),
             EventKind::CiCheck,
             "pr",
             2,

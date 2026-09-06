@@ -135,40 +135,6 @@ pub(crate) fn validate_merge_gate_at(
     Ok(state)
 }
 
-/// ── #2 result-bound gates (F-007/F-008 gate_head binding redesign, applied
-/// to the merge RESULT's inputs) ── The merge result is a function of
-/// (source snapshot, CURRENT base tip). When the base has moved since the
-/// PR snapshot, a review decision or CI Check recorded against a pre-move
-/// base tip validated a different result; the live-base merge may proceed
-/// ONLY with gate inputs bound to the CURRENT base tip. Each gate input
-/// names its own re-validation remedy; the refusal precedes every side
-/// effect (no worktree, no pending ref, no event).
-pub(crate) fn validate_result_bound_gate(
-    id: u64,
-    state: &crate::event::PrState,
-    base_ref: &str,
-    snapshot_base: Oid,
-    current_base: Oid,
-) -> Result<(), String> {
-    if state.ci_base_head.as_deref() != Some(&current_base.to_string()) {
-        return Err(format!(
-            "PR #{id} base branch '{base_ref}' has moved since the PR snapshot \
-             ({current_base} != snapshot {snapshot_base}) and the latest CI Check \
-             was taken against a different base; re-validate against the current \
-             base tip: run `git forge ci run {id}` and re-approve, then merge"
-        ));
-    }
-    if state.decision_base_head.as_deref() != Some(&current_base.to_string()) {
-        return Err(format!(
-            "PR #{id} base branch '{base_ref}' has moved since the PR snapshot \
-             ({current_base} != snapshot {snapshot_base}) and the effective review \
-             decision was made against a different base; re-validate against the \
-             current base tip: run `git forge pr review {id} --approve`, then merge"
-        ));
-    }
-    Ok(())
-}
-
 /// ── #2 identify what CI verified with the result ── `source_oid`'s tree is
 /// what the latest Check validated; `result_commit`'s tree is what the
 /// merge lands. Equal trees prove the Check already validated the result
@@ -374,12 +340,9 @@ pub(crate) struct MergeFinalizeSpec<'a> {
     pub result_commit: Oid,
     pub actor: &'a str,
     pub strategy: &'a str,
+    /// The head OID the merge gate validated (F-007): the finalize CASes the
+    /// PR head chain FROM this tip.
     pub gate_head: Oid,
-    /// Issue id the PR declares it closes (`pr.created` body `closes` field),
-    /// captured at the same gate read as `gate_head`; `None` when the PR
-    /// declares no relationship. When present, the completion transaction
-    /// gains a fourth CAS: `refs/forge/issues/<n>` onto an `issue.close`
-    /// event commit, in the SAME batch as base + PR-head + pending delete.
     pub closes_issue: Option<u64>,
     pub base_worktrees: &'a [std::path::PathBuf],
     /// #4 recycle: `Some((target_path, force))` when `pr merge` was given
@@ -393,8 +356,24 @@ pub(crate) struct MergeFinalizeSpec<'a> {
     /// The PR's snapshot source head OID (hex), the recycle's branch-content
     /// identity anchor: the branch is deleted only when its live tip equals
     /// this (the work the PR was created from, not a moved branch) AND that
-    /// tip is an ancestor of the integrated result commit.
+    /// tip is an ancestor of the integrated result commit. Also the F-003
+    /// identity anchor: the finalize retry requires the revalidated head's
+    /// source_head to equal this.
     pub source_head: &'a str,
+    /// The PR's snapshot generation the merge result was built from (F-003):
+    /// the finalize retry re-validates a concurrently moved head tip against
+    /// THIS generation, so an in-window `pr update` that moves the PR to a
+    /// new snapshot REFUSES (cleanup + no rematerialization) instead of
+    /// finalizing the OLD result under the NEW generation's head.
+    pub generation: u64,
+    /// The prepared candidate's result commit this merge binds, when the
+    /// merge went through the F-002 candidate path (`None` for the legacy
+    /// path). The finalize retry cross-checks the revalidated fold's
+    /// candidate identity (F-002 re-prepare): an in-window re-prepare that
+    /// replaces the candidate (same generation — re-prepare does not bump it)
+    /// REFUSES instead of silently finalizing under a head that approves a
+    /// different candidate.
+    pub prepared_result: Option<&'a str>,
 }
 /// Stage the linked-issue close for ONE finalize attempt (t2): fold the
 /// issue chain at its CURRENT tip and decide whether the transaction needs
@@ -648,11 +627,19 @@ pub(crate) fn run_finalize(
                 // Disappeared head ref: a genuine transaction failure. Refuse
                 // with refs unchanged and the pending result ref left in place.
                 let Some(tip) = head_now else {
+                    // F-004: best-effort delete the pending result ref (CAS
+                    // expected result_commit); report a leftover ONLY when the
+                    // CAS deletion itself fails.
+                    let pending = cleanup_pending_result(
+                        store,
+                        spec.id,
+                        spec.result_commit,
+                        lock_handle,
+                        tmp,
+                    );
                     return Err(format!(
                         "merge execution finished but final transaction failed \
-                         ({e}); refs unchanged, pending result ref \
-                         refs/forge/prs/{}/result left in place",
-                        spec.id
+                         ({e}); refs unchanged{pending}"
                     ));
                 };
                 // Head did not move. The failure can still be the linked-issue
@@ -692,11 +679,18 @@ pub(crate) fn run_finalize(
                         }
                         continue;
                     }
+                    // F-004: best-effort delete the pending result ref; report a
+                    // leftover ONLY when the CAS deletion fails.
+                    let pending = cleanup_pending_result(
+                        store,
+                        spec.id,
+                        spec.result_commit,
+                        lock_handle,
+                        tmp,
+                    );
                     return Err(format!(
                         "merge execution finished but final transaction failed \
-                         ({e}); refs unchanged, pending result ref \
-                         refs/forge/prs/{}/result left in place",
-                        spec.id
+                         ({e}); refs unchanged{pending}"
                     ));
                 }
                 // Canonical chain validator: the moved tip must be a valid
@@ -709,24 +703,14 @@ pub(crate) fn run_finalize(
                 // rewrite A→B that descends from H but never from A is a
                 // non-append move and must be refused (F-010). Rewrites,
                 // mixed/foreign chains, cross-PR tips, or disappeared refs
-                // also cannot reach `head_expected`, so all refuse with refs
-                // unchanged and the pending ref left in place.
+                // also cannot reach `head_expected`; all refuse with refs
+                // unchanged.
                 if !store
                     .store()
                     .head_extends_pr_chain(spec.id, head_expected, tip)
                 {
-                    return Err(format!(
-                        "merge execution finished but final transaction failed \
-                         ({e}); refs unchanged, pending result ref \
-                         refs/forge/prs/{}/result left in place",
-                        spec.id
-                    ));
-                }
-                // The candidate is a valid extension; re-evaluate the merge
-                // gates against THIS EXACT tip (F-007): a legitimate concurrent
-                // append that carries a failed CI Check refuses and names the
-                // gate; a legitimate green append is retried.
-                if let Err(gate_err) = validate_merge_gate_at(store.store(), spec.id, tip) {
+                    // F-004: best-effort delete the pending result ref; report
+                    // a leftover ONLY when the CAS deletion fails.
                     let pending = cleanup_pending_result(
                         store,
                         spec.id,
@@ -735,10 +719,17 @@ pub(crate) fn run_finalize(
                         tmp,
                     );
                     return Err(format!(
-                        "{gate_err} (merge aborted: the PR head changed during \
-                         finalization; refs unchanged{pending})"
+                        "merge execution finished but final transaction failed \
+                         ({e}); refs unchanged{pending}"
                     ));
                 }
+                // The candidate is a valid extension; re-evaluate the merge
+                // gates against THIS EXACT tip (F-007): a legitimate concurrent
+                // append that carries a failed CI Check refuses and names the
+                // gate; a legitimate green append is retried. The returned
+                // folded state is also cross-checked for F-003 (snapshot
+                // identity) and F-002 (candidate identity) below.
+                validate_adopted_finalize_tip(store, &spec, tip, lock_handle, tmp)?;
                 head_expected = tip;
                 attempts += 1;
                 // Test-only retry-window barrier (F-010): pause between the
@@ -780,6 +771,74 @@ pub(crate) fn run_finalize(
     // (never split) when a refresh fails. Detail in `refresh_base_worktrees`.
     refresh_base_worktrees(store, &spec, head_applied, applied_issue)?;
     finish_merge_output(store, &spec)
+}
+/// F-007/F-003/F-002 finalize retry validation, extracted from `run_finalize`
+/// (clippy too_many_lines): re-evaluate the merge gate against the moved tip
+/// `tip`, then require the folded state's snapshot identity (generation +
+/// source_head) AND prepared-candidate identity to match the spec the result
+/// was built from. Refuses (with cleanup) on any mismatch — the retry never
+/// finalizes the OLD result under a NEW generation/candidate's head.
+fn validate_adopted_finalize_tip(
+    store: &BoundEventStore,
+    spec: &MergeFinalizeSpec<'_>,
+    tip: Oid,
+    lock_handle: &mut Option<std::fs::File>,
+    tmp: &std::path::Path,
+) -> Result<(), String> {
+    let revalidated = match validate_merge_gate_at(store.store(), spec.id, tip) {
+        Ok(state) => state,
+        Err(gate_err) => {
+            let pending =
+                cleanup_pending_result(store, spec.id, spec.result_commit, lock_handle, tmp);
+            return Err(format!(
+                "{gate_err} (merge aborted: the PR head changed during finalization; \
+                 refs unchanged{pending})"
+            ));
+        }
+    };
+    // F-003: the revalidated tip may carry a NEW snapshot generation (a
+    // `pr update` landed during the pending window). The merge result was
+    // built from the OLD snapshot only; a gate-validated-but-different
+    // generation/source means the retry would finalize the OLD result under
+    // the NEW generation's head, falsely marking updated content merged.
+    // Refuse (cleanup + no rematerialization), naming the change.
+    if revalidated.generation != spec.generation
+        || revalidated.source_head.as_deref() != Some(spec.source_head)
+    {
+        let pending = cleanup_pending_result(store, spec.id, spec.result_commit, lock_handle, tmp);
+        return Err(format!(
+            "merge execution finished but the PR snapshot changed during finalization \
+             (generation {} -> {}, source {} -> {}); refs unchanged{pending}",
+            spec.generation,
+            revalidated.generation,
+            spec.source_head,
+            revalidated.source_head.as_deref().unwrap_or("<none>")
+        ));
+    }
+    // F-002 candidate identity: a re-prepare in the pending window replaces
+    // the candidate WITHOUT bumping the generation (so the generation/source
+    // check above cannot see it). The merge is bound to the OLD candidate's
+    // result; a fold whose candidate now differs must REFUSE (cleanup +
+    // re-prepare remedy), never finalize under a head that approves a
+    // different candidate. Applies on both paths: the candidate path pins
+    // `spec.prepared_result`; a legacy merge that gains a candidate
+    // mid-window also refuses (the candidate pin would collide with the
+    // pending-ref lifecycle).
+    let candidate_changed = match (spec.prepared_result, &revalidated.prepared) {
+        (None, None) => false,
+        (None, Some(_)) | (Some(_), None) => true,
+        (Some(expected), Some(current)) => current.result_commit != expected,
+    };
+    if candidate_changed {
+        let pending = cleanup_pending_result(store, spec.id, spec.result_commit, lock_handle, tmp);
+        return Err(format!(
+            "merge execution finished but the PR candidate changed during finalization; \
+             re-run `git forge pr prepare {}`, then `git forge ci run {}` and \
+             `git forge pr review {} --approve`, then merge; refs unchanged{pending}",
+            spec.id, spec.id, spec.id
+        ));
+    }
+    Ok(())
 }
 
 /// The #4 recycle epilogue, extracted from `run_finalize` (clippy

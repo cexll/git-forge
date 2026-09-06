@@ -62,7 +62,7 @@ pub(crate) fn sanitize_terminal(s: &str) -> String {
     for c in s.chars() {
         let cp = c as u32;
         if cp < 0x20 || (0x7F..=0x9F).contains(&cp) {
-            out.push_str(&format!("\\x{:02x}", cp));
+            out.push_str(&format!("\\x{cp:02x}"));
         } else {
             out.push(c);
         }
@@ -308,6 +308,15 @@ fn cmd_pr_show(store: &EventStore, args: &[String]) -> Result<String, String> {
     // t1: the PR's current snapshot generation (0 = the authoritative
     // pr.created snapshot, +1 per pr.update).
     out.push_str(&format!("generation: {}\n", state.generation));
+    // F-002: the latest prepared candidate, additive (safe for adapter
+    // prose parsers: one extra line, no existing field reshaped).
+    if let Some(c) = &state.prepared {
+        out.push_str(&format!(
+            "prepared: strategy {} result {}\n",
+            sanitize_terminal(&c.strategy),
+            sanitize_terminal(&c.result_commit)
+        ));
+    }
     if let Some(d) = &state.description {
         out.push_str(&format!("description: {}\n", sanitize_terminal(d)));
     }
@@ -318,7 +327,7 @@ fn cmd_pr_show(store: &EventStore, args: &[String]) -> Result<String, String> {
         ));
     }
     if let Some(c) = &state.closes {
-        out.push_str(&format!("closes: #{}\n", c));
+        out.push_str(&format!("closes: #{c}\n"));
     }
     for c in &state.comments {
         out.push_str(&format!("comment: {}\n", sanitize_terminal(c)));
@@ -476,16 +485,37 @@ fn cmd_pr_review(args: &[String]) -> Result<String, String> {
     // Generation binding: the decision authorizes the snapshot generation
     // current at review time; the merge gate refuses a decision from an
     // older generation (pre-update approve is stale).
-    body.insert(
-        "generation".into(),
-        JsonValue::Number(state.generation as i64),
-    );
     // #2 result-bound review: the decision also records the LIVE base-branch
     // tip at review time, so the live-base merge gate can require a decision
     // bound to the current base tip when the base has moved since the PR
     // snapshot.
-    if let Some(bh) = live_base_head_entry(store.repo(), state.base_ref.as_deref()) {
+    if let Some(bh) =
+        crate::pr_prepare::live_base_head_entry(store.repo(), state.base_ref.as_deref())
+    {
         body.insert("base_head".into(), bh);
+    }
+    // F-002 candidate-bound review: when a prepared candidate exists at
+    // review time (fold candidate whose generation matches the current
+    // snapshot AND whose identity is corroborated by the pinned result ref),
+    // the decision binds THAT candidate (strategy/result_commit/result_tree
+    // stamped from the CAPTURED fold state, not re-read after the append).
+    // The merge gate requires decision identity == candidate identity, so a
+    // stale approve (bound to a superseded candidate) or an unbound legacy
+    // approve refuses with a re-review remedy.
+    let candidate_bind = match &state.prepared {
+        Some(p) if p.generation == state.generation => store
+            .repo()
+            .find_reference(&crate::store::pr_result_ref(id))
+            .ok()
+            .and_then(|r| r.target())
+            .filter(|pin| pin.to_string() == p.result_commit)
+            .map(|_| p.clone()),
+        _ => None,
+    };
+    if let Some(c) = &candidate_bind {
+        body.insert("strategy".into(), json_str(&c.strategy));
+        body.insert("result_commit".into(), json_str(&c.result_commit));
+        body.insert("result_tree".into(), json_str(&c.result_tree));
     }
     let ev = Event::new(EventKind::PrReview, "pr", id, &actor, body);
     store.append_event(&r, &ev).map_err(|e| e.to_string())?;
@@ -631,11 +661,12 @@ fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String, String> {
 /// Dispatch a `git forge pr` subcommand. `argv` excludes the `pr` token.
 pub fn run_pr(argv: &[String]) -> Result<String, String> {
     let sub = argv.first().map(|s| s.as_str()).unwrap_or("");
-    // Subcommand-level `-h`/`--help` is answered HERE, before any store open,
-    // so help works outside a git repository (same as the namespace helps).
     if help_requested(argv.get(1..).unwrap_or(&[])) {
         if sub == "merge" {
             return Ok(crate::pr_merge::pr_merge_help());
+        }
+        if sub == "prepare" {
+            return Ok(crate::pr_prepare::pr_prepare_help());
         }
         if let Some(usage) = pr_sub_usage(sub) {
             return Ok(usage.into());
@@ -648,6 +679,7 @@ pub fn run_pr(argv: &[String]) -> Result<String, String> {
         "comment" => cmd_pr_comment(&argv[1..]),
         "review" => cmd_pr_review(&argv[1..]),
         "update" => crate::pr_merge::cmd_pr_update(&argv[1..]),
+        "prepare" => crate::pr_prepare::cmd_pr_prepare(&argv[1..]),
         "abandon" => cmd_pr_abandon(&argv[1..]),
         "diff" => cmd_pr_diff(&open_store()?, &argv[1..]),
         "merge" => crate::pr_merge::cmd_pr_merge(open_store()?, &argv[1..]),
@@ -667,12 +699,13 @@ fn pr_sub_usage(sub: &str) -> Option<&'static str> {
         "abandon" => "usage: git forge pr abandon <n> --reason <text>",
         "diff" => "usage: git forge pr diff <n>",
         "update" => "usage: git forge pr update <n>",
+        "prepare" => "usage: git forge pr prepare <n> --strategy merge|squash|rebase|ff",
         _ => return None,
     })
 }
 
 fn pr_help() -> String {
-    "usage: git forge pr <create|list|show|comment|review|update|diff|merge|abandon> ...\n\
+    "usage: git forge pr <create|list|show|comment|review|update|prepare|diff|merge|abandon> ...\n\
      \nsubcommands:\n\
      \x20 create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]... [--closes <n>]\n\
      \x20 list\n\
@@ -680,6 +713,7 @@ fn pr_help() -> String {
      \x20 comment <n> <body>\n\
      \x20 review <n> --approve|--reject [--file <f> --line <l> --commit <c>]\n\
      \x20 update <n>\n\
+     \x20 prepare <n> --strategy merge|squash|rebase|ff\n\
      \x20 diff <n>\n\
      \x20 merge [<n>] [--squash|--rebase]\n\
      \x20 abandon <n> --reason <text>"
@@ -777,19 +811,53 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
     // snapshot of the current generation (shared invariant, one owner in
     // the store).
     crate::store::EventStore::validate_snapshot_against_state(id, &state, source_oid, base_oid)?;
+    // F-002 candidate-bound CI: when the PR has a VALID prepared candidate
+    // (fold candidate whose generation matches the current snapshot AND
+    // whose identity is corroborated by the pinned `refs/forge/prs/<n>/result`
+    // ref), the Check validates the CANDIDATE RESULT, not the source
+    // snapshot. The candidate identity is CAPTURED HERE at run start and
+    // stamped into the check body after execution — a concurrent
+    // re-prepare/update during the run cannot swap the identity the check
+    // actually validated (Main directive: captured identity, never
+    // fresh-fold values). A stale/mismatched candidate falls back to the
+    // legacy source-snapshot run (unbound check; the candidate merge gate
+    // refuses until a fresh candidate-bound run).
+    let candidate_run = match &state.prepared {
+        Some(p) if p.generation == generation => store
+            .repo()
+            .find_reference(&crate::store::pr_result_ref(id))
+            .ok()
+            .and_then(|r| r.target())
+            .filter(|pin| pin.to_string() == p.result_commit)
+            .map(|_| p.clone()),
+        _ => None,
+    };
+    let run_oid = match &candidate_run {
+        Some(c) => c
+            .result_commit
+            .parse::<git2::Oid>()
+            .map_err(|_| "PR prepared candidate result_commit invalid".to_string())?,
+        None => source_oid,
+    };
+    // Live base tip captured at run start (#2 result-bound CI): the Check
+    // binds the tip it RAN against, so a concurrent base move during the
+    // run cannot re-bind it.
+    let live_base =
+        crate::pr_prepare::live_base_head_entry(store.repo(), state.base_ref.as_deref());
     let repo_dir = store
         .repo()
         .workdir()
         .map(|p| p.to_path_buf())
         .ok_or_else(|| "cannot resolve repository working directory".to_string())?;
 
-    // Determine the plan from the PR's IMMUTABLE source snapshot up front
+    // Determine the plan from the RUN OID's IMMUTABLE bytes up front
     // (F-001/F-012): a symlink/non-regular `.forge/ci.sh`, or a symlink
     // justfile for the `just check` fallback, is refused before a worktree is
     // even created, so CI never follows a tracked link to mutable bytes
     // outside the detached worktree. Absent `.forge/ci.sh` -> the pinned
-    // `just check` fallback (F-012).
-    let plan = crate::ci::snapshot_ci_plan(store.repo(), source_oid)?;
+    // `just check` fallback (F-012). For a candidate run the plan comes from
+    // the RESULT commit's tree.
+    let plan = crate::ci::snapshot_ci_plan(store.repo(), run_oid)?;
 
     // Reserve a unique temp worktree path (sibling lock) so concurrent CI runs
     // on the same repo never collide on the global temp dir.
@@ -821,7 +889,7 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
         {
             Ok(h) => {
                 lock_handle = Some(h);
-                match crate::git::worktree_add_ci(&repo_dir, &tmp, &source_oid) {
+                match crate::git::worktree_add_ci(&repo_dir, &tmp, &run_oid) {
                     Ok(()) => break (true, String::new()),
                     Err(err) => break (false, err),
                 }
@@ -858,7 +926,7 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
     // (clamped, F-011), and on expiry the WHOLE process group is killed and
     // reaped (F-015) so a background descendant cannot survive the deadline.
     let timeout = crate::ci::ci_timeout(std::env::var("GIT_FORGE_CI_TIMEOUT").ok().as_deref());
-    let run = crate::ci::run_ci_plan(store.repo(), source_oid, &tmp, &plan, timeout);
+    let run = crate::ci::run_ci_plan(store.repo(), run_oid, &tmp, &plan, timeout);
 
     // Clean up the temp worktree regardless of the plan outcome, holding the
     // sibling lock until the worktree is removed AND verified gone (directory
@@ -878,65 +946,21 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
     } else {
         "failed"
     };
-    let mut body = HashMap::new();
-    body.insert("status".into(), json_str(status));
-    body.insert("plan".into(), json_str(plan.label()));
-    // Generation binding: the Check validates the snapshot it ran against;
-    // the merge gate refuses a Check from an older generation.
-    // #2 result-bound CI: the Check also records the LIVE base-branch tip at
-    // run time, so the live-base merge gate can require a Check bound to the
-    // current base tip when the base has moved since the PR snapshot.
-    if let Some(bh) = live_base_head_entry(store.repo(), state.base_ref.as_deref()) {
-        body.insert("base_head".into(), bh);
-    }
-    let ev = Event::new(EventKind::CiCheck, "pr", id, &actor, body);
-    // Record the outcome — a failing plan still appends a `failure` CI Check
-    // (VAL-002) before the command exits nonzero.
-    let append = store.append_event(&head, &ev);
-    if let Some(ar) = append.as_ref().err() {
-        let msg = format!("CI run completed but recording the CI Check failed: {ar}");
-        return Err(match leftover {
-            Some(l) => format!("{msg}; temp worktree cleanup failed: {l}"),
-            None => msg,
-        });
-    }
-
-    if let Some(leftover) = leftover {
-        return Err(format!(
-            "CI run recorded {status} but temp worktree cleanup failed: {leftover}"
-        ));
-    }
-    append.map_err(|e| format!("CI run completed but recording the CI Check failed: {e}"))?;
-
-    if run.status == Some(0) && !run.timed_out {
-        Ok(format!("CI run for PR #{id} passed ({})", plan.label()))
-    } else {
-        let detail = if run.timed_out {
-            ": timed out".to_string()
-        } else if let Some(d) = run.detail {
-            format!(": {d}")
-        } else {
-            run.status
-                .map(|c| format!(": exited with status {c}"))
-                .unwrap_or_default()
-        };
-        Err(format!(
-            "CI run for PR #{id} failed ({}){detail}",
-            plan.label()
-        ))
-    }
-}
-
-/// #2 result-bound gate input: the LIVE base-branch tip (`base_head` body
-/// entry) for a `ci.check` or `pr.review` event, resolved at write time, so
-/// the live-base merge gate can require gate inputs bound to the current
-/// base tip when the base has moved since the PR snapshot. Extracted from
-/// `cmd_ci_run` (clippy too_many_lines); `cmd_pr_review` calls it too.
-fn live_base_head_entry(repo: &git2::Repository, base_ref: Option<&str>) -> Option<JsonValue> {
-    repo.find_reference(&format!("refs/heads/{}", base_ref.unwrap_or("")))
-        .ok()
-        .and_then(|r| r.target())
-        .map(|o| json_str(&o.to_string()))
+    crate::pr_prepare::record_and_report_ci_check(
+        &store,
+        &head,
+        id,
+        status,
+        plan.label(),
+        generation,
+        live_base,
+        candidate_run.as_ref(),
+        leftover,
+        run.status,
+        run.timed_out,
+        run.detail.map(|d| d.to_string()),
+        &actor,
+    )
 }
 
 /// Dispatch a `git forge ci` subcommand. `argv` excludes the `ci` token.

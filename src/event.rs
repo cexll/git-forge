@@ -40,6 +40,7 @@ pub enum EventKind {
     IssueReopen,
     PrCreated,
     PrUpdate,
+    PrPrepared,
     PrComment,
     PrReview,
     PrMerge,
@@ -56,6 +57,7 @@ impl EventKind {
             EventKind::IssueReopen => "issue.reopen",
             EventKind::PrCreated => "pr.created",
             EventKind::PrUpdate => "pr.update",
+            EventKind::PrPrepared => "pr.prepared",
             EventKind::PrComment => "pr.comment",
             EventKind::PrReview => "pr.review",
             EventKind::PrMerge => "pr.merge",
@@ -76,6 +78,7 @@ impl std::str::FromStr for EventKind {
             "issue.reopen" => Self::IssueReopen,
             "pr.created" => Self::PrCreated,
             "pr.update" => Self::PrUpdate,
+            "pr.prepared" => Self::PrPrepared,
             "pr.comment" => Self::PrComment,
             "pr.review" => Self::PrReview,
             "pr.merge" => Self::PrMerge,
@@ -307,6 +310,36 @@ pub struct IssueState {
     pub open: bool,
 }
 
+/// A materialized merge candidate produced by `pr prepare <n> --strategy <s>`.
+///
+/// The candidate is the immutable result the PR pins (`refs/forge/prs/<n>/result`)
+/// until merge finalization consumes it. Every later gate input (`ci run`,
+/// `review`) and the merge finalize CAS are required to bind this exact
+/// candidate: `prepared_base_head` is the base-branch tip the candidate was
+/// built against and `prepared_generation` the snapshot generation it was
+/// built from, so a base move or a source `pr.update` visibly invalidates it
+/// (merge refuses with a re-prepare remedy) instead of silently re-deriving
+/// the result.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PreparedCandidate {
+    /// Snapshot generation the candidate was prepared from.
+    pub generation: u64,
+    /// Snapshot source commit the candidate was prepared from.
+    pub source_head: String,
+    /// Base-branch tip the candidate was built against (may differ from the
+    /// snapshot base_head when the base moved — the live-base case).
+    pub base_head: String,
+    /// Strategy (`merge`, `squash`, `rebase`, `ff`) the candidate materializes.
+    pub strategy: String,
+    /// The materialized result commit (reachable: merge finalize CASes the
+    /// base branch from `base_head` to this commit).
+    pub result_commit: String,
+    /// The result commit's tree — identity of the result content CI validates.
+    pub result_tree: String,
+    /// Recompute `merge_base(source_head, base_head)` at prepare time.
+    pub merge_base: String,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PrState {
     pub id: u64,
@@ -362,6 +395,31 @@ pub struct PrState {
     pub ci_base_head: Option<String>,
     /// Timestamp of the latest CI Check.
     pub ci_ts: Option<String>,
+    /// The latest `pr.prepared` candidate (last-wins), if any. `None` when no
+    /// prepare has run (unmoved-base legacy path). Merge of a moved base
+    /// requires a candidate; the gate cross-checks its generation and
+    /// base_head against the current PR/base state so staleness is refused
+    /// rather than re-derived.
+    pub prepared: Option<PreparedCandidate>,
+    /// Strategy the current effective review decision binds (from the
+    /// `strategy` field of `pr.review` recorded while a candidate exists);
+    /// `None` for legacy decisions.
+    pub decision_strategy: Option<String>,
+    /// Candidate result commit the current effective review decision binds;
+    /// `None` for legacy decisions.
+    pub decision_result_commit: Option<String>,
+    /// Candidate result tree the current effective review decision binds;
+    /// `None` for legacy decisions.
+    pub decision_result_tree: Option<String>,
+    /// Strategy the latest CI Check binds (from `ci.check` run against a
+    /// candidate); `None` for legacy source-snapshot Checks.
+    pub ci_strategy: Option<String>,
+    /// Candidate result commit the latest CI Check ran against; `None` for
+    /// legacy source-snapshot Checks.
+    pub ci_result_commit: Option<String>,
+    /// Candidate result tree the latest CI Check ran against; `None` for
+    /// legacy source-snapshot Checks.
+    pub ci_result_tree: Option<String>,
 }
 
 impl PrState {
@@ -403,6 +461,13 @@ impl PrState {
                     // the field (pre-#2 chains) fold as None and only the
                     // unmoved-base merge path accepts them.
                     self.decision_base_head = str_field(&event.body, "base_head");
+                    // Candidate-bound review: a decision taken while a
+                    // prepared candidate exists records the candidate
+                    // identity it approves. Legacy decisions fold as None
+                    // and only the unmoved-base legacy path accepts them.
+                    self.decision_strategy = str_field(&event.body, "strategy");
+                    self.decision_result_commit = str_field(&event.body, "result_commit");
+                    self.decision_result_tree = str_field(&event.body, "result_tree");
                 }
             }
             EventKind::PrMerge => {
@@ -426,6 +491,25 @@ impl PrState {
                     .and_then(JsonValue::as_u64)
                     .unwrap_or(self.generation + 1);
             }
+            EventKind::PrPrepared => {
+                // Last-wins: the latest `pr.prepared` event is the PR's
+                // current candidate. Re-prepare replaces it; `pr.update`
+                // bumps the generation so the gate sees the candidate as
+                // stale (its prepared_generation no longer matches).
+                self.prepared = Some(PreparedCandidate {
+                    generation: event
+                        .body
+                        .get("generation")
+                        .and_then(JsonValue::as_u64)
+                        .unwrap_or(self.generation),
+                    source_head: str_field(&event.body, "source_head").unwrap_or_default(),
+                    base_head: str_field(&event.body, "base_head").unwrap_or_default(),
+                    strategy: str_field(&event.body, "strategy").unwrap_or_default(),
+                    result_commit: str_field(&event.body, "result_commit").unwrap_or_default(),
+                    result_tree: str_field(&event.body, "result_tree").unwrap_or_default(),
+                    merge_base: str_field(&event.body, "merge_base").unwrap_or_default(),
+                });
+            }
             EventKind::CiCheck => {
                 // The fold keeps the LATEST CI Check: each event overwrites the
                 // prior status/plan/actor/ts, so the PR state always exposes
@@ -443,6 +527,12 @@ impl PrState {
                 // #2 result-bound CI: the Check binds the live base-branch
                 // tip it ran against (same None default as PrReview).
                 self.ci_base_head = str_field(&event.body, "base_head");
+                // Candidate-bound CI: a Check run against a prepared
+                // candidate records the candidate identity it validated.
+                // Legacy source-snapshot Checks fold these as None.
+                self.ci_strategy = str_field(&event.body, "strategy");
+                self.ci_result_commit = str_field(&event.body, "result_commit");
+                self.ci_result_tree = str_field(&event.body, "result_tree");
             }
             _ => {}
         }

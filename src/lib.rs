@@ -7,4 +7,5 @@ pub mod identity;
 pub mod issue;
 pub mod merge_state;
 pub mod pr_merge;
+pub mod pr_prepare;
 pub mod store;

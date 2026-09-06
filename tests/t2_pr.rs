@@ -3357,9 +3357,16 @@ fn merge_refuses_when_head_moved_to_foreign_green_pr_during_finalize() {
         "stderr: {stderr}"
     );
     assert!(stderr.contains("refs unchanged"), "stderr: {stderr}");
+    // F-004: the genuine finalization-failure cleanup deletes the pending
+    // result ref best-effort (it holds the expected result_commit), so the
+    // "left in place" suffix is NOT reported.
     assert!(
-        stderr.contains("pending result ref refs/forge/prs/1/result left in place"),
+        !stderr.contains("pending result ref refs/forge/prs/1/result left in place"),
         "stderr: {stderr}"
+    );
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_none(),
+        "pending result ref must be cleaned on the finalization refusal"
     );
     assert_eq!(
         ref_oid(&dir, "refs/heads/main").unwrap(),
@@ -3377,8 +3384,8 @@ fn merge_refuses_when_head_moved_to_foreign_green_pr_during_finalize() {
         "PR #2 chain must be untouched"
     );
     assert!(
-        ref_oid(&dir, "refs/forge/prs/1/result").is_some(),
-        "pending result ref must be left in place on a sabotage refusal"
+        ref_oid(&dir, "refs/forge/prs/1/result").is_none(),
+        "pending result ref must be cleaned on a sabotage refusal"
     );
 }
 
@@ -3640,9 +3647,16 @@ fn merge_refuses_sibling_rewrite_after_green_append_during_finalize() {
         "stderr: {stderr}"
     );
     assert!(stderr.contains("refs unchanged"), "stderr: {stderr}");
+    // F-004: the genuine finalization-failure cleanup deletes the pending
+    // result ref best-effort (it holds the expected result_commit), so the
+    // "left in place" suffix is NOT reported.
     assert!(
-        stderr.contains("pending result ref refs/forge/prs/1/result left in place"),
+        !stderr.contains("pending result ref refs/forge/prs/1/result left in place"),
         "stderr: {stderr}"
+    );
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_none(),
+        "pending result ref must be cleaned on the finalization refusal"
     );
     assert_eq!(
         ref_oid(&dir, "refs/heads/main").unwrap(),
@@ -3655,8 +3669,8 @@ fn merge_refuses_sibling_rewrite_after_green_append_during_finalize() {
         "PR #1 head must stay at B, not receive a pr.merge"
     );
     assert!(
-        ref_oid(&dir, "refs/forge/prs/1/result").is_some(),
-        "pending result ref must be left in place on a non-append rewrite refusal"
+        ref_oid(&dir, "refs/forge/prs/1/result").is_none(),
+        "pending result ref must be cleaned on a non-append rewrite refusal"
     );
 }
 
@@ -3970,9 +3984,16 @@ fn merge_refuses_rewrite_to_unproven_tip_between_read_and_cas() {
         "stderr: {stderr}"
     );
     assert!(stderr.contains("refs unchanged"), "stderr: {stderr}");
+    // F-004: the genuine finalization-failure cleanup deletes the pending
+    // result ref best-effort (it holds the expected result_commit), so the
+    // "left in place" suffix is NOT reported.
     assert!(
-        stderr.contains("pending result ref refs/forge/prs/1/result left in place"),
+        !stderr.contains("pending result ref refs/forge/prs/1/result left in place"),
         "stderr: {stderr}"
+    );
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_none(),
+        "pending result ref must be cleaned on the finalization refusal"
     );
     assert_eq!(
         ref_oid(&dir, "refs/heads/main").unwrap(),
@@ -3990,8 +4011,8 @@ fn merge_refuses_rewrite_to_unproven_tip_between_read_and_cas() {
         "PR #2 chain must be untouched"
     );
     assert!(
-        ref_oid(&dir, "refs/forge/prs/1/result").is_some(),
-        "pending result ref must be left in place on a rewrite refusal"
+        ref_oid(&dir, "refs/forge/prs/1/result").is_none(),
+        "pending result ref must be cleaned on a rewrite refusal"
     );
 }
 
@@ -4176,9 +4197,16 @@ fn merge_refuses_forged_same_id_creation_chain_during_finalize() {
         "stderr: {stderr}"
     );
     assert!(stderr.contains("refs unchanged"), "stderr: {stderr}");
+    // F-004: the genuine finalization-failure cleanup deletes the pending
+    // result ref best-effort (it holds the expected result_commit), so the
+    // "left in place" suffix is NOT reported.
     assert!(
-        stderr.contains("pending result ref refs/forge/prs/1/result left in place"),
+        !stderr.contains("pending result ref refs/forge/prs/1/result left in place"),
         "stderr: {stderr}"
+    );
+    assert!(
+        ref_oid(&dir, "refs/forge/prs/1/result").is_none(),
+        "pending result ref must be cleaned on the finalization refusal"
     );
     assert_eq!(
         ref_oid(&dir, "refs/heads/main").unwrap(),
@@ -4191,8 +4219,8 @@ fn merge_refuses_forged_same_id_creation_chain_during_finalize() {
         "PR #1 head must stay at the forged tip, not receive a pr.merge"
     );
     assert!(
-        ref_oid(&dir, "refs/forge/prs/1/result").is_some(),
-        "pending result ref must be left in place on a forged-chain refusal"
+        ref_oid(&dir, "refs/forge/prs/1/result").is_none(),
+        "pending result ref must be cleaned on a forged-chain refusal"
     );
 }
 

@@ -477,19 +477,25 @@ git checkout -q "$BASE_BRANCH"
 git forge pr create --source feat/gf-lb2 --base "$BASE_BRANCH" "lb second PR" >/dev/null
 git forge pr review 24 --approve >/dev/null
 git forge ci run 24 >/dev/null
-git checkout -q feat/gf-lb1
-ck "lb first merge ok" 0 git forge pr merge 23
+# Move the base via PR #23's merge (unmoved legacy path) so PR #24's base has
+# genuinely advanced; LB_MOVED is the moved tip the refusals must preserve and
+# the merged result must contain.
+git forge pr merge 23 >/dev/null
 LB_MOVED="$(git rev-parse "$BASE_BRANCH")"
-git checkout -q feat/gf-lb2
-at "lb second merge refused without fresh gate" 0 "! git forge pr merge 24 2>/dev/null"
-at "lb refusal names re-validate" 0 "git forge pr merge 24 2>&1 | grep -q 're-validate'"
+at "lb second merge refused without prepared candidate" 0 "! git forge pr merge 24 2>/dev/null"
+at "lb refusal names prepare" 0 "git forge pr merge 24 2>&1 | grep -q 'prepare'"
 at "lb refusal leaves base ref" 0 "[ \"\$(git rev-parse \"\$BASE_BRANCH\")\" = \"\$LB_MOVED\" ]"
 at "lb refusal leaves PR unmerged" 0 "! git forge pr show 24 | grep -q 'merged:'"
+ck "lb prepare candidate" 0 git forge pr prepare 24 --strategy merge
+at "lb pr show renders prepared line" 0 "git forge pr show 24 | grep -q 'prepared: strategy merge result'"
+# Candidate CI runs BEFORE the refusal: the Check is bound to the prepared
+# candidate while the approve is still unbound, so the refusal is genuinely
+# the CI-alone case and names the approve remedy.
 git forge ci run 24 >/dev/null
-at "lb fresh CI alone still refused" 0 "! git forge pr merge 24 2>/dev/null"
-at "lb CI-alone refusal names review" 0 "git forge pr merge 24 2>&1 | grep -q 'review'"
+at "lb candidate CI alone still refused" 0 "! git forge pr merge 24 2>/dev/null"
+at "lb CI-alone refusal names approve" 0 "git forge pr merge 24 2>&1 | grep -q 'approve'"
 git forge pr review 24 --approve >/dev/null
-ck "lb live-base merge passes with fresh gate" 0 git forge pr merge 24
+ck "lb live-base merge passes with prepared candidate" 0 git forge pr merge 24
 at "lb result contains the moved base" 0 "git merge-base --is-ancestor \$LB_MOVED \"\$BASE_BRANCH\""
 at "lb result contains the second PR source" 0 "git merge-base --is-ancestor feat/gf-lb2 \"\$BASE_BRANCH\""
 at "lb pr show merged" 0 "git forge pr show 24 | grep -q 'merged:'"

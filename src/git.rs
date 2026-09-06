@@ -846,7 +846,7 @@ fn sanitize_config_diag(bytes: &[u8]) -> String {
     for c in s.chars() {
         let cp = c as u32;
         if cp < 0x20 || (0x7F..=0x9F).contains(&cp) {
-            out.push_str(&format!("\\x{:02x}", cp));
+            out.push_str(&format!("\\x{cp:02x}"));
         } else {
             out.push(c);
         }
