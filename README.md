@@ -34,6 +34,24 @@ Requests tabs stay unused. A web view is deferred L2 roadmap.
   on top of the snapshot base). After a successful merge,
   `--recycle-worktree <path>` removes the merged source worktree (and
   deletes its branch when safe); `--force` recycles a dirty source worktree.
+- **PR generations (t1)**: `pr update <n>` re-pins an open PR to the source
+  branch tip as a NEW immutable snapshot generation — follow-up commits join
+  the same PR instead of recreating it. Approvals and CI Checks bind the
+  generation they were taken against; after an update, fresh CI + a fresh
+  approve are required (older-generation gate inputs are stale and refused).
+- **Live-base merge (t2)**: a moved base no longer refuses outright —
+  `pr prepare <n> --strategy <merge|squash|rebase|ff>` materializes the
+  merge result against the CURRENT base tip and pins it as an immutable
+  candidate; `ci run` and `pr review --approve` then validate and authorize
+  exactly that candidate, and `pr merge` finalizes it atomically.
+- **Machine interface (t7)**: `--json` on `issue new/list/show`,
+  `pr create/list/show`, and `ci run` emits stable machine-readable results
+  (allocated ids included); `git forge version` prints a semver and exits 0
+  — automation version-gates on it instead of parsing prose.
+- **Actor roles (t8)**: `GIT_FORGE_ROLE` (worker | reviewer | orchestrator)
+  attributes events to a role; the merge gate refuses a self-approval when
+  both sides carry roles. Per-worktree identity (`extensions.worktreeConfig`)
+  and `GIT_CONFIG_COUNT` overrides are promised interfaces.
 - All state in git refs (`refs/forge/*`); no daemon, no second protocol.
 
 ## Install
