@@ -5611,3 +5611,301 @@ fn finalize_refuses_snapshot_change_during_pending_window() {
     );
     assert_no_temp_worktree_pr(&dir, 1);
 }
+
+// ─────────────────────────── #7 machine interface (t7) ───────────────────────────
+//
+// VAL-201: `--json` on issue new/list/show + pr create/list/show + ci run emits a
+// byte-stable schema including the allocated id/status, byte-compared against the
+// committed fixtures under tests/fixtures/json/. `git forge version` prints a
+// semver and exits 0. VAL-202: unknown flags keep exit-1.
+
+/// `git` with pinned author/committer dates: commit OIDs become a pure function
+/// of content + parents, so the fixtures embedding snapshot OIDs byte-match
+/// across runs of the same scenario (and across machines running the same git).
+fn gitp(dir: &Path, args: &[&str]) -> (i32, String, String) {
+    let out = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .env("GIT_AUTHOR_DATE", "2026-09-06T00:00:00+0000")
+        .env("GIT_COMMITTER_DATE", "2026-09-06T00:00:00+0000")
+        .output()
+        .unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    )
+}
+
+/// Pinned-date [`init_repo`]: the fixture scenario's base commit is part of the
+/// OID lineage the pr fixtures embed.
+fn init_repo_pinned(dir: &Path) {
+    let (c, _, e) = gitp(dir, &["init", "-q"]);
+    assert!(c == 0, "git init failed: {e}");
+    let (c, _, e) = gitp(dir, &["config", "user.name", "Test"]);
+    assert!(c == 0, "config user.name failed: {e}");
+    let (c, _, e) = gitp(dir, &["config", "user.email", "test@example.com"]);
+    assert!(c == 0, "config user.email failed: {e}");
+    std::fs::write(dir.join("base.txt"), "base\n").unwrap();
+    let _ = gitp(dir, &["add", "base.txt"]);
+    let (c, _, e) = gitp(dir, &["commit", "-q", "-m", "base commit"]);
+    assert!(c == 0, "base commit failed: {e}");
+    let (c, _, e) = gitp(dir, &["branch", "-M", "main"]);
+    assert!(c == 0, "branch -M failed: {e}");
+}
+
+/// Pinned-date [`make_feature`] + a green CI plan commit, both before `pr create`
+/// so the PR snapshot carries `.forge/ci.sh` (the ci-run fixture's plan label).
+fn make_feature_with_plan_pinned(dir: &Path, branch: &str) {
+    let (c, _, e) = gitp(dir, &["checkout", "-q", "-b", branch]);
+    assert!(c == 0, "checkout -b {branch} failed: {e}");
+    std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
+    let (c, _, e) = gitp(dir, &["add", "feature.txt"]);
+    assert!(c == 0, "add failed: {e}");
+    let (c, _, e) = gitp(dir, &["commit", "-q", "-m", &format!("{branch} commit")]);
+    assert!(c == 0, "commit {branch} failed: {e}");
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    std::fs::write(dir.join(".forge").join("ci.sh"), "#!/bin/bash\nexit 0\n").unwrap();
+    let (c, _, e) = gitp(dir, &["add", ".forge/ci.sh"]);
+    assert_eq!(c, 0, "add ci.sh failed: {e}");
+    let (c, _, e) = gitp(dir, &["commit", "-q", "-m", "ci plan"]);
+    assert_eq!(c, 0, "commit ci.sh failed: {e}");
+    let (c, _, e) = gitp(dir, &["checkout", "-q", "main"]);
+    assert!(c == 0, "checkout main failed: {e}");
+}
+
+/// Like [`forge`], but stdout is returned VERBATIM (the byte-compare against the
+/// committed fixtures must see exactly what the binary printed, trailing
+/// newline included).
+fn forge_raw(dir: &Path, args: &[&str]) -> (i32, String, String) {
+    let bin = env!("CARGO_BIN_EXE_git-forge");
+    let out = Command::new(bin)
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).to_string(),
+        String::from_utf8_lossy(&out.stderr).to_string(),
+    )
+}
+
+/// The one deterministic scenario behind all seven fixtures. Entity ids are
+/// sequential (shared counter): issue #1, issue #2, PR #3. Every output is the
+/// binary's raw stdout; the byte-compare is the assertion.
+fn t7_json_scenario(dir: &Path) -> Vec<(&'static str, String)> {
+    let mut outs: Vec<(&'static str, String)> = Vec::new();
+    init_repo_pinned(dir);
+    let (c, o, e) = forge_raw(
+        dir,
+        &[
+            "forge",
+            "issue",
+            "new",
+            "--json",
+            "dogfood bug",
+            "fixture description",
+            "--label",
+            "bug",
+            "--label",
+            "p2",
+        ],
+    );
+    assert_eq!(c, 0, "issue new --json failed: {e}");
+    outs.push(("issue-new.json", o));
+    let (c, _, e) = forge(dir, &["forge", "issue", "comment", "1", "first comment"]);
+    assert_eq!(c, 0, "issue comment failed: {e}");
+    let (c, _, e) = forge(dir, &["forge", "issue", "comment", "1", "second comment"]);
+    assert_eq!(c, 0, "issue comment failed: {e}");
+    let (c, _, e) = forge(dir, &["forge", "issue", "new", "closed one"]);
+    assert_eq!(c, 0, "issue new failed: {e}");
+    let (c, _, e) = forge(dir, &["forge", "issue", "close", "2"]);
+    assert_eq!(c, 0, "issue close failed: {e}");
+    let (c, o, e) = forge_raw(dir, &["forge", "issue", "list", "--json"]);
+    assert_eq!(c, 0, "issue list --json failed: {e}");
+    outs.push(("issue-list.json", o));
+    let (c, o, e) = forge_raw(dir, &["forge", "issue", "show", "1", "--json"]);
+    assert_eq!(c, 0, "issue show --json failed: {e}");
+    outs.push(("issue-show.json", o));
+    make_feature_with_plan_pinned(dir, "feature");
+    let (c, o, e) = forge_raw(
+        dir,
+        &[
+            "forge",
+            "pr",
+            "create",
+            "--json",
+            "--source",
+            "feature",
+            "--base",
+            "main",
+            "dogfood PR",
+            "--body",
+            "fixture PR body",
+            "--label",
+            "session:w-x",
+            "--closes",
+            "1",
+        ],
+    );
+    assert_eq!(c, 0, "pr create --json failed: {e}");
+    outs.push(("pr-create.json", o));
+    let (c, o, e) = forge_raw(dir, &["forge", "pr", "list", "--json"]);
+    assert_eq!(c, 0, "pr list --json failed: {e}");
+    outs.push(("pr-list.json", o));
+    let (c, o, e) = forge_raw(dir, &["forge", "ci", "run", "3", "--json"]);
+    assert_eq!(c, 0, "ci run --json failed: {e}");
+    outs.push(("ci-run.json", o));
+    let (c, o, e) = forge_raw(dir, &["forge", "pr", "show", "3", "--json"]);
+    assert_eq!(c, 0, "pr show --json failed: {e}");
+    outs.push(("pr-show.json", o));
+    outs
+}
+
+/// VAL-201: every JSON-enabled command's stdout byte-matches its committed
+/// fixture, and a second independent run of the scenario reproduces every byte
+/// (the schemas are byte-stable, not merely shape-stable).
+#[test]
+fn t7_json_schemas_byte_match_fixtures() {
+    let dir = tmpdir("t7fix");
+    let outs = t7_json_scenario(&dir);
+    assert_eq!(outs.len(), 7, "one fixture per JSON-enabled command");
+    for (name, stdout) in &outs {
+        let expected: &str = match *name {
+            "issue-new.json" => include_str!("fixtures/json/issue-new.json"),
+            "issue-list.json" => include_str!("fixtures/json/issue-list.json"),
+            "issue-show.json" => include_str!("fixtures/json/issue-show.json"),
+            "pr-create.json" => include_str!("fixtures/json/pr-create.json"),
+            "pr-list.json" => include_str!("fixtures/json/pr-list.json"),
+            "pr-show.json" => include_str!("fixtures/json/pr-show.json"),
+            "ci-run.json" => include_str!("fixtures/json/ci-run.json"),
+            other => panic!("unfixtured command output: {other}"),
+        };
+        assert_eq!(
+            stdout, expected,
+            "{name} drifted from its committed fixture"
+        );
+    }
+    let dir2 = tmpdir("t7fix2");
+    let outs2 = t7_json_scenario(&dir2);
+    assert_eq!(
+        outs.iter()
+            .map(|(n, o)| (*n, o.as_str()))
+            .collect::<Vec<_>>(),
+        outs2
+            .iter()
+            .map(|(n, o)| (*n, o.as_str()))
+            .collect::<Vec<_>>(),
+        "two independent scenario runs must be byte-identical"
+    );
+}
+
+/// Empty-entity lists render as empty JSON arrays (the prose "(no issues)"
+/// fallback stays for the human surface).
+#[test]
+fn t7_json_empty_lists() {
+    let dir = tmpdir("t7empty");
+    init_repo(&dir);
+    let (c, o, _) = forge_raw(&dir, &["forge", "issue", "list", "--json"]);
+    assert_eq!(c, 0);
+    assert_eq!(o, "[]\n", "empty issue list --json");
+    let (c, o, _) = forge_raw(&dir, &["forge", "pr", "list", "--json"]);
+    assert_eq!(c, 0);
+    assert_eq!(o, "[]\n", "empty pr list --json");
+    // Prose surface unchanged.
+    let (c, o, _) = forge(&dir, &["forge", "issue", "list"]);
+    assert_eq!(c, 0);
+    assert_eq!(o, "(no issues)", "prose empty issue list changed");
+}
+
+/// VAL-201: `git forge version` prints a bare semver and exits 0 — through the
+/// top-level dispatch and the direct-binary `forge` namespace alike.
+#[test]
+fn t7_version_prints_semver_exit_zero() {
+    let dir = tmpdir("t7ver");
+    for args in [vec!["version"], vec!["forge", "version"]] {
+        let (c, o, e) = forge(&dir, &args);
+        assert_eq!(c, 0, "version {:?} failed: {e}", args);
+        let v = o.trim();
+        let parts: Vec<&str> = v.split('.').collect();
+        assert_eq!(parts.len(), 3, "not a bare semver: {o:?}");
+        for p in parts {
+            p.parse::<u64>()
+                .unwrap_or_else(|_| panic!("semver part {p:?} in {o:?}"));
+        }
+    }
+}
+
+/// VAL-202: unknown flags keep exit-1 — `version` has no options.
+#[test]
+fn t7_version_rejects_arguments() {
+    let dir = tmpdir("t7verbad");
+    let (c, _, e) = forge(&dir, &["version", "--bogus"]);
+    assert_ne!(c, 0, "version --bogus must exit nonzero");
+    assert!(e.contains("unknown option"), "stderr: {e}");
+    let (c, _, _) = forge(&dir, &["forge", "version", "extra"]);
+    assert_ne!(c, 0, "version with a positional must exit nonzero");
+}
+
+/// VAL-202: injecting an unknown flag on a JSON-enabled command keeps exit-1
+/// (the `--json` flag must not loosen the parsers).
+#[test]
+fn t7_unknown_flag_still_exits_nonzero() {
+    let dir = tmpdir("t7unk");
+    init_repo(&dir);
+    make_feature(&dir, "feature", "feat\n");
+    let (c, _, e) = forge(
+        &dir,
+        &[
+            "forge", "pr", "create", "--source", "feature", "--base", "main", "P", "--bogus",
+        ],
+    );
+    assert_ne!(c, 0, "pr create --bogus: {e}");
+    assert!(e.contains("unknown option"), "{e}");
+    let (c, o, _) = forge(
+        &dir,
+        &[
+            "forge", "pr", "create", "--source", "feature", "--base", "main", "P",
+        ],
+    );
+    assert_eq!(c, 0, "{o}");
+    let (c, _, _) = forge(&dir, &["forge", "ci", "run", "1", "--bogus"]);
+    assert_ne!(c, 0, "ci run --bogus must exit nonzero");
+    let (c, _, _) = forge(&dir, &["forge", "issue", "show", "1", "--bogus"]);
+    assert_ne!(c, 0, "issue show --bogus must exit nonzero");
+}
+
+/// `ci run --json` is a success-path result surface: a RED run still exits 1
+/// with prose on stderr and prints NO JSON (errors stay prose on stderr for
+/// every command; the adapter classifies red via stderr, as today).
+#[test]
+fn t7_ci_run_json_failure_keeps_prose_error() {
+    let dir = tmpdir("t7cired");
+    init_repo(&dir);
+    let (c, _, e) = gitp(&dir, &["checkout", "-q", "-b", "feature"]);
+    assert_eq!(c, 0, "checkout: {e}");
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    std::fs::write(dir.join(".forge").join("ci.sh"), "#!/bin/bash\nexit 1\n").unwrap();
+    let (c, _, e) = gitp(&dir, &["add", ".forge/ci.sh"]);
+    assert_eq!(c, 0, "add: {e}");
+    let (c, _, e) = gitp(&dir, &["commit", "-q", "-m", "ci plan"]);
+    assert_eq!(c, 0, "commit: {e}");
+    let (c, _, e) = gitp(&dir, &["checkout", "-q", "main"]);
+    assert_eq!(c, 0, "checkout: {e}");
+    let (c, o, _) = forge(
+        &dir,
+        &[
+            "forge", "pr", "create", "--source", "feature", "--base", "main", "P",
+        ],
+    );
+    assert_eq!(c, 0, "{o}");
+    let (c, o, e) = forge_raw(&dir, &["forge", "ci", "run", "1", "--json"]);
+    assert_ne!(c, 0, "red ci run must exit nonzero");
+    assert_eq!(o, "", "no JSON on a red run: {o:?}");
+    assert!(e.contains("failed"), "stderr names the failure: {e}");
+}

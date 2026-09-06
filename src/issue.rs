@@ -4,15 +4,15 @@
 //! human-readable output only. Shared CLI plumbing (entity-id parsing, terminal
 //! sanitization, store openers, JSON body builders) lives in `crate::cli`.
 
-use std::collections::HashMap;
-
 use crate::cli::{
     body_obj, help_requested, json_str, open_store, parse_entity_id, sanitize_terminal,
     store_has_ref,
 };
 use crate::event::{Event, EventKind, JsonValue};
 use crate::identity::open_mutation_store;
+use crate::machine;
 use crate::store::EventStore;
+use std::collections::HashMap;
 
 /// Build an `issue.*` event for `store`.
 fn issue_event(kind: EventKind, id: u64, actor: &str, body: HashMap<String, JsonValue>) -> Event {
@@ -33,6 +33,7 @@ fn cmd_new(args: &[String]) -> Result<String, String> {
     // Pure argument validation first — a usage error must not be masked by a
     // later config-open failure (error precedence, F-028). Supports
     // `--label <x>` (repeatable) alongside the positional `<title> [description]`.
+    let (json, args) = machine::json_requested(args);
     let mut labels: Vec<String> = Vec::new();
     let mut positional: Vec<String> = Vec::new();
     let mut i = 0;
@@ -79,8 +80,8 @@ fn cmd_new(args: &[String]) -> Result<String, String> {
     let (store, actor) = open_mutation_store()?;
     let id = store.allocate_id().map_err(|e| e.to_string())?;
     let mut body = body_obj(&[("title", json_str(&title))]);
-    if let Some(d) = description {
-        body.insert("description".into(), json_str(&d));
+    if let Some(d) = &description {
+        body.insert("description".into(), json_str(d));
     }
     if !labels.is_empty() {
         body.insert("labels".into(), crate::event::json_string_array(&labels));
@@ -89,37 +90,38 @@ fn cmd_new(args: &[String]) -> Result<String, String> {
     store
         .append_event(&crate::store::issue_ref(id), &ev)
         .map_err(|e| e.to_string())?;
+    if json {
+        // The allocated issue id (the machine surface's reason to exist) plus
+        // the folded-equivalent state, rendered from the same values persisted.
+        return Ok(machine::issue_json(&crate::event::IssueState {
+            id,
+            title: Some(title),
+            description,
+            labels,
+            open: true,
+            comments: Vec::new(),
+        }));
+    }
     Ok(format!("issue #{id} created: {title}"))
 }
 
 /// `git forge issue list`
-fn cmd_list(store: &EventStore) -> Result<String, String> {
-    // Issue list is a bounded scan of refs/forge/issues/1..counter_next
-    // (best-effort when the counter is unreadable).
+fn cmd_list(store: &EventStore, args: &[String]) -> Result<String, String> {
+    let (json, _) = machine::json_requested(args);
+    let states = machine::fold_all_issues(store)?;
+    if json {
+        return Ok(machine::issue_list_json(&states));
+    }
     let mut out = String::new();
-    let mut found = 0usize;
-    // Bound the scan by the counter's next value (best-effort).
-    let next_opt = store.counter_next().ok();
-    let bound = next_opt.unwrap_or(0);
-    for n in 1..bound {
-        let r = crate::store::issue_ref(n);
-        if !store_has_ref(store, &r) {
-            continue;
-        }
-        let chain = store.read_chain(&r).map_err(|e| e.to_string())?;
-        if chain.is_empty() {
-            continue;
-        }
-        let state = crate::event::fold(&chain).issue;
+    for state in &states {
         out.push_str(&format!(
             "#{} {} ({})\n",
             state.id,
             sanitize_terminal(state.title.as_deref().unwrap_or("(untitled)")),
             if state.open { "open" } else { "closed" }
         ));
-        found += 1;
     }
-    if found == 0 {
+    if states.is_empty() {
         return Ok("(no issues)".to_string());
     }
     Ok(out.trim_end().to_string())
@@ -127,6 +129,7 @@ fn cmd_list(store: &EventStore) -> Result<String, String> {
 
 /// `git forge issue show <n>`
 fn cmd_show(store: &EventStore, args: &[String]) -> Result<String, String> {
+    let (json, args) = machine::json_requested(args);
     let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
     let r = crate::store::issue_ref(id);
     if !store_has_ref(store, &r) {
@@ -137,6 +140,9 @@ fn cmd_show(store: &EventStore, args: &[String]) -> Result<String, String> {
         return Err(format!("issue #{id} has no events"));
     }
     let state = crate::event::fold(&chain).issue;
+    if json {
+        return Ok(machine::issue_json(&state));
+    }
     let mut out = format!(
         "#{} {} — {}\n",
         state.id,
@@ -218,7 +224,7 @@ pub fn run_issue(argv: &[String]) -> Result<String, String> {
     }
     match sub {
         "new" => cmd_new(&argv[1..]),
-        "list" => cmd_list(&open_store()?),
+        "list" => cmd_list(&open_store()?, &argv[1..]),
         "show" => cmd_show(&open_store()?, &argv[1..]),
         "comment" => cmd_comment(&argv[1..]),
         "close" | "reopen" => {

@@ -6,6 +6,7 @@ use std::collections::HashMap;
 
 use crate::event::{Event, EventKind, JsonValue};
 use crate::identity::open_mutation_store;
+use crate::machine;
 use crate::store::EventStore;
 
 /// Parse `"<n>"` into a positive u64, else a clean usage error (no panic).
@@ -129,6 +130,9 @@ fn cmd_pr_create(args: &[String]) -> Result<String, String> {
     if help_requested(args) {
         return Ok(USAGE.into());
     }
+    // `--json` (#7): the created PR (allocated id, snapshot, pending CI state)
+    // as one JSON line — the adapter's id capture.
+    let (json, args) = machine::json_requested(args);
     let mut source = None;
     let mut base = None;
     let mut title = None;
@@ -250,11 +254,33 @@ fn cmd_pr_create(args: &[String]) -> Result<String, String> {
     // nor any PR refs changed — no separate append step can strand a durable PR
     // without its pending marker. No plan executes here (fast + non-destructive);
     // the plan runs on-demand via `git forge ci run <pr>`.
+    if json {
+        // The allocated PR number is the id the adapter captures; the rest of
+        // the snapshot renders from the same values `create_pr` persisted.
+        let state = crate::event::PrState {
+            id,
+            title: Some(title.trim().to_string()),
+            description: body.clone().filter(|b| !b.is_empty()),
+            labels: labels.clone(),
+            source_ref: Some(source.clone()),
+            base_ref: Some(base.clone()),
+            source_head: Some(source_oid.to_string()),
+            base_head: Some(base_oid.to_string()),
+            merge_base: Some(merge_base.to_string()),
+            closes,
+            // create_pr publishes the pending marker atomically (above).
+            ci_status: Some("pending".to_string()),
+            ci_plan: None,
+            ..Default::default()
+        };
+        return Ok(machine::pr_json(&state));
+    }
     Ok(format!("PR #{id} created: {title} ({source} -> {base})"))
 }
 
 /// `git forge pr show <n>`
 fn cmd_pr_show(store: &EventStore, args: &[String]) -> Result<String, String> {
+    let (json, args) = machine::json_requested(args);
     let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
     let r = crate::store::pr_head_ref(id);
     if !store_has_ref(store, &r) {
@@ -265,6 +291,9 @@ fn cmd_pr_show(store: &EventStore, args: &[String]) -> Result<String, String> {
         return Err(format!("PR #{id} has no events"));
     }
     let state = crate::event::fold(&chain).pr;
+    if json {
+        return Ok(machine::pr_json(&state));
+    }
     let mut out = format!(
         "PR #{} {} — {}\n",
         state.id,
@@ -336,29 +365,22 @@ fn cmd_pr_show(store: &EventStore, args: &[String]) -> Result<String, String> {
 }
 
 /// `git forge pr list`
-fn cmd_pr_list(store: &EventStore) -> Result<String, String> {
-    let bound = store.counter_next().ok().unwrap_or(1);
+fn cmd_pr_list(store: &EventStore, args: &[String]) -> Result<String, String> {
+    let (json, _) = machine::json_requested(args);
+    let states = machine::fold_all_prs(store)?;
+    if json {
+        return Ok(machine::pr_list_json(&states));
+    }
     let mut out = String::new();
-    let mut found = 0usize;
-    for n in 1..bound {
-        let r = crate::store::pr_head_ref(n);
-        if !store_has_ref(store, &r) {
-            continue;
-        }
-        let chain = store.read_chain(&r).map_err(|e| e.to_string())?;
-        if chain.is_empty() {
-            continue;
-        }
-        let st = crate::event::fold(&chain).pr;
+    for st in &states {
         out.push_str(&format!(
             "PR #{} {} ({})\n",
             st.id,
             sanitize_terminal(st.title.as_deref().unwrap_or("(untitled)")),
             sanitize_terminal(st.effective_decision.as_deref().unwrap_or("no review"))
         ));
-        found += 1;
     }
-    if found == 0 {
+    if states.is_empty() {
         return Ok("(no pull requests)".into());
     }
     Ok(out.trim_end().to_string())
@@ -593,80 +615,6 @@ fn cmd_pr_abandon(args: &[String]) -> Result<String, String> {
     Ok(format!("PR #{id} abandoned: {reason}"))
 }
 
-/// `git forge pr diff <n>` — three-dot diff from the immutable snapshot refs.
-fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String, String> {
-    let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
-    let head = crate::store::pr_head_ref(id);
-    if !store_has_ref(store, &head) {
-        return Err(format!("PR #{id} does not exist"));
-    }
-    // Resolve from the CURRENT generation's immutable snapshot refs (survive
-    // branch deletion + gc): generation 0 uses the L1 `/source`//`/base`
-    // refs, later generations their `/source/g<k>`//`/base/g<k>` pins. The
-    // folded head chain is the authority on which generation is current.
-    let head_tip = store
-        .repo()
-        .find_reference(&head)
-        .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
-        .map_err(|_| format!("PR #{id} does not exist"))?;
-    let (anchored, chain) = store
-        .read_pr_chain_anchored(id, head_tip)
-        .map_err(|e| e.to_string())?;
-    if !anchored {
-        return Err(format!("PR #{id} head chain is not anchored to PR #{id}"));
-    }
-    let state = crate::event::fold(&chain).pr;
-    let source = crate::store::pr_source_ref_for(id, state.generation);
-    let base = crate::store::pr_base_ref_for(id, state.generation);
-    let source_oid = store
-        .repo()
-        .find_reference(&source)
-        .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
-        .map_err(|_| format!("PR #{id} snapshot source ref missing"))?;
-    let base_oid = store
-        .repo()
-        .find_reference(&base)
-        .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
-        .map_err(|_| format!("PR #{id} snapshot base ref missing"))?;
-    // F-008: a retargeted `/source`//`/base` would let `pr diff` display a
-    // different patch than the one a reviewer approves (shared invariant,
-    // one owner in the store).
-    crate::store::EventStore::validate_snapshot_against_state(id, &state, source_oid, base_oid)?;
-    // F-027 (review): the `git diff` shell-out must run through the SANITIZED
-    // git adapter — a caller `GIT_EXTERNAL_DIFF`/`GIT_DIR`/`GIT_CONFIG` would
-    // otherwise render an arbitrary/redirected patch (or run an external-diff
-    // program), so a reviewer could approve a different display than the
-    // validated snapshot.
-    // `--no-ext-diff`/`--no-textconv` also disable a REPO-LOCAL `diff.external`
-    // or an attribute `textconv` driver, which `git_in_ci` intentionally retains
-    // (the repo's own config) and which would otherwise execute arbitrary code
-    // during `pr diff`. The repo is passed as its WORKTREE root (not the `.git`
-    // path) so `-c safe.directory=<root>` matches the path Git's ownership check
-    // actually validates for a non-bare repository.
-    let repo_dir = store
-        .repo()
-        .workdir()
-        .map(|p| p.to_path_buf())
-        .unwrap_or_else(|| store.repo().path().to_path_buf());
-    let (ok, out, err) = crate::git::git_in_ci(
-        &repo_dir,
-        &[
-            "diff",
-            "--no-ext-diff",
-            "--no-textconv",
-            &format!("{base_oid}...{source_oid}"),
-        ],
-    );
-    if !ok {
-        return Err(if err.is_empty() {
-            "git diff failed".to_string()
-        } else {
-            err
-        });
-    }
-    Ok(out)
-}
-
 /// Dispatch a `git forge pr` subcommand. `argv` excludes the `pr` token.
 pub fn run_pr(argv: &[String]) -> Result<String, String> {
     let sub = argv.first().map(|s| s.as_str()).unwrap_or("");
@@ -683,15 +631,15 @@ pub fn run_pr(argv: &[String]) -> Result<String, String> {
     }
     match sub {
         "create" => cmd_pr_create(&argv[1..]),
-        "list" => cmd_pr_list(&open_store()?),
+        "list" => cmd_pr_list(&open_store()?, &argv[1..]),
         "show" => cmd_pr_show(&open_store()?, &argv[1..]),
         "comment" => cmd_pr_comment(&argv[1..]),
         "review" => cmd_pr_review(&argv[1..]),
         "update" => crate::pr_merge::cmd_pr_update(&argv[1..]),
         "prepare" => crate::pr_prepare::cmd_pr_prepare(&argv[1..]),
-        "abandon" => cmd_pr_abandon(&argv[1..]),
-        "diff" => cmd_pr_diff(&open_store()?, &argv[1..]),
+        "diff" => crate::pr_merge::cmd_pr_diff(&open_store()?, &argv[1..]),
         "merge" => crate::pr_merge::cmd_pr_merge(open_store()?, &argv[1..]),
+        "abandon" => cmd_pr_abandon(&argv[1..]),
         "help" | "-h" | "--help" => Ok(pr_help()),
         "" => Ok(pr_help()),
         other => Err(format!("unknown pr subcommand '{other}'")),
@@ -763,6 +711,9 @@ fn worktree_leftover(repo_dir: &std::path::Path, tmp: &std::path::Path) -> Optio
 /// `.forge/ci.sh` that is a symlink or otherwise not a regular file is refused
 /// up front (F-001), so the plan always comes from immutable PR content.
 fn cmd_ci_run(args: &[String]) -> Result<String, String> {
+    // `--json` (#7): the recorded Check's outcome as one JSON line on stdout
+    // (success path only; failures keep the prose stderr + exit 1 contract).
+    let (json, args) = machine::json_requested(args);
     if args.len() != 1 {
         return Err(format!(
             "usage: git forge ci run <pr> (got {} argument(s), expected exactly 1)",
@@ -955,7 +906,7 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
     } else {
         "failed"
     };
-    crate::pr_prepare::record_and_report_ci_check(
+    let recorded = crate::pr_prepare::record_and_report_ci_check(
         &store,
         &head,
         id,
@@ -969,7 +920,14 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
         run.timed_out,
         run.detail.map(|d| d.to_string()),
         &actor,
-    )
+    );
+    if json {
+        // The Check was recorded (record_and_report returns Ok only for a
+        // verified-green run); failures fall through to the prose stderr +
+        // exit-1 contract, so stdout JSON always describes a recorded Check.
+        return recorded.map(|_| machine::ci_run_json(id, status, plan.label(), generation));
+    }
+    recorded
 }
 
 /// Dispatch a `git forge ci` subcommand. `argv` excludes the `ci` token.

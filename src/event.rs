@@ -616,6 +616,13 @@ pub fn json_string_array(items: &[String]) -> JsonValue {
     JsonValue::Array(items.iter().map(|s| JsonValue::String(s.clone())).collect())
 }
 
+/// The wire string serializer, re-exported for the machine interface (#7):
+/// the `--json` output surface escapes through THIS function so the event
+/// wire and the machine surface share one escape implementation.
+pub(crate) fn json_escape_for_machine(value: &str) -> String {
+    json_string(value)
+}
+
 fn json_string(value: &str) -> String {
     let mut out = String::from("\"");
     for c in value.chars() {

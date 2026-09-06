@@ -8,6 +8,81 @@
 
 use crate::identity::{bind_identity, resolve_identity};
 use crate::store::EventStore;
+
+/// `git forge pr diff <n>` — three-dot diff from the immutable snapshot refs.
+pub(crate) fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String, String> {
+    let id = crate::cli::parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
+    let head = crate::store::pr_head_ref(id);
+    if !crate::cli::store_has_ref(store, &head) {
+        return Err(format!("PR #{id} does not exist"));
+    }
+    // Resolve from the CURRENT generation's immutable snapshot refs (survive
+    // branch deletion + gc): generation 0 uses the L1 `/source`//`/base`
+    // refs, later generations their `/source/g<k>`//`/base/g<k>` pins. The
+    // folded head chain is the authority on which generation is current.
+    let head_tip = store
+        .repo()
+        .find_reference(&head)
+        .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
+        .map_err(|_| format!("PR #{id} does not exist"))?;
+    let (anchored, chain) = store
+        .read_pr_chain_anchored(id, head_tip)
+        .map_err(|e| e.to_string())?;
+    if !anchored {
+        return Err(format!("PR #{id} head chain is not anchored to PR #{id}"));
+    }
+    let state = crate::event::fold(&chain).pr;
+    let source = crate::store::pr_source_ref_for(id, state.generation);
+    let base = crate::store::pr_base_ref_for(id, state.generation);
+    let source_oid = store
+        .repo()
+        .find_reference(&source)
+        .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
+        .map_err(|_| format!("PR #{id} snapshot source ref missing"))?;
+    let base_oid = store
+        .repo()
+        .find_reference(&base)
+        .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
+        .map_err(|_| format!("PR #{id} snapshot base ref missing"))?;
+    // F-008: a retargeted `/source`//`/base` would let `pr diff` display a
+    // different patch than the one a reviewer approves (shared invariant,
+    // one owner in the store).
+    crate::store::EventStore::validate_snapshot_against_state(id, &state, source_oid, base_oid)?;
+    // F-027 (review): the `git diff` shell-out must run through the SANITIZED
+    // git adapter — a caller `GIT_EXTERNAL_DIFF`/`GIT_DIR`/`GIT_CONFIG` would
+    // otherwise render an arbitrary/redirected patch (or run an external-diff
+    // program), so a reviewer could approve a different display than the
+    // validated snapshot.
+    // `--no-ext-diff`/`--no-textconv` also disable a REPO-LOCAL `diff.external`
+    // or an attribute `textconv` driver, which `git_in_ci` intentionally retains
+    // (the repo's own config) and which would otherwise execute arbitrary code
+    // during `pr diff`. The repo is passed as its WORKTREE root (not the `.git`
+    // path) so `-c safe.directory=<root>` matches the path Git's ownership check
+    // actually validates for a non-bare repository.
+    let repo_dir = store
+        .repo()
+        .workdir()
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| store.repo().path().to_path_buf());
+    let (ok, out, err) = crate::git::git_in_ci(
+        &repo_dir,
+        &[
+            "diff",
+            "--no-ext-diff",
+            "--no-textconv",
+            &format!("{base_oid}...{source_oid}"),
+        ],
+    );
+    if !ok {
+        return Err(if err.is_empty() {
+            "git diff failed".to_string()
+        } else {
+            err
+        });
+    }
+    Ok(out)
+}
+
 /// `git forge pr merge [<n>] [--squash|--rebase]`
 ///
 /// Fold the PR chain, require effective review decision = approve AND the

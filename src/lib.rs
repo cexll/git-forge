@@ -5,6 +5,7 @@ pub mod fold;
 pub mod git;
 pub mod identity;
 pub mod issue;
+pub mod machine;
 pub mod merge_state;
 pub mod pr_merge;
 pub mod pr_prepare;
