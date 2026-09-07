@@ -10,7 +10,7 @@
   - `tests/t3_merge.rs` — `t7_json_schemas_byte_match_fixtures`, `t7_version_prints_semver_exit_zero`, `t7_unknown_flag_still_exits_nonzero`.
   - `tests/fixtures/json/*.json` — the byte-locked schema fixtures (issue-new, issue-list, issue-show, pr-create, pr-list, pr-show, ci-run).
   - `scripts/devflow.cjs` (adapter repo `/Users/chenwenjie/.agents/skills/implement`) — `FORGE_MIN_JSON_VERSION {0,3,0}`, `forgeProbeVersion` (memoized `git forge version`), `forgeSupportsJson`, `firstJsonObject`/`firstJsonArray`, and the branch points `forgeEnsureTicketIssue` / `forgeCreatePR` / `forgePrMergedRead` / supersede check.
-  - `tests/devflow/forge-adapter.test.cjs` (35 tests) + `dual-path-parity.test.cjs` (6 tests) + `fixtures/devflow/fake-git-forge.cjs`.
+  - `tests/devflow/forge-adapter.test.cjs` (36 tests) + `dual-path-parity.test.cjs` (6 tests) + `fixtures/devflow/fake-git-forge.cjs`.
   - `docs/architecture/git-forge.md` (normative surface) and `.agents/skills/git-forge/SKILL.md` (help quirk documentation).
 - Proven by: the P2 sweeps (v-p2 + a-final), VAL-201 `pass`, VAL-203 `pass`, VAL-202 `fail` on the unknown-flag half (finding F-001: 9 surfaces silently ignored unknown flags, exit 0 — `issue new` even created an entity) with the quirk-documentation half `pass`; F-001 fixed at forge commit `41ea9a0` where `t7_unknown_flag_still_exits_nonzero` (fixture now creates issue #1 / PR #2 first — the pre-fix test passed vacuously) asserts the flag is NAMED in the refusal on all 9 surfaces plus `pr create`/`ci run`, proves no side effect, and proves `--json` still parses everywhere; cargo test 320 passed / 0 failed, dogfood pass=141 fail=0 (6 new `--bogus` assertions). Evidence: `.specs/forge-p2/forge-p2/missions/evidence/v-p2/` and `evidence/a-final/`.
 
@@ -57,5 +57,5 @@
 - Live `--json` snapshots for all seven surfaces (`issue-new.json`, `issue-list.json`, `issue-show.json`, `pr-create.json`, `pr-list.json`, `pr-show.json`, `ci-run.json` shape) with exit codes.
 - The unknown-flag exit matrix: one line per surface with exit code and verbatim refusal, run on a repo with the entities present.
 - The version probe artifact (`0.3.0`, exit 0, both forms; `version --bogus` exit 1).
-- Adapter matrix + parity logs (35/35 and 6/6) and the live gate/cycle artifacts (`version-gate-live.json`: probe object, supportsJson, 0.2.9 false; `adapter-json-cycle-live.json`: `LIVE-JSON-CYCLE OK` with ids).
+- Adapter matrix + parity logs (36/36 and 6/6) and the live gate/cycle artifacts (`version-gate-live.json`: probe object, supportsJson, 0.2.9 false; `adapter-json-cycle-live.json`: `LIVE-JSON-CYCLE OK` with ids).
 - A run-log ending line `ALL <k> ASSERTIONS EXERCISED OK`.
