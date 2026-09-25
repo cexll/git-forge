@@ -88,3 +88,7 @@ git forge issue close <n>                               # 8. close the loop on t
 ## Reference
 
 Normative wire contract (ref layout, event JSON schema v1, counter CAS, merge semantics): `docs/architecture/git-forge.md`. Glossary: `CONTEXT.md`. Legacy rationale: `docs/adr/`.
+
+## Optional Issue workflow companion
+
+See `docs/issue-workflow-bridge.md` for `git forge-workflow`. It delegates to devflow and does not change native L1 refs or introduce a native `issue sync` subcommand.

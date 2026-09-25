@@ -1,0 +1,22 @@
+#!/usr/bin/env node
+'use strict';
+// An optional bridge, not a native git-forge subcommand. No shell or implicit API credentials.
+const fs = require('node:fs');
+const path = require('node:path');
+const { spawnSync } = require('node:child_process');
+const verbs = Object.freeze({publish:'publish-issues',sync:'sync-issues',intake:'intake-issues','submit-pr':'submit-pr','review-pr':'review-pr',reconcile:'reconcile-github','sync-status':'sync-issue-status'});
+const [verb, ...args] = process.argv.slice(2);
+if (verb === '--help' || verb === 'help') {
+  process.stdout.write('git-forge-workflow (optional devflow bridge)\nUsage: git forge-workflow <'+Object.keys(verbs).join('|')+'> [devflow arguments]\nSet DEVFLOW_CLI to the loaded implement skill entry when installed separately.\nPublication/review/status preview by default; --apply authorizes those writes. Reconcile changes local Git state.\n');
+  process.exit(0);
+}
+if (!Object.hasOwn(verbs, verb || '')) { process.stderr.write('Unknown workflow command; run git-forge-workflow --help\n'); process.exit(2); }
+const [major, minor] = process.versions.node.split('.').map(Number);
+if (major < 22 || (major === 22 && minor < 16)) { process.stderr.write('Node >=22.16.0 is required\n'); process.exit(2); }
+const cli = path.resolve(process.env.DEVFLOW_CLI || path.join(__dirname, '../../../skills/implement/scripts/devflow.cjs'));
+try { if (!fs.statSync(cli).isFile()) throw new Error('not a file'); }
+catch { process.stderr.write('Cannot read devflow entry; set DEVFLOW_CLI to an existing absolute path\n'); process.exit(2); }
+const result = spawnSync(process.execPath, [cli, verbs[verb], ...args], { stdio:'inherit', env:process.env });
+if (result.error) { process.stderr.write('Cannot execute devflow: '+result.error.message+'\n'); process.exit(2); }
+if (result.signal) { process.kill(process.pid,result.signal); }
+else process.exitCode = Number.isInteger(result.status) ? result.status : 2;

@@ -1,0 +1,8 @@
+'use strict';
+const {test}=require('node:test'), assert=require('node:assert/strict'), fs=require('node:fs'), os=require('node:os'), path=require('node:path'), {spawnSync}=require('node:child_process');
+const bridge=path.join(__dirname,'../scripts/git-forge-workflow');
+const run=(args,env=process.env)=>spawnSync(process.execPath,[bridge,...args],{encoding:'utf8',env});
+test('help succeeds and unknown verbs fail explicitly',()=>{assert.equal(run(['--help']).status,0);assert.equal(run(['merge-everything']).status,2);});
+test('argv is preserved literally with spaces and shell metacharacters',()=>{const dir=fs.mkdtempSync(path.join(os.tmpdir(),'forge bridge '));try{const cli=path.join(dir,'entry.cjs');fs.writeFileSync(cli,'console.log(JSON.stringify(process.argv.slice(2)));');const args=['--repo','acme/demo','--body','$(touch SHOULD_NOT_EXECUTE); literal spaces'];const r=run(['publish',...args],{...process.env,DEVFLOW_CLI:cli});assert.equal(r.status,0,r.stderr);assert.deepEqual(JSON.parse(r.stdout),['publish-issues',...args]);}finally{fs.rmSync(dir,{recursive:true,force:true});}});
+test('child rejection status is not reported as success',()=>{const dir=fs.mkdtempSync(path.join(os.tmpdir(),'forge bridge '));try{const cli=path.join(dir,'entry.cjs');fs.writeFileSync(cli,'process.exit(7);');assert.equal(run(['sync'],{...process.env,DEVFLOW_CLI:cli}).status,7);}finally{fs.rmSync(dir,{recursive:true,force:true});}});
+test('missing runtime refuses rather than falling back to a different CLI',()=>{assert.equal(run(['publish'],{...process.env,DEVFLOW_CLI:'/nonexistent/entry.cjs'}).status,2);});
