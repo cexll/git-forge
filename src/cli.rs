@@ -684,13 +684,13 @@ fn pr_help() -> String {
      \nsubcommands:\n\
      \x20 create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]... [--closes <n>]\n\
      \x20 list\n\
-     \x20 show <n>\n\
+     \x20 show <n> [--json]\n\
      \x20 comment <n> <body>\n\
      \x20 review <n> --approve|--reject [--file <f> --line <l> --commit <c>]\n\
      \x20 update <n>\n\
      \x20 prepare <n> --strategy merge|squash|rebase|ff\n\
      \x20 diff <n>\n\
-     \x20 merge [<n>] [--squash|--rebase]\n\
+     \x20 merge [<n>] [--merge|--squash|--rebase|--ff]\n\
      \x20 abandon <n> --reason <text>"
         .to_string()
 }

@@ -87,7 +87,7 @@ pub(crate) fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String,
     Ok(out)
 }
 
-/// `git forge pr merge [<n>] [--squash|--rebase]`
+/// `git forge pr merge [<n>] [--merge|--squash|--rebase|--ff]`
 ///
 /// Fold the PR chain, require effective review decision = approve AND the
 /// latest CI Check = success, then merge the immutable snapshot

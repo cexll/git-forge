@@ -332,7 +332,7 @@ fn issue_help() -> String {
      \x20 new <title> [description] [--label <x>]... [--parent <n>] [--blocked-by <n>]... [--json]\n\
      \x20 apply <dir|file> [--dry-run] [--json]\n\
      \x20 list [--parent <n>] [--state open|closed|all] [--json]\n\
-     \x20 show <n>\n\
+     \x20 show <n> [--json]\n\
      \x20 comment <n> <body>\n\
      \x20 close <n>\n\
      \x20 reopen <n>"
