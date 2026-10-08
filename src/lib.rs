@@ -10,6 +10,7 @@ mod issue_apply;
 mod issue_plan;
 pub mod machine;
 pub mod merge_state;
+mod pr_create;
 pub mod pr_merge;
 pub mod pr_prepare;
 mod pr_review;
