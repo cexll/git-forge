@@ -216,6 +216,8 @@ state: open
 
 - Opening and closing frontmatter delimiters are `---` lines. `key` and `title`
   are required non-empty scalar strings; whitespace-only titles are invalid.
+  A decoded key may contain whitespace or punctuation, but must not start with
+  the reserved `#` reference prefix. Quoted keys preserve their decoded bytes.
 - The only fields are `key`, `title`, `parent`, `blocked_by`, `labels`, and
   `state`. Unknown/duplicate fields, missing delimiters and malformed values
   are errors naming the file and field. This is not general YAML: no nested
@@ -224,7 +226,7 @@ state: open
 - Scalars are strings, optionally enclosed in single or double quotes. Single
   quoted strings cannot contain an internal single quote; double quoted strings
   use JSON escapes. Plain scalars cannot contain `[`, `]`, commas or quotes;
-  quote titles/labels containing those characters.
+  quote keys, references, titles or labels containing those characters.
   `blocked_by` and `labels` are inline arrays of scalar strings, for example
   `[api, "#12"]` or `['ready-for-agent']`; an empty array is `[]`.
   Comments start at an unquoted `#` preceded by whitespace. Existing Issue

@@ -131,6 +131,40 @@ fn apply_creates_graph_and_dry_run_and_reapply_preserve_refs() {
 }
 
 #[test]
+fn quoted_keys_resolve_parent_and_blocker_references() {
+    for quoted in [r#""project schema,[root]""#, "'   '"] {
+        let repo = Repo::new();
+        let dir = repo.0.join("plan");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(
+            dir.join("0-root.md"),
+            format!("---\nkey: {quoted}\ntitle: Root\n---\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            dir.join("1-child.md"),
+            entry(
+                "child",
+                &format!("parent: {quoted}\nblocked_by: [{quoted}]\n"),
+                "",
+            ),
+        )
+        .unwrap();
+        repo.ok(&["issue", "apply", path_str(&dir), "--json"]);
+        let root = repo.ok(&["issue", "show", "1", "--json"]);
+        assert!(root.contains("\"children\":[2]"), "{root}");
+        let child = repo.ok(&["issue", "show", "2", "--json"]);
+        assert!(child.contains("\"parent\":1"), "{child}");
+        assert!(child.contains("\"blocked_by\":[1]"), "{child}");
+        assert!(child.contains("\"blocked\":true"), "{child}");
+        let before = repo.refs();
+        let again = repo.ok(&["issue", "apply", path_str(&dir), "--json"]);
+        assert_eq!(again.matches("\"action\":\"unchanged\"").count(), 2);
+        assert_eq!(repo.refs(), before);
+    }
+}
+
+#[test]
 fn metadata_diff_only_appends_updated_and_state_omission_preserves_closed() {
     let repo = Repo::new();
     let dir = graph(&repo);
@@ -173,6 +207,9 @@ fn metadata_diff_only_appends_updated_and_state_omission_preserves_closed() {
 #[test]
 fn invalid_plans_name_file_and_field_and_write_nothing() {
     for (field, text) in [
+        ("key", "---\nkey: \"\"\ntitle: Root\n---\n".into()),
+        ("key", "---\nkey: \"#reserved\"\ntitle: Root\n---\n".into()),
+        ("title", "---\nkey: one\ntitle: '   '\n---\n".into()),
         ("blocked_by", entry("one", "blocked_by: [one]\n", "")),
         ("blocked_by", entry("one", "blocked_by: [missing]\n", "")),
         ("parent", entry("one", "parent: one\n", "")),

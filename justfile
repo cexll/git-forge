@@ -90,8 +90,8 @@ size-gate:
     cd "$T" && HOME="$T" XDG_CONFIG_HOME="$T" tokei --no-ignore --output json "$REPO/src/" | python3 -c 'import json,sys; data=json.load(sys.stdin); prefix=sys.argv[1]; bad=[(r["name"],r["stats"]["code"]) for v in data.values() for r in v.get("reports",[]) if r["name"].startswith(prefix + "/") and r["stats"]["code"]>800]; [print("size-gate: %s exceeds 800 code lines (%d)"%(n,c), file=sys.stderr) for n,c in sorted(bad)]; sys.exit(1 if bad else 0)' "$REPO/src"
 
 # ── Tests ────────────────────────────────────────────────────────
-test:
-    @if [ -f Cargo.toml ]; then cargo test --all-targets; else echo "test: no Cargo.toml yet — lands with devflow t0"; fi
+test *args:
+    @if [ -f Cargo.toml ]; then cargo test --all-targets {{args}}; else echo "test: no Cargo.toml yet — lands with devflow t0"; fi
 
 # Unit tests only (fast)
 unit:

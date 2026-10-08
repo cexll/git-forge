@@ -108,17 +108,26 @@ fn parse(file: &Path, text: &str) -> Result<Entry, String> {
         .map_err(|e| error(field, &e))
     };
     let key = scalar_field("key")?;
-    if key.starts_with('#') || key.chars().any(|c| c.is_whitespace() || "[],".contains(c)) {
+    if key.starts_with('#') {
         return Err(error(
             "key",
-            "expected a non-empty stable key without whitespace, # prefix, commas or brackets",
+            "expected a non-empty stable key without the reserved # prefix",
         ));
     }
     let title = scalar_field("title")?;
+    if title.trim().is_empty() {
+        return Err(error("title", "must be non-empty"));
+    }
     let list_field = |field: &str| -> Result<Vec<String>, String> {
         fields
             .get(field)
-            .map(|v| list(v).map_err(|e| error(field, &e)))
+            .map(|v| {
+                let values = list(v).map_err(|e| error(field, &e))?;
+                if field == "labels" && values.iter().any(|s| s.trim().is_empty()) {
+                    return Err(error(field, "must be non-empty"));
+                }
+                Ok(values)
+            })
             .unwrap_or(Ok(Vec::new()))
     };
     let parent = fields
@@ -194,7 +203,7 @@ fn scalar(input: &str) -> Result<String, String> {
         }
         input.to_string()
     };
-    if value.trim().is_empty() {
+    if value.is_empty() {
         return Err("must be non-empty".into());
     }
     Ok(value)
