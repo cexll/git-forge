@@ -134,6 +134,9 @@ refs/remotes/<remote>/forge/*            # remote-tracking mirror; never local-a
 ```
 
 - Entity ID is sequential integer. `refs/forge/meta/counter` is a ref to a versioned counter commit whose tree contains `.forge/counter.json` `{v:1, next: <u64>}`; each allocation appends a new counter commit and updates the ref.
+- Counter and event JSON readers accept JSON whitespace around keys, colons,
+  values and separators. Writers retain the compact JSON format. The counter
+  reader preserves the full unsigned 64-bit range for `next`.
 - **Lazy initialization**: the first allocation (`issue new`/`pr create`) atomically creates entity `#1` and a counter commit `{next:2}` in one ref transaction; `git forge init` is optional and only pre-creates the counter. A clean repo needs no setup step before `#1`.
 - Allocation is atomic: one `git update-ref --stdin` transaction performs (1) CAS on `refs/forge/meta/counter` (expected old counter commit, new counter commit) and (2) `create` of the entity ref with **expected absence** — Issue: `refs/forge/issues/<n>`; PR: `refs/forge/prs/<n>/head`, `.../meta`, `.../source` (→ `source_head`), and `.../base` (→ `base_head`) all in the same transaction. A concurrent allocator or a pre-existing entity ref fails the transaction (retry with fresh read for counter collision; reject if the entity ref already exists). L1 requires a concurrent-allocation test proving two simultaneous `issue new` calls receive distinct `#n`, a stale-counter/preexisting-entity collision test, and a PR first-allocation collision test.
 - PR uses `pr.created` as the **authoritative** base/source snapshot; `refs/forge/prs/<n>/meta` is a convenience pointer only. `pr.created` records `base_ref`, `base_head`, `source_ref`, `source_head`, and `merge_base` (= `git merge-base(base_head, source_head)` at creation).
@@ -319,6 +322,10 @@ with `LC_ALL=C`; unrecognized diagnostics fail closed without retrying.
 - `issue list [--parent <n>] [--state open|closed|all] [--json]` filters by direct
   parent and state; the default state filter is `all` (preserves existing list
   behavior). `issue show <n> [--json]` displays one Issue.
+- Issue display enumerates actual `refs/forge/issues/*` through Git ref APIs,
+  independent of the counter. An unreadable Issue ref or a chain without a
+  usable Issue creation fails listing with an error naming the ref;
+  it is never silently omitted from prose or JSON lists.
 - JSON keeps the existing fields and adds `key` (string or null), `parent`
   (Issue id or null), `blocked_by` (Issue ids), and `blocked` (boolean). Show
   also adds `children` (direct child Issue ids). Compute `blocked` against the

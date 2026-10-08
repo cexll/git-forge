@@ -290,10 +290,7 @@ pub fn cmd_version(args: &[String]) -> Result<String, String> {
     Ok(version_string())
 }
 
-/// Fold every existing entity ref `1..counter` in id order — the shared scan
-/// behind prose and JSON `issue list` / `pr list`, so the two surfaces can
-/// never disagree on WHICH entities exist — only on rendering. One generic
-/// body (not a per-entity pair): the duplication gate counts the naive pair.
+/// Fold PR refs `1..counter` in id order for prose and JSON `pr list`.
 fn fold_all<T>(
     store: &EventStore,
     head_ref: fn(u64) -> String,
@@ -316,7 +313,19 @@ fn fold_all<T>(
 
 /// The prose/JSON `issue list` scan, in id order.
 pub(crate) fn fold_all_issues(store: &EventStore) -> Result<Vec<crate::event::IssueState>, String> {
-    fold_all(store, crate::store::issue_ref, |s| s.issue.clone())
+    let (tips, states) = store.read_issue_refs().map_err(|e| e.to_string())?;
+    for id in tips.keys() {
+        if !states
+            .get(id)
+            .is_some_and(|state| state.id == *id && state.title.is_some())
+        {
+            return Err(format!(
+                "cannot read {}: chain has no usable issue #{id} creation",
+                crate::store::issue_ref(*id)
+            ));
+        }
+    }
+    Ok(states.into_values().collect())
 }
 
 /// The prose/JSON `pr list` scan, in id order.

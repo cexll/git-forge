@@ -849,11 +849,99 @@ fn git_out(dir: &PathBuf, args: &[&str]) -> (i32, String) {
     )
 }
 
+/// Publish an independently authored JSON fixture through git object/ref APIs.
+fn publish_json(dir: &Path, reference: &str, file: &str, content: &str) {
+    let repo = git2::Repository::open(dir).unwrap();
+    let blob = repo.blob(content.as_bytes()).unwrap();
+    let mut files = repo.treebuilder(None).unwrap();
+    files.insert(file, blob, 0o100644).unwrap();
+    let files = files.write().unwrap();
+    let mut root = repo.treebuilder(None).unwrap();
+    root.insert(".forge", files, 0o040000).unwrap();
+    let tree = repo.find_tree(root.write().unwrap()).unwrap();
+    let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+    repo.commit(
+        Some(reference),
+        &signature,
+        &signature,
+        "fixture",
+        &tree,
+        &[],
+    )
+    .unwrap();
+}
+
 #[test]
-fn issue_list_tolerates_gap_and_eventless_ref() {
-    // cli.rs:159 (absent ref inside the counter bound -> continue) and
-    // cli.rs:163 (ref present but chain has no event blob -> continue). A GC'd
-    // or rewritten ref must never abort `issue list`; it is skipped.
+fn issue_new_accepts_standard_json_counter_spacing() {
+    let dir = tmpdir("spaced-counter-new");
+    init_repo(&dir);
+    publish_json(
+        &dir,
+        "refs/forge/meta/counter",
+        "counter.json",
+        r#"{"v": 1, "next": 3}"#,
+    );
+    let (code, out, err) = forge(&dir, &["issue", "new", "Third issue"]);
+    assert_eq!(code, 0, "spaced counter allocation failed: {err}");
+    assert!(out.contains("#3"), "wrong allocation: {out}");
+    let (code, out, err) = forge(&dir, &["issue", "show", "3"]);
+    assert_eq!(code, 0, "show failed: {err}");
+    assert!(out.contains("#3 Third issue"), "show: {out}");
+}
+
+#[test]
+fn issue_apply_accepts_standard_json_counter_spacing() {
+    let dir = tmpdir("spaced-counter-apply");
+    init_repo(&dir);
+    publish_json(
+        &dir,
+        "refs/forge/meta/counter",
+        "counter.json",
+        r#"{"v": 1, "next": 3}"#,
+    );
+    let plan = dir.join("plan.md");
+    std::fs::write(
+        &plan,
+        "---\nkey: third\ntitle: Applied third issue\n---\nBody\n",
+    )
+    .unwrap();
+    let (code, out, err) = forge(&dir, &["issue", "apply", plan.to_str().unwrap()]);
+    assert_eq!(code, 0, "spaced counter apply failed: {err}");
+    assert!(out.contains("#3"), "wrong allocation: {out}");
+    let (code, out, err) = forge(&dir, &["issue", "show", "3"]);
+    assert_eq!(code, 0, "show failed: {err}");
+    assert!(out.contains("#3 Applied third issue"), "show: {out}");
+}
+
+#[test]
+fn issue_list_and_show_read_standard_json_event_spacing_without_counter() {
+    let dir = tmpdir("spaced-event");
+    init_repo(&dir);
+    publish_json(
+        &dir,
+        "refs/forge/issues/2",
+        "event.json",
+        r#"
+        {
+            "v" : 1, "id": "517b19a7-9f70-469a-b1f3-ff646b730f83",
+            "kind": "issue.created", "entity": "issue", "entity_id": 2,
+            "ts": "2026-09-21T02:36:01Z", "actor": "test@example.com",
+            "body": { "title": "Earlier issue", "description": "Earlier body" }
+        }
+    "#,
+    );
+    for args in [
+        vec!["issue", "list", "--state", "all"],
+        vec!["issue", "show", "2"],
+    ] {
+        let (code, out, err) = forge(&dir, &args);
+        assert_eq!(code, 0, "spaced event read failed: {err}");
+        assert!(out.contains("#2 Earlier issue"), "missing issue: {out}");
+    }
+}
+
+#[test]
+fn issue_list_tolerates_missing_ref_gap() {
     let dir = tmpdir("listgap");
     init_repo(&dir);
     git_out(&dir, &["commit", "--allow-empty", "-q", "-m", "base"]);
@@ -871,18 +959,43 @@ fn issue_list_tolerates_gap_and_eventless_ref() {
         !o1.contains("two"),
         "deleted issue must not be listed: {o1}"
     );
+}
 
-    // Eventless: #2's ref points at a plain commit with no event blob.
-    let base = git_out(&dir, &["rev-parse", "HEAD"]).1;
-    let (cr, _) = git_out(&dir, &["update-ref", "refs/forge/issues/2", &base]);
-    assert_eq!(cr, 0, "setup: repoint issue 2 at a plain commit");
-    let (c2, o2, e2) = forge(&dir, &["forge", "issue", "list"]);
-    assert_eq!(c2, 0, "list with an eventless ref must succeed: {e2}");
-    assert!(o2.contains("one"), "eventless list output: {o2}");
-    assert!(
-        !o2.contains("two"),
-        "eventless issue must not be listed: {o2}"
-    );
+#[test]
+fn issue_list_rejects_unreadable_refs_with_ref_name() {
+    for (tag, payload) in [
+        ("invalid-json", Some("not JSON")),
+        ("wrong-shape", Some(r#"{"v": 1}"#)),
+        ("eventless", None),
+    ] {
+        let dir = tmpdir(tag);
+        init_repo(&dir);
+        if let Some(payload) = payload {
+            publish_json(&dir, "refs/forge/issues/2", "event.json", payload);
+        } else {
+            assert_eq!(
+                git_out(&dir, &["commit", "--allow-empty", "-q", "-m", "base"]).0,
+                0
+            );
+            let base = git_out(&dir, &["rev-parse", "HEAD"]).1;
+            assert_eq!(
+                git_out(&dir, &["update-ref", "refs/forge/issues/2", &base]).0,
+                0
+            );
+        }
+        for args in [
+            vec!["issue", "list", "--state", "all"],
+            vec!["issue", "list", "--state", "all", "--json"],
+        ] {
+            let (code, out, err) = forge(&dir, &args);
+            assert_ne!(code, 0, "unreadable ref silently skipped ({tag}): {out}");
+            assert!(
+                err.contains("refs/forge/issues/2"),
+                "missing ref name ({tag}): {err}"
+            );
+            assert!(out.is_empty(), "partial list ({tag}): {out}");
+        }
+    }
 }
 
 #[test]

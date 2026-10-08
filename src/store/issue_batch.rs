@@ -3,6 +3,8 @@ use super::*;
 use crate::event::{fold, IssueState};
 use std::collections::BTreeMap;
 
+type IssueRefs = (BTreeMap<u64, Oid>, BTreeMap<u64, IssueState>);
+
 pub(crate) struct IssueSnapshot {
     pub counter_tip: Option<Oid>,
     pub next: u64,
@@ -19,27 +21,7 @@ impl EventStore {
             };
             #[cfg(test)]
             tests::after_counter_read(self);
-            let mut tips = BTreeMap::new();
-            let mut states = BTreeMap::new();
-            for reference in self.repo.references_glob("refs/forge/issues/*")? {
-                let reference = reference?;
-                let name = reference
-                    .name()
-                    .ok_or_else(|| StoreError::InvalidState("non-UTF-8 issue ref".into()))?;
-                let id: u64 = name
-                    .strip_prefix("refs/forge/issues/")
-                    .and_then(|s| s.parse().ok())
-                    .filter(|id| *id > 0)
-                    .ok_or_else(|| StoreError::InvalidState(format!("invalid issue ref {name}")))?;
-                let tip = reference.target().ok_or_else(|| {
-                    StoreError::InvalidState(format!("symbolic issue ref {name}"))
-                })?;
-                tips.insert(id, tip);
-                let events = self.chain_events_from_tip(tip)?;
-                if !events.is_empty() {
-                    states.insert(id, fold(&events).issue);
-                }
-            }
+            let (tips, states) = self.read_issue_refs()?;
             // Allocations publish the counter and new Issue together. Reject a
             // graph read that crossed an allocation before checking id collisions.
             if self.current_tip(COUNTER_REF)? != counter_tip {
@@ -53,6 +35,33 @@ impl EventStore {
             });
         }
         Err(StoreError::CasConflict)
+    }
+
+    pub(crate) fn read_issue_refs(&self) -> Result<IssueRefs, StoreError> {
+        let mut tips = BTreeMap::new();
+        let mut states = BTreeMap::new();
+        for reference in self.repo.references_glob("refs/forge/issues/*")? {
+            let reference = reference?;
+            let name = reference
+                .name()
+                .ok_or_else(|| StoreError::InvalidState("non-UTF-8 issue ref".into()))?;
+            let id: u64 = name
+                .strip_prefix("refs/forge/issues/")
+                .and_then(|s| s.parse().ok())
+                .filter(|id| *id > 0)
+                .ok_or_else(|| StoreError::InvalidState(format!("invalid issue ref {name}")))?;
+            let tip = reference
+                .target()
+                .ok_or_else(|| StoreError::InvalidState(format!("symbolic issue ref {name}")))?;
+            let events = self
+                .chain_events_from_tip(tip)
+                .map_err(|e| StoreError::InvalidState(format!("cannot read {name}: {e}")))?;
+            tips.insert(id, tip);
+            if !events.is_empty() {
+                states.insert(id, fold(&events).issue);
+            }
+        }
+        Ok((tips, states))
     }
 }
 impl BoundEventStore {
