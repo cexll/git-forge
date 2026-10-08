@@ -416,12 +416,27 @@ fn failed_ci_has_json_error_and_records_failed_check() {
         .run(&["pr", "create", "--source", "feature", "--base", "main", "PR"])
         .status
         .success());
-    assert_error(
-        &repo.run(&["ci", "run", "1", "--json"]),
-        "E_CI_FAILED",
-        "CI run for PR #1 failed (.forge/ci.sh): exited with status 1",
-        "1",
-        false,
+    // #38: the CI failure adds the reason to the message and `data` with
+    // the reason and the (empty) output tail.
+    let message =
+        "CI run for PR #1 failed (.forge/ci.sh): exited with status 1; reason: nonzero_exit";
+    let output = repo.run(&["ci", "run", "1", "--json"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!("git-forge: {message}\n")
+    );
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(
+        document,
+        serde_json::json!({"error": {
+            "code": "E_CI_FAILED",
+            "message": message,
+            "input": "1",
+            "hint": "Fix the CI plan and run CI again.",
+            "retryable": false,
+            "data": {"pr": 1, "reason": "nonzero_exit", "tail": ""},
+        }})
     );
     let show = repo.run(&["pr", "show", "1", "--json"]);
     assert!(show.status.success());

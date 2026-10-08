@@ -2376,12 +2376,6 @@ fn ci_run_extreme_timeout_does_not_panic() {
     assert_eq!(status.trim(), "", "working tree must be clean: {status}");
 }
 
-/// F-016 regression: unbounded output capture must not be silently restored.
-/// A plan writes a deterministic marker whenever its stdout/stderr are a PIPE
-/// (i.e. being captured, as with `Command::output()`) rather than redirected to
-/// `/dev/null` (the bounded impl). Under the bounded impl the marker is never
-/// written; if `Command::output()` unbounded capture is restored, the marker is
-/// written and this test fails — deterministically, without needing an OOM.
 #[test]
 fn ci_run_ignores_caller_bash_env() {
     let dir = tmpdir("ci-bash-env");
@@ -2573,6 +2567,12 @@ fn ci_run_rejects_trailing_arguments() {
     );
 }
 
+/// F-016 regression: plan output must stay bounded while it is captured for
+/// the CI diagnostic tail (spec #33). A plan writes 32 MiB and then a marker
+/// line and fails: the run drains the pipe (the failure is the plan's
+/// non-zero exit, never a deadline hit from a blocked writer) and stores
+/// exactly the last 4096 bytes. The in-memory bound itself is pinned by the
+/// `Capture` unit test in `src/ci/tests.rs`.
 #[test]
 fn ci_run_detects_unbounded_output_capture() {
     let dir = tmpdir("ci-capture");
@@ -2580,26 +2580,19 @@ fn ci_run_detects_unbounded_output_capture() {
     git(&dir, &["config", "user.email", "ci@example.com"]);
     git(&dir, &["checkout", "-q", "-b", "feature"]);
     std::fs::create_dir_all(dir.join(".forge")).unwrap();
-    let marker = dir.join("unbounded-capture-marker.txt");
     std::fs::write(
         dir.join(".forge").join("ci.sh"),
-        format!(
-            "#!/bin/bash\n\
-             if [ -p /dev/stdout ] || [ -p /dev/stderr ]; then\n\
-             \x20 echo 'unbounded output capture detected' > \"{marker}\"\n\
-             fi\n\
-             echo 'noise on stdout'\n\
-             echo 'noise on stderr' >&2\n\
-             exit 1\n",
-            marker = marker.display()
-        ),
+        "#!/bin/bash\n\
+         yes 0123456789abcde | head -c 33554432\n\
+         echo END-MARK >&2\n\
+         exit 1\n",
     )
     .unwrap();
     std::fs::write(dir.join("feature.txt"), "feat\n").unwrap();
     git(&dir, &["add", "."]);
     git(
         &dir,
-        &["commit", "-q", "-m", "feature + capture detector ci plan"],
+        &["commit", "-q", "-m", "feature + high-volume ci plan"],
     );
     git(&dir, &["checkout", "-q", "main"]);
 
@@ -2611,18 +2604,22 @@ fn ci_run_detects_unbounded_output_capture() {
         .0,
         0
     );
-    assert!(!marker.exists(), "marker must not exist before ci run");
 
-    let (c, _o, e) = forge(&dir, &["forge", "ci", "run", "1"]);
-    assert_ne!(c, 0, "failing capture-detector plan must exit nonzero: {e}");
-    assert!(
-        !marker.exists(),
-        "the bounded impl must redirect plan output to /dev/null; a marker here \
-         proves unbounded Command::output() capture was restored (F-016)"
+    let (c, _o, e) = forge_with_env(
+        &dir,
+        &["forge", "ci", "run", "1"],
+        &[("GIT_FORGE_CI_TIMEOUT", "120")],
     );
+    assert_ne!(c, 0, "failing high-volume plan must exit nonzero: {e}");
+    assert!(e.contains("; reason: nonzero_exit; "), "{e}");
 
-    let event = head_event(&dir, 1);
-    assert!(event.contains("\"status\":\"failed\""), "status: {event}");
+    let event: serde_json::Value = serde_json::from_str(&head_event(&dir, 1)).unwrap();
+    assert_eq!(event["body"]["status"], "failed", "{event}");
+    assert_eq!(event["body"]["reason"], "nonzero_exit", "{event}");
+    let stream = "0123456789abcde\n".repeat(256);
+    let expected = format!("{}END-MARK\n", &stream[stream.len() - 4087..]);
+    assert_eq!(expected.len(), 4096);
+    assert_eq!(event["body"]["tail"], expected.as_str());
 
     assert_no_ci_worktree(&dir);
     let (_, status, _) = git(&dir, &["status", "--porcelain"]);
