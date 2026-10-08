@@ -5230,3 +5230,551 @@ fn ci_run_refuses_abandoned_pr_without_appending_check() {
     );
     assert_no_ci_worktree(&dir);
 }
+
+fn candidate_error_fixture(tag: &str) -> PathBuf {
+    let dir = tmpdir(tag);
+    init_repo(&dir);
+    std::fs::create_dir_all(dir.join(".forge")).unwrap();
+    std::fs::write(dir.join(".forge/ci.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+    assert_eq!(git(&dir, &["add", ".forge/ci.sh"]).0, 0);
+    assert_eq!(git(&dir, &["commit", "-q", "-m", "CI plan"]).0, 0);
+    make_feature(&dir, "feature", "feature\n");
+    let (code, _, error) = forge(
+        &dir,
+        &[
+            "forge",
+            "pr",
+            "create",
+            "--source",
+            "feature",
+            "--base",
+            "main",
+            "Candidate",
+        ],
+    );
+    assert_eq!(code, 0, "create: {error}");
+    dir
+}
+
+fn assert_candidate_cli_error(
+    dir: &PathBuf,
+    args: &[&str],
+    code: &str,
+    message: &str,
+    input: &str,
+    hint: &str,
+) {
+    let (status, stdout, stderr) = forge(dir, args);
+    assert_eq!(status, 1);
+    assert_eq!(stdout, "");
+    assert_eq!(stderr, format!("git-forge: {message}"));
+    let mut json_args = args.to_vec();
+    json_args.push("--json");
+    let (status, stdout, stderr) = forge(dir, &json_args);
+    assert_eq!(status, 1);
+    assert_eq!(stderr, format!("git-forge: {message}"));
+    let actual: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        actual,
+        serde_json::json!({"error": {
+            "code": code, "message": message, "input": input,
+            "hint": hint, "retryable": false
+        }})
+    );
+}
+
+#[test]
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+fn candidate_error_strategy_cause_matrix() {
+    let mut failures = Vec::new();
+    for strategy in ["ff", "merge", "squash", "rebase"] {
+        for cause in [
+            "stale-base",
+            "unrelated-base",
+            "stale-generation",
+            "strategy-mismatch",
+            "unbound-review",
+            "unbound-ci",
+            "missing-candidate",
+        ] {
+            let label = format!("{strategy}/{cause}");
+            let dir = candidate_error_fixture(&format!("candidate-matrix-{strategy}-{cause}"));
+            // Catch each case so its repository is removed even on RED, and report
+            // every strategy/cause rather than stopping at the first ff refusal.
+            let outcome = std::panic::catch_unwind(|| {
+                let snapshot_base = ref_oid(&dir, "refs/heads/main").unwrap();
+                let prepare_strategy = if cause == "strategy-mismatch" {
+                    if strategy == "merge" {
+                        "squash"
+                    } else {
+                        "merge"
+                    }
+                } else {
+                    strategy
+                };
+                // Mismatch can use a divergent candidate even when requesting ff.
+                // Binding cases do too, except ff: a valid same-strategy ff
+                // candidate necessarily has a fast-forwardable source snapshot.
+                if cause == "strategy-mismatch"
+                    || (strategy != "ff" && matches!(cause, "unbound-review" | "unbound-ci"))
+                {
+                    assert_eq!(
+                        git(&dir, &["commit", "--allow-empty", "-qm", "Diverge base"]).0,
+                        0,
+                        "{label}"
+                    );
+                }
+                let prepared_base = ref_oid(&dir, "refs/heads/main").unwrap();
+                if matches!(cause, "unbound-review" | "unbound-ci" | "missing-candidate") {
+                    assert_eq!(
+                        forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
+                        0,
+                        "{label}"
+                    );
+                    assert_eq!(forge(&dir, &["forge", "ci", "run", "1"]).0, 0, "{label}");
+                }
+                if cause != "missing-candidate" {
+                    let (status, _, stderr) = forge(
+                        &dir,
+                        &[
+                            "forge",
+                            "pr",
+                            "prepare",
+                            "1",
+                            "--strategy",
+                            prepare_strategy,
+                        ],
+                    );
+                    assert_eq!(status, 0, "{label}: prepare: {stderr}");
+                }
+                if cause == "stale-generation" {
+                    assert_eq!(git(&dir, &["checkout", "-q", "feature"]).0, 0, "{label}");
+                    assert_eq!(
+                        git(&dir, &["commit", "--allow-empty", "-qm", "New source"]).0,
+                        0,
+                        "{label}"
+                    );
+                    assert_eq!(git(&dir, &["checkout", "-q", "main"]).0, 0, "{label}");
+                    // pr update requires the live base to remain at the snapshot
+                    // tip; fresh gates below bind generation 1 without re-prepare.
+                    let (status, _, stderr) = forge(&dir, &["forge", "pr", "update", "1"]);
+                    assert_eq!(status, 0, "{label}: update: {stderr}");
+                }
+                if !matches!(cause, "unbound-review" | "missing-candidate") {
+                    assert_eq!(
+                        forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
+                        0,
+                        "{label}"
+                    );
+                }
+                if !matches!(cause, "unbound-ci" | "missing-candidate") {
+                    assert_eq!(forge(&dir, &["forge", "ci", "run", "1"]).0, 0, "{label}");
+                }
+                if matches!(cause, "stale-base" | "missing-candidate") {
+                    assert_eq!(
+                        git(&dir, &["commit", "--allow-empty", "-qm", "Move live base"]).0,
+                        0,
+                        "{label}"
+                    );
+                } else if cause == "unrelated-base" {
+                    // Preserve immutable snapshot refs but give the live base no
+                    // common ancestor: candidate validation must precede even
+                    // require_single_merge_base, not merely the ff precondition.
+                    assert_eq!(
+                        git(&dir, &["checkout", "--orphan", "unrelated-base"]).0,
+                        0,
+                        "{label}"
+                    );
+                    assert_eq!(
+                        git(&dir, &["commit", "--allow-empty", "-qm", "Unrelated root"]).0,
+                        0,
+                        "{label}"
+                    );
+                    assert_eq!(git(&dir, &["branch", "-f", "main", "HEAD"]).0, 0, "{label}");
+                    assert_eq!(git(&dir, &["checkout", "-q", "main"]).0, 0, "{label}");
+                }
+                let current_base = ref_oid(&dir, "refs/heads/main").unwrap();
+                let result = ref_oid(&dir, "refs/forge/prs/1/result");
+                let message = match cause {
+                    "stale-base" | "unrelated-base" => format!(
+                        "PR #1 prepared candidate is stale (built against base tip {prepared_base}, current base tip of 'main' is {current_base}); re-run `git forge pr prepare 1 --strategy {strategy}`, then `git forge ci run 1` and `git forge pr review 1 --approve`, then merge"
+                    ),
+                    "stale-generation" => format!(
+                        "PR #1 has a stale prepared candidate (prepared on generation 0, current snapshot generation 1); re-run `git forge pr prepare 1 --strategy {strategy}`, then `git forge ci run 1` and `git forge pr review 1 --approve`, then merge"
+                    ),
+                    "strategy-mismatch" => format!(
+                        "PR #1 prepared candidate is for strategy '{prepare_strategy}' but the merge requested '{strategy}'; re-run `git forge pr prepare 1 --strategy {strategy}`, then `git forge ci run 1` and `git forge pr review 1 --approve`, then merge"
+                    ),
+                    "unbound-review" => format!(
+                        "PR #1 approve is not bound to the prepared candidate (generation 0, base {prepared_base}, result {}); re-approve after re-running the candidate CI: `git forge pr review 1 --approve`, then merge",
+                        result.as_deref().unwrap()
+                    ),
+                    "unbound-ci" => format!(
+                        "PR #1 is not mergeable: latest CI Check is valid but not bound to the prepared candidate (generation 0, base {prepared_base}, result {}); run `git forge ci run 1` against the candidate, then merge",
+                        result.as_deref().unwrap()
+                    ),
+                    "missing-candidate" => format!(
+                        "PR #1 base branch 'main' has moved since the PR snapshot ({current_base} != snapshot {snapshot_base}); prepare the merge result first: run `git forge pr prepare 1 --strategy {strategy}`, then `git forge ci run 1` and `git forge pr review 1 --approve`, then merge"
+                    ),
+                    _ => unreachable!(),
+                };
+                let protected_refs = [
+                    "refs/heads/main",
+                    "refs/forge/prs/1/head",
+                    "refs/forge/prs/1/result",
+                    "refs/forge/prs/1/base",
+                ];
+                let before = protected_refs.map(|reference| ref_oid(&dir, reference));
+                // The shared helper independently asserts human stderr, exit 1,
+                // and the entire JSON error object on two real CLI invocations.
+                // Check atomicity even when the error-contract assertion fails.
+                let rejection = std::panic::catch_unwind(|| {
+                    assert_candidate_cli_error(
+                        &dir,
+                        &["forge", "pr", "merge", "1", &format!("--{strategy}")],
+                        "E_GATE",
+                        &message,
+                        "1",
+                        "Inspect PR review and CI state and satisfy the reported merge gate.",
+                    );
+                });
+                for (reference, expected) in protected_refs.iter().zip(before) {
+                    assert_eq!(ref_oid(&dir, reference), expected, "{label}: {reference}");
+                }
+                if let Err(error) = rejection {
+                    std::panic::resume_unwind(error);
+                }
+            });
+            std::fs::remove_dir_all(&dir).unwrap();
+            if let Err(error) = outcome {
+                let detail = error
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| error.downcast_ref::<&str>().copied())
+                    .unwrap_or("non-string panic");
+                failures.push(format!("{label}: {detail}"));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "candidate matrix failures:\n{}",
+        failures.join("\n")
+    );
+}
+
+#[test]
+fn candidate_error_gate_unbound_approval_is_typed() {
+    let dir = candidate_error_fixture("candidate-gate-json");
+    assert_eq!(
+        forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
+        0
+    );
+    assert_eq!(forge(&dir, &["forge", "ci", "run", "1"]).0, 0);
+    let base = ref_oid(&dir, "refs/heads/main").unwrap();
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "prepare", "1", "--strategy", "merge"]
+        )
+        .0,
+        0
+    );
+    let result = ref_oid(&dir, "refs/forge/prs/1/result").unwrap();
+    let head = ref_oid(&dir, "refs/forge/prs/1/head");
+    let message = format!(
+        "PR #1 approve is not bound to the prepared candidate (generation 0, base {base}, result {result}); re-approve after re-running the candidate CI: `git forge pr review 1 --approve`, then merge"
+    );
+    assert_candidate_cli_error(
+        &dir,
+        &["forge", "pr", "merge", "1"],
+        "E_GATE",
+        &message,
+        "1",
+        "Inspect PR review and CI state and satisfy the reported merge gate.",
+    );
+    assert_eq!(ref_oid(&dir, "refs/forge/prs/1/head"), head);
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").as_deref(),
+        Some(base.as_str())
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn candidate_error_stale_base_is_typed() {
+    let dir = candidate_error_fixture("candidate-stale-json");
+    let base = ref_oid(&dir, "refs/heads/main").unwrap();
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "prepare", "1", "--strategy", "merge"]
+        )
+        .0,
+        0
+    );
+    assert_eq!(
+        forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
+        0
+    );
+    assert_eq!(forge(&dir, &["forge", "ci", "run", "1"]).0, 0);
+    std::fs::write(dir.join("base.txt"), "moved base\n").unwrap();
+    assert_eq!(git(&dir, &["add", "base.txt"]).0, 0);
+    assert_eq!(git(&dir, &["commit", "-q", "-m", "Move base"]).0, 0);
+    let current = ref_oid(&dir, "refs/heads/main").unwrap();
+    let head = ref_oid(&dir, "refs/forge/prs/1/head");
+    let message = format!(
+        "PR #1 prepared candidate is stale (built against base tip {base}, current base tip of 'main' is {current}); re-run `git forge pr prepare 1 --strategy merge`, then `git forge ci run 1` and `git forge pr review 1 --approve`, then merge"
+    );
+    assert_candidate_cli_error(
+        &dir,
+        &["forge", "pr", "merge", "1"],
+        "E_GATE",
+        &message,
+        "1",
+        "Inspect PR review and CI state and satisfy the reported merge gate.",
+    );
+    assert_eq!(ref_oid(&dir, "refs/forge/prs/1/head"), head);
+    assert_eq!(
+        ref_oid(&dir, "refs/heads/main").as_deref(),
+        Some(current.as_str())
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn candidate_error_stale_generation_is_typed() {
+    let dir = candidate_error_fixture("stale-generation-json");
+    assert_eq!(
+        forge(
+            &dir,
+            &["forge", "pr", "prepare", "1", "--strategy", "merge"]
+        )
+        .0,
+        0
+    );
+    assert_eq!(git(&dir, &["checkout", "-q", "feature"]).0, 0);
+    assert_eq!(
+        git(&dir, &["commit", "--allow-empty", "-qm", "New source"]).0,
+        0
+    );
+    assert_eq!(git(&dir, &["checkout", "-q", "main"]).0, 0);
+    assert_eq!(forge(&dir, &["forge", "pr", "update", "1"]).0, 0);
+    assert_eq!(
+        forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
+        0
+    );
+    assert_eq!(forge(&dir, &["forge", "ci", "run", "1"]).0, 0);
+    let base = ref_oid(&dir, "refs/heads/main");
+    let head = ref_oid(&dir, "refs/forge/prs/1/head");
+    assert_candidate_cli_error(&dir, &["forge", "pr", "merge", "1"], "E_GATE",
+        "PR #1 has a stale prepared candidate (prepared on generation 0, current snapshot generation 1); re-run `git forge pr prepare 1 --strategy merge`, then `git forge ci run 1` and `git forge pr review 1 --approve`, then merge", "1",
+        "Inspect PR review and CI state and satisfy the reported merge gate.");
+    assert_eq!(ref_oid(&dir, "refs/forge/prs/1/head"), head);
+    assert_eq!(ref_oid(&dir, "refs/heads/main"), base);
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn candidate_error_missing_candidate_is_typed() {
+    let dir = candidate_error_fixture("moved-no-candidate-json");
+    let base = ref_oid(&dir, "refs/heads/main").unwrap();
+    assert_eq!(
+        forge(&dir, &["forge", "pr", "review", "1", "--approve"]).0,
+        0
+    );
+    assert_eq!(forge(&dir, &["forge", "ci", "run", "1"]).0, 0);
+    assert_eq!(
+        git(&dir, &["commit", "--allow-empty", "-qm", "New base"]).0,
+        0
+    );
+    let current = ref_oid(&dir, "refs/heads/main").unwrap();
+    let head = ref_oid(&dir, "refs/forge/prs/1/head");
+    let message = format!("PR #1 base branch 'main' has moved since the PR snapshot ({current} != snapshot {base}); prepare the merge result first: run `git forge pr prepare 1 --strategy merge`, then `git forge ci run 1` and `git forge pr review 1 --approve`, then merge");
+    assert_candidate_cli_error(
+        &dir,
+        &["forge", "pr", "merge", "1"],
+        "E_GATE",
+        &message,
+        "1",
+        "Inspect PR review and CI state and satisfy the reported merge gate.",
+    );
+    assert_eq!(ref_oid(&dir, "refs/forge/prs/1/head"), head);
+    assert_eq!(ref_oid(&dir, "refs/heads/main"), Some(current));
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn candidate_error_prepare_conflict_is_not_operational_failure() {
+    for strategy in ["merge", "squash"] {
+        let dir = candidate_error_fixture(&format!("prepare-conflict-{strategy}"));
+        std::fs::write(dir.join("feature.txt"), "base addition\n").unwrap();
+        assert_eq!(git(&dir, &["add", "feature.txt"]).0, 0);
+        assert_eq!(git(&dir, &["commit", "-q", "-m", "Conflicting base"]).0, 0);
+        let head = ref_oid(&dir, "refs/forge/prs/1/head");
+        assert_candidate_cli_error(
+            &dir,
+            &["forge", "pr", "prepare", "1", "--strategy", strategy],
+            "E_PREPARE_CONFLICT",
+            &format!("git {strategy} failed: ; worktree cleaned up, no ref changes made"),
+            "1",
+            "Inspect the repository and the reported failure before retrying.",
+        );
+        assert_eq!(ref_oid(&dir, "refs/forge/prs/1/head"), head);
+        assert_eq!(ref_oid(&dir, "refs/forge/prs/1/result"), None);
+        assert_eq!(
+            git(&dir, &["worktree", "list", "--porcelain"])
+                .1
+                .matches("worktree ")
+                .count(),
+            1
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+}
+
+#[test]
+fn candidate_error_prepare_hook_failure_remains_internal() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = candidate_error_fixture("prepare-hook-json");
+    let hook = dir.join(".git/hooks/pre-commit");
+    std::fs::write(
+        &hook,
+        "#!/bin/sh\necho 'conflict wording from hook' >&2\nexit 1\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let head = ref_oid(&dir, "refs/forge/prs/1/head");
+    assert_candidate_cli_error(
+        &dir,
+        &["forge", "pr", "prepare", "1", "--strategy", "squash"],
+        "E_INTERNAL",
+        "git squash failed: conflict wording from hook; worktree cleaned up, no ref changes made",
+        "",
+        "Inspect the repository and the reported failure before retrying.",
+    );
+    assert_eq!(ref_oid(&dir, "refs/forge/prs/1/head"), head);
+    assert_eq!(ref_oid(&dir, "refs/forge/prs/1/result"), None);
+    assert_eq!(
+        git(&dir, &["worktree", "list", "--porcelain"])
+            .1
+            .matches("worktree ")
+            .count(),
+        1
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn candidate_error_squash_commit_hook_unmerged_index_is_conflict() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = candidate_error_fixture("squash-hook-unmerged-index");
+    let blob = git(&dir, &["rev-parse", "feature:feature.txt"]).1;
+    let marker = dir.join("hook-marker");
+    let hook = dir.join(".git/hooks/pre-commit");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\nprintf 'hook ran\\n' > '{}'\nprintf '0 0000000000000000000000000000000000000000\\tfeature.txt\\n100644 {blob} 1\\tfeature.txt\\n100644 {blob} 2\\tfeature.txt\\n100644 {blob} 3\\tfeature.txt\\n' | git update-index --index-info || exit 99\nprintf 'hook failed\\n' >&2\nexit 1\n",
+            marker.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let base = ref_oid(&dir, "refs/heads/main");
+    let source = ref_oid(&dir, "refs/heads/feature");
+    let head = ref_oid(&dir, "refs/forge/prs/1/head");
+    assert_candidate_cli_error(
+        &dir,
+        &["forge", "pr", "prepare", "1", "--strategy", "squash"],
+        "E_PREPARE_CONFLICT",
+        "git squash failed: hook failed; worktree cleaned up, no ref changes made",
+        "1",
+        "Inspect the repository and the reported failure before retrying.",
+    );
+    assert!(marker.exists(), "squash commit hook must execute");
+    assert_eq!(ref_oid(&dir, "refs/heads/main"), base);
+    assert_eq!(ref_oid(&dir, "refs/heads/feature"), source);
+    assert_eq!(ref_oid(&dir, "refs/forge/prs/1/head"), head);
+    assert_eq!(ref_oid(&dir, "refs/forge/prs/1/result"), None);
+    assert_eq!(
+        git(&dir, &["worktree", "list", "--porcelain"])
+            .1
+            .matches("worktree ")
+            .count(),
+        1
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn candidate_error_prepare_rebase_conflict_is_typed() {
+    let dir = candidate_error_fixture("prepare-rebase-conflict-json");
+    std::fs::write(dir.join("feature.txt"), "base addition\n").unwrap();
+    assert_eq!(git(&dir, &["add", "feature.txt"]).0, 0);
+    assert_eq!(git(&dir, &["commit", "-q", "-m", "Conflicting base"]).0, 0);
+    let source = ref_oid(&dir, "refs/heads/feature").unwrap();
+    let base = ref_oid(&dir, "refs/heads/main").unwrap();
+    let merge_base = git(&dir, &["merge-base", &source, &base]).1;
+    // Git's rebase diagnostics vary by version; obtain the expected stderr
+    // from the same public Git operation in an independent disposable worktree.
+    let oracle = tmpdir("rebase-stderr-oracle");
+    assert_eq!(
+        git(
+            &dir,
+            &[
+                "worktree",
+                "add",
+                "--detach",
+                oracle.to_str().unwrap(),
+                &source
+            ]
+        )
+        .0,
+        0
+    );
+    let (status, _, cause) = git(&oracle, &["rebase", "--onto", &base, &merge_base]);
+    assert_ne!(status, 0);
+    assert_eq!(git(&oracle, &["rebase", "--abort"]).0, 0);
+    assert_eq!(
+        git(
+            &dir,
+            &["worktree", "remove", "--force", oracle.to_str().unwrap()]
+        )
+        .0,
+        0
+    );
+    let head = ref_oid(&dir, "refs/forge/prs/1/head");
+    assert_candidate_cli_error(
+        &dir,
+        &["forge", "pr", "prepare", "1", "--strategy", "rebase"],
+        "E_PREPARE_CONFLICT",
+        &format!("git rebase failed: {cause}; worktree cleaned up, no ref changes made"),
+        "1",
+        "Inspect the repository and the reported failure before retrying.",
+    );
+    assert_eq!(ref_oid(&dir, "refs/forge/prs/1/head"), head);
+    assert_eq!(ref_oid(&dir, "refs/forge/prs/1/result"), None);
+    assert_eq!(
+        git(&dir, &["worktree", "list", "--porcelain"])
+            .1
+            .matches("worktree ")
+            .count(),
+        1
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}
+
+#[test]
+fn candidate_error_prepare_json_reaches_strategy_usage() {
+    let dir = candidate_error_fixture("prepare-parser-json");
+    assert_candidate_cli_error(
+        &dir,
+        &["forge", "pr", "prepare", "1", "--strategy", "invalid"],
+        "E_USAGE",
+        "unknown strategy 'invalid'; use --strategy merge|squash|rebase|ff",
+        "invalid",
+        "Run the command with --help and correct its arguments.",
+    );
+    std::fs::remove_dir_all(dir).unwrap();
+}

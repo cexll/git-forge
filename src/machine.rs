@@ -11,6 +11,8 @@
 //! Fixtures: `tests/fixtures/json/<command>.json` are byte-compared by the
 //! t7 tests; a schema change must regenerate them in the same commit.
 
+use crate::cli_error::CliError;
+
 use crate::event::fold;
 use crate::store::EventStore;
 
@@ -52,14 +54,17 @@ pub(crate) fn json_requested(args: &[String]) -> (bool, Vec<String>) {
 /// their own arity/existence. Shared by the pure-positional surfaces
 /// (`issue list/show/close/reopen`, `pr list/show/diff`) and both comment
 /// parsers (flags only) so an unknown flag can never be silently ignored.
-pub(crate) fn reject_flags(args: &[String], usage: &str) -> Result<(), String> {
+pub(crate) fn reject_flags(args: &[String], usage: &str) -> Result<(), CliError> {
     for a in args {
         if a.starts_with('-') {
-            return Err(if a == "--json=x" {
-                format!("unknown option '{a}' (the machine flag is bare `--json`); {usage}")
-            } else {
-                format!("unknown option '{a}'; {usage}")
-            });
+            return Err(CliError::usage(
+                if a == "--json=x" {
+                    format!("unknown option '{a}' (the machine flag is bare `--json`); {usage}")
+                } else {
+                    format!("unknown option '{a}'; {usage}")
+                },
+                a,
+            ));
         }
     }
     Ok(())
@@ -68,12 +73,12 @@ pub(crate) fn reject_flags(args: &[String], usage: &str) -> Result<(), String> {
 /// [`reject_flags`] plus an unexpected-positional refusal for grammars with
 /// NO positionals at all (`issue list`, `pr list`): anything left over after
 /// the flag check is a `too many` usage error.
-pub(crate) fn reject_leftover_flags(args: &[String], usage: &str) -> Result<(), String> {
+pub(crate) fn reject_leftover_flags(args: &[String], usage: &str) -> Result<(), CliError> {
     reject_flags(args, usage)?;
     if !args.is_empty() {
-        return Err(format!(
-            "{usage} (got {} unexpected argument(s))",
-            args.len()
+        return Err(CliError::usage(
+            format!("{usage} (got {} unexpected argument(s))", args.len()),
+            "",
         ));
     }
     Ok(())
@@ -279,13 +284,16 @@ pub fn version_string() -> String {
 /// `git forge version` argument handling: no options, no positionals (unknown
 /// flags keep exit-1, VAL-202). `pub` because the bin crate's `main.rs`
 /// dispatches `version` directly here.
-pub fn cmd_version(args: &[String]) -> Result<String, String> {
+pub fn cmd_version(args: &[String]) -> Result<String, CliError> {
     if let Some(a) = args.first() {
-        return Err(if a.starts_with('-') {
-            format!("unknown option '{a}'")
-        } else {
-            format!("unexpected argument '{a}'")
-        });
+        return Err(CliError::usage(
+            if a.starts_with('-') {
+                format!("unknown option '{a}'")
+            } else {
+                format!("unexpected argument '{a}'")
+            },
+            a,
+        ));
     }
     Ok(version_string())
 }
@@ -298,14 +306,14 @@ fn fold_all<T>(
     store: &EventStore,
     head_ref: fn(u64) -> String,
     select: fn(&crate::event::FoldState) -> T,
-) -> Result<Vec<T>, String> {
+) -> Result<Vec<T>, CliError> {
     let mut states = Vec::new();
     for n in 1..store.counter_next().ok().unwrap_or(1) {
         let r = head_ref(n);
         if !crate::cli::store_has_ref(store, &r) {
             continue;
         }
-        let chain = store.read_chain(&r).map_err(|e| e.to_string())?;
+        let chain = store.read_chain(&r).map_err(CliError::from)?;
         if chain.is_empty() {
             continue;
         }
@@ -315,12 +323,14 @@ fn fold_all<T>(
 }
 
 /// The prose/JSON `issue list` scan, in id order.
-pub(crate) fn fold_all_issues(store: &EventStore) -> Result<Vec<crate::event::IssueState>, String> {
+pub(crate) fn fold_all_issues(
+    store: &EventStore,
+) -> Result<Vec<crate::event::IssueState>, CliError> {
     fold_all(store, crate::store::issue_ref, |s| s.issue.clone())
 }
 
 /// The prose/JSON `pr list` scan, in id order.
-pub(crate) fn fold_all_prs(store: &EventStore) -> Result<Vec<crate::event::PrState>, String> {
+pub(crate) fn fold_all_prs(store: &EventStore) -> Result<Vec<crate::event::PrState>, CliError> {
     fold_all(store, crate::store::pr_head_ref, |s| s.pr.clone())
 }
 

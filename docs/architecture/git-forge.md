@@ -25,13 +25,15 @@ Must-not-haves (L1): web UI, single-file export, GitHub bridge, accounts/permiss
 | `fold` (state derivation) | `fold(events) -> FoldState`, `IssueState`/`PrState`/`SeqState`, `first_allocation` | Deterministic ordering, issue/PR state derivation, effective review decision | Pure, no I/O |
 | `store` (git refs) | `EventStore`: `append_event`, `read_chain`, `create_pr`, `allocate_id` (versioned counter CAS) | Ref naming under `refs/forge/*`, commit creation, packed-ref-safe reads, counter commit chain | Deep: hides all git plumbing; callers never touch refs directly |
 | `identity` (actor) | `resolve_identity`, `bind_identity`, `open_mutation_store` | The invoking repo's `user.email` resolved once per write via `crate::git::config_get_identity` (a safe `git config --null --get` child — never libgit2, VAL-115 stage A). Stage A (config-open fault) propagates a clean CLI error; stage B (absent/empty/non-UTF-8 email) falls back to `forge@localhost`. Signature + actor are bound before any write. | Shallow: never a libgit2 `repo.config()` read at write time (the VAL-115 SIGSEGV-on-corrupt-config path) |
-| `git` (adapter) | `worktree_add`/`worktree_remove`/`worktree_list`, `base_checked_out_elsewhere`, `execute_strategy` (merge/squash/rebase), `cleanup_failed_worktree`, `require_single_merge_base` | `git` binary shell-outs for merge execution: strategy commands, abort/reset/clean failure cleanup, merge-base --all, worktree plumbing | Deep: protocol correctness delegated to git itself; the merge-gate predicate stays in `merge_state` |
+| `git` (adapter) | `worktree_add`/`worktree_remove`/`worktree_list`, `base_checked_out_elsewhere`, `execute_strategy`, `cleanup_failed_worktree`, `require_single_merge_base` | `git` binary shell-outs for merge execution and worktree plumbing. `git/strategy.rs` owns merge/squash/rebase execution and conflict classification before cleanup. | Deep: protocol correctness delegated to git itself; the merge-gate predicate stays in `merge_state` |
 | `ci` (runner) | `ci_timeout`, `snapshot_ci_plan`, `run_ci_plan` | Bounded CI plan execution in a disposable worktree: immutable-snapshot plan resolution/materialization, process-group kill+reap under a deadline, env tightening | Security-sensitive: isolates the plan subprocess (`/bin/bash` / `just`) and its environment |
-| `merge_state` (merge gate + finalize) | `read_merge_gate`/`validate_merge_gate_at`, `finalize_pr_merge`, `run_finalize`, `create_pending_result_ref`/`delete_pending_result_ref` | Merge-gate predicate (effective approve + latest CI Check) bound to the exact validated head OID (F-007/F-008), one-transaction merge completion with CAS retry (F-009/F-010), pending-result ref lifecycle | Deep: the gate predicate + merge atomicity live here (not `cli`); `cli` dispatches to it 
+| `merge_state` (merge gate + finalize) | `read_merge_gate`/`validate_merge_gate_at`, `finalize_pr_merge`, `run_finalize`, `create_pending_result_ref`/`delete_pending_result_ref` | Merge-gate predicate bound to the exact validated head OID, one-transaction completion, and pending-result lifecycle. `merge_state/finalize.rs` owns CAS retries and adopted-input revalidation. | Deep: gate and merge atomicity live here, not `cli` |
 | `pr_merge` (merge commands) | `cmd_pr_merge`, `pr_merge_help` | Merge orchestration (live-base resolution + moved-base candidate routing, checked-out-base guard, temp-worktree lifecycle, pending-result cleanup); gate + finalize delegated to `merge_state` | Deep: the orchestration boundary; `cli` dispatches to it |
 | `issue` (commands) | `run_issue` dispatch; issue `cmd_*` handlers | Issue command parsing + human-readable output; apply and new graph publication delegated to `issue_apply`; graph JSON derived from folded states | Shallow: command surface only |
 | `issue_plan` (plans) | strict plan parsing, whole-graph validation, desired-state diff | Minimal frontmatter grammar; repository-wide key mapping and reference resolution; parent/blocking cycle checks | No YAML dependency; shared graph rules for apply and new |
 | `issue_apply` (publication) | `cmd_apply`, `new_issue` | Complete Issue graph snapshot, allocation, event construction and one atomic snapshot/CAS publication via store | Owns orchestration, not a second storage implementation |
+| `cli_error` (failures) | `CliError` | Stable codes, preserved human messages, optional structured data and JSON error rendering; typed storage conversion | CLI-layer boundary; core and store do not import it |
+| `pr_review` (review command) | `cmd_pr_review` | Review argument handling and generation/candidate-bound event publication | CLI-layer owner, extracted to retain the file-size gate |
 | `cli` (entry) | `run_pr`, `run_ci` dispatch; `cmd_pr_diff` (arguments + result handling) | Command parsing; the merge-gate predicate + finalize live in `merge_state`, orchestration in `pr_merge`; `cmd_pr_diff` delegates the subprocess to `git::git_in_ci` | Shallow by design: dispatch only, no direct subprocess spawning (diff goes through the sanitized git adapter) |
 | `sync` (L2) | — | Explicit forge refspec push, additive fetch refspec, per-entity DAG merge convergence | Not built in L1; no `src/sync.rs` yet |
 | `hooks` (L2) | — | Pre-receive/post-receive hooks, refspec validation | Not built in L1; no `src/hooks.rs` yet |
@@ -119,6 +121,71 @@ flowchart LR
 ## Wire Contract
 
 This contract is normative for tickets and tests. Versions: schema version field is `v: 1` in every event; do not parse unversioned events.
+
+### CLI Failure Contract (schema 1)
+
+Every command failure exits 1. Without `--json`, stdout is empty and stderr
+prints `git-forge: <message>`. With a bare `--json` token, stdout contains one
+JSON error object and stderr keeps the same line. This also applies when a
+command rejects `--json` because it has no machine success result.
+
+```json
+{"error":{"code":"E_USAGE","message":"usage: git forge pr show <n> [--json]","input":"","hint":"Run the command with --help and correct its arguments.","retryable":false}}
+```
+
+`code`, `message`, `input`, and `hint` are strings. `retryable` is a boolean.
+`input` identifies the offending argument when known; it is empty for a
+missing argument or a failure without one offending value. `hint` names the
+next action. Consumers must use `code`, not parse the message. Command-specific
+errors may add `data` without changing these fields. Existing success JSON
+keeps its current schema-1 shapes; it has no common envelope.
+
+| Code | Meaning |
+|---|---|
+| `E_USAGE` | Missing or malformed command arguments, or unknown options |
+| `E_NOT_FOUND` | Referenced Issue, PR, or branch does not exist |
+| `E_CONFLICT` | Compare-and-swap conflict, exhausted CAS retries, or stale snapshot; read current state before retrying |
+| `E_BASE_MOVED` | Base movement prevents the requested operation |
+| `E_PREPARE_CONFLICT` | Candidate preparation encounters a merge conflict |
+| `E_GATE` | Merge gate refuses the operation |
+| `E_CI_FAILED` | CI execution or cleanup fails |
+| `E_INVALID` | Domain validation rejects input or repository state |
+| `E_INTERNAL` | Unclassified storage, process, or internal failure |
+
+Known limitation: preparation classifies failures from the unmerged index before
+cleanup. A failing hook that leaves unmerged index entries returns
+`E_PREPARE_CONFLICT`; the CLI does not distinguish hook-created entries from
+strategy conflicts. Hook and process failures without unmerged entries remain
+`E_INTERNAL`.
+
+The CLI preserves typed CAS failures as `E_CONFLICT` with `retryable: true`.
+Other failures are not automatically retryable. Detailed base-movement,
+prepare-conflict, and CI-diagnostic payloads are separate command contracts.
+
+Canonical local branch names that are absent return `E_NOT_FOUND` with the
+supplied branch argument as `input`. Malformed or noncanonical branch inputs
+remain `E_INVALID`. An invalid configured role returns `E_INVALID` and names
+the rejected role in `input`. Version usage failures retain the offending
+flag or positional in `input`.
+
+Merge and prepare accept the bare `--json` selector for failures without
+changing their human success output. Prepared-candidate currentness, strategy
+binding, and gate validation precede merge-base and strategy preconditions for
+every merge strategy. Staleness, mismatched candidate gate inputs, and missing
+required candidates return `E_GATE` with the existing candidate remedy.
+Finalization preserves the original human context and cleanup suffix while
+retaining retryable `E_CONFLICT` for recognized CAS rejection and exhaustion.
+Each finalization ref expects a nonzero existing OID; movement or deletion
+rejects the entire transaction. Expected-absent creation occurs only in the
+separate pending-result publication, not finalization. Unknown Git diagnostics
+remain `E_INTERNAL`; missing-reference classification requires an exact named
+update operation with a nonzero expected OID.
+Preparation returns `E_PREPARE_CONFLICT` when a failed strategy leaves an
+unmerged index, subject to the hook limitation documented beside the code list.
+
+Missing required positionals return usage errors, never panics. In particular,
+`pr show` and `pr diff` use `usage: git forge pr <verb> <n> [--json]`.
+
 
 ### Ref Layout
 

@@ -2,6 +2,8 @@
 //! surfaces. Issue commands live in `crate::issue` (t1b); the merge gate and
 //! orchestration live in `crate::pr_merge`; CI plan execution in `crate::ci`.
 
+use crate::cli_error::CliError;
+
 use std::collections::HashMap;
 
 use crate::event::{Event, EventKind, JsonValue};
@@ -10,15 +12,18 @@ use crate::machine;
 use crate::store::EventStore;
 
 /// Parse `"<n>"` into a positive u64, else a clean usage error (no panic).
-pub(crate) fn parse_entity_id(s: &str) -> Result<u64, String> {
+pub(crate) fn parse_entity_id(s: &str) -> Result<u64, CliError> {
     if s.is_empty() {
-        return Err("empty entity id".to_string());
+        return Err(CliError::usage("empty entity id".to_string(), ""));
     }
-    let n: u64 = s
-        .parse()
-        .map_err(|_| format!("invalid entity id '{s}' (expected a positive integer)"))?;
+    let n: u64 = s.parse().map_err(|_| {
+        CliError::usage(
+            format!("invalid entity id '{s}' (expected a positive integer)"),
+            s,
+        )
+    })?;
     if n == 0 {
-        return Err("entity id must be positive".to_string());
+        return Err(CliError::usage("entity id must be positive", s));
     }
     Ok(n)
 }
@@ -79,8 +84,8 @@ pub(crate) fn store_has_ref(store: &EventStore, r: &str) -> bool {
 }
 
 /// Open the workspace store for a READ command (read-only command surface).
-pub(crate) fn open_store() -> Result<EventStore, String> {
-    EventStore::open(".").map_err(|e| format!("{e}"))
+pub(crate) fn open_store() -> Result<EventStore, CliError> {
+    EventStore::open(".").map_err(CliError::from)
 }
 
 // ─────────────────────────── PR commands ───────────────────────────
@@ -91,41 +96,39 @@ pub(crate) fn open_store() -> Result<EventStore, String> {
 /// tags, remote-tracking refs, OIDs, and revision expressions. The returned
 /// name is always the bare branch name, so downstream construction of
 /// `refs/heads/{name}` (merge, checked-out guard) is always correct.
-fn resolve_local_branch(store: &EventStore, arg: &str) -> Result<(String, git2::Oid), String> {
+fn resolve_local_branch(store: &EventStore, arg: &str) -> Result<(String, git2::Oid), CliError> {
     if arg.is_empty() {
-        return Err("branch name must be non-empty".into());
+        return Err(CliError::usage("branch name must be non-empty", ""));
     }
-    let (name, full) = if let Some(stripped) = arg.strip_prefix("refs/heads/") {
-        // Full form: must be a real refs/heads ref; the canonical name is the
-        // stripped remainder (may itself contain slashes, e.g. feat/foo).
-        if stripped.is_empty() {
-            return Err(format!(
-                "'{arg}' is not a canonical local branch; use a plain branch name (tags, remote-tracking refs, OIDs, and revision expressions are rejected)"
-            ));
-        }
-        (stripped.to_string(), arg.to_string())
-    } else {
-        // Bare form: resolve as refs/heads/<arg>. Slashes are legal inside
-        // branch names, so no early '/' rejection — a name that does not
-        // resolve is rejected below. `refs/tags/...`, `refs/remotes/...`,
-        // OIDs, and revision expressions all fail resolution and are rejected.
-        (arg.to_string(), format!("refs/heads/{arg}"))
+    let name = arg.strip_prefix("refs/heads/").unwrap_or(arg);
+    let full = format!("refs/heads/{name}");
+    let message = || {
+        format!("'{arg}' is not a canonical local branch; use a plain branch name (tags, remote-tracking refs, OIDs, and revision expressions are rejected)")
     };
-    let oid = store
-        .repo()
-        .find_reference(&full)
-        .ok()
-        .and_then(|r| r.target())
-        .ok_or_else(|| {
-            format!(
-                "'{arg}' is not a canonical local branch; use a plain branch name (tags, remote-tracking refs, OIDs, and revision expressions are rejected)"
-            )
-        })?;
-    Ok((name, oid))
+    if name.is_empty()
+        || (arg.starts_with("refs/") && !arg.starts_with("refs/heads/"))
+        || !git2::Reference::is_valid_name(&full)
+        || name == "HEAD"
+    {
+        return Err(CliError::invalid(message()));
+    }
+    let reference = store.repo().find_reference(&full).map_err(|error| {
+        let bare_oid =
+            arg == name && name.len() == 40 && name.bytes().all(|byte| byte.is_ascii_hexdigit());
+        if error.code() == git2::ErrorCode::NotFound && !bare_oid && !name.starts_with('-') {
+            CliError::not_found(message(), arg)
+        } else {
+            CliError::invalid(message())
+        }
+    })?;
+    let oid = reference
+        .target()
+        .ok_or_else(|| CliError::invalid(message()))?;
+    Ok((name.to_string(), oid))
 }
 
 /// `git forge pr create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]... [--closes <n>]`
-fn cmd_pr_create(args: &[String]) -> Result<String, String> {
+fn cmd_pr_create(args: &[String]) -> Result<String, CliError> {
     const USAGE: &str = "usage: git forge pr create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]... [--closes <n>]";
     if help_requested(args) {
         return Ok(USAGE.into());
@@ -147,7 +150,7 @@ fn cmd_pr_create(args: &[String]) -> Result<String, String> {
                 if title.is_none() {
                     title = Some(t.to_string());
                 } else {
-                    return Err("too many positional arguments; usage: git forge pr create --source <branch> --base <branch> <title>".into());
+                    return Err(CliError::usage("too many positional arguments; usage: git forge pr create --source <branch> --base <branch> <title>", ""));
                 }
             }
             break;
@@ -156,63 +159,67 @@ fn cmd_pr_create(args: &[String]) -> Result<String, String> {
             "--source" => {
                 i += 1;
                 if i >= args.len() {
-                    return Err("--source requires a branch name".into());
+                    return Err(CliError::usage("--source requires a branch name", ""));
                 }
                 source = Some(args[i].clone());
             }
             "--base" => {
                 i += 1;
                 if i >= args.len() {
-                    return Err("--base requires a branch name".into());
+                    return Err(CliError::usage("--base requires a branch name", ""));
                 }
                 base = Some(args[i].clone());
             }
             "--body" => {
                 i += 1;
                 if i >= args.len() {
-                    return Err("--body requires a description".into());
+                    return Err(CliError::usage("--body requires a description", ""));
                 }
                 body = Some(args[i].trim().to_string());
             }
             "--label" | "-l" => {
                 i += 1;
                 if i >= args.len() {
-                    return Err("--label requires a value".into());
+                    return Err(CliError::usage("--label requires a value", ""));
                 }
                 let v = args[i].trim().to_string();
                 if v.is_empty() {
-                    return Err("--label requires a non-empty value".into());
+                    return Err(CliError::usage("--label requires a non-empty value", ""));
                 }
                 labels.push(v);
             }
             "--closes" => {
                 i += 1;
                 if i >= args.len() {
-                    return Err("--closes requires an issue id".into());
+                    return Err(CliError::usage("--closes requires an issue id", ""));
                 }
                 let id = parse_entity_id(&args[i])?;
                 closes = Some(id);
             }
             "-h" | "--help" => return Ok(USAGE.into()),
             a if a.starts_with("--") || a.starts_with('-') => {
-                return Err(format!("unknown option '{a}'"));
+                return Err(CliError::usage(format!("unknown option '{a}'"), a));
             }
             t if title.is_none() => title = Some(t.to_string()),
-            _ => return Err("too many positional arguments; usage: git forge pr create --source <branch> --base <branch> <title>".into()),
+            _ => return Err(CliError::usage("too many positional arguments; usage: git forge pr create --source <branch> --base <branch> <title>", "")),
         }
         i += 1;
     }
-    let source = source.ok_or_else(|| {
-        String::from("usage: git forge pr create --source <branch> --base <branch> <title>")
-    })?;
-    let base = base.ok_or_else(|| {
-        String::from("usage: git forge pr create --source <branch> --base <branch> <title>")
-    })?;
-    let title = title.ok_or_else(|| {
-        String::from("usage: git forge pr create --source <branch> --base <branch> <title>")
-    })?;
+    let (source, base, title) = source
+        .zip(base)
+        .zip(title)
+        .map(|((source, base), title)| (source, base, title))
+        .ok_or_else(|| {
+            CliError::usage(
+                "usage: git forge pr create --source <branch> --base <branch> <title>",
+                "",
+            )
+        })?;
     if title.trim().is_empty() {
-        return Err("PR title is required and must be non-empty".into());
+        return Err(CliError::usage(
+            "PR title is required and must be non-empty",
+            "",
+        ));
     }
 
     let (store, actor) = open_mutation_store()?;
@@ -222,16 +229,23 @@ fn cmd_pr_create(args: &[String]) -> Result<String, String> {
     if let Some(c) = closes {
         let r = crate::store::issue_ref(c);
         if !store_has_ref(store.store(), &r) {
-            return Err(format!("issue #{c} does not exist"));
+            return Err(CliError::not_found(
+                format!("issue #{c} does not exist"),
+                c.to_string(),
+            ));
         }
     }
     let (source, source_oid) = resolve_local_branch(store.store(), &source)?;
     let (base, base_oid) = resolve_local_branch(store.store(), &base)?;
     if source == base {
-        return Err("source and base branch must differ (no self-PR)".into());
+        return Err(CliError::invalid(
+            "source and base branch must differ (no self-PR)",
+        ));
     }
     if source_oid == base_oid {
-        return Err("source and base branches resolve to the same commit (no self-PR)".into());
+        return Err(CliError::invalid(
+            "source and base branches resolve to the same commit (no self-PR)",
+        ));
     }
     let merge_base = crate::git::require_single_merge_base(store.repo(), base_oid, source_oid)?;
 
@@ -248,7 +262,7 @@ fn cmd_pr_create(args: &[String]) -> Result<String, String> {
             &labels,
             closes,
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(CliError::from)?;
     // The pending CI Check marker is published INSIDE `create_pr`'s single
     // atomic store transaction (F-006), so a failure leaves neither the counter
     // nor any PR refs changed — no separate append step can strand a durable PR
@@ -279,17 +293,23 @@ fn cmd_pr_create(args: &[String]) -> Result<String, String> {
 }
 
 /// `git forge pr show <n>`
-fn cmd_pr_show(store: &EventStore, args: &[String]) -> Result<String, String> {
+fn cmd_pr_show(store: &EventStore, args: &[String]) -> Result<String, CliError> {
     let (json, args) = machine::json_requested(args);
-    machine::reject_leftover_flags(&args[1..], "usage: git forge pr show <n>")?;
-    let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
+    let (id_arg, rest) = args
+        .split_first()
+        .ok_or_else(|| CliError::usage("usage: git forge pr show <n> [--json]", ""))?;
+    machine::reject_leftover_flags(rest, "usage: git forge pr show <n>")?;
+    let id = parse_entity_id(id_arg)?;
     let r = crate::store::pr_head_ref(id);
     if !store_has_ref(store, &r) {
-        return Err(format!("PR #{id} does not exist"));
+        return Err(CliError::not_found(
+            format!("PR #{id} does not exist"),
+            id_arg,
+        ));
     }
-    let chain = store.read_chain(&r).map_err(|e| e.to_string())?;
+    let chain = store.read_chain(&r).map_err(CliError::from)?;
     if chain.is_empty() {
-        return Err(format!("PR #{id} has no events"));
+        return Err(format!("PR #{id} has no events").into());
     }
     let state = crate::event::fold(&chain).pr;
     if json {
@@ -378,7 +398,7 @@ fn cmd_pr_show(store: &EventStore, args: &[String]) -> Result<String, String> {
 }
 
 /// `git forge pr list`
-fn cmd_pr_list(store: &EventStore, args: &[String]) -> Result<String, String> {
+fn cmd_pr_list(store: &EventStore, args: &[String]) -> Result<String, CliError> {
     let (json, args) = machine::json_requested(args);
     machine::reject_leftover_flags(&args, "usage: git forge pr list")?;
     let states = machine::fold_all_prs(store)?;
@@ -400,7 +420,7 @@ fn cmd_pr_list(store: &EventStore, args: &[String]) -> Result<String, String> {
     Ok(out.trim_end().to_string())
 }
 
-fn cmd_pr_comment(args: &[String]) -> Result<String, String> {
+fn cmd_pr_comment(args: &[String]) -> Result<String, CliError> {
     const USAGE: &str = "usage: git forge pr comment <n> <body>";
     // Same strict flag/token split as its issue sibling: an unknown option
     // is a clean usage error naming the flag (VAL-202), never a
@@ -408,17 +428,20 @@ fn cmd_pr_comment(args: &[String]) -> Result<String, String> {
     let (_, args) = machine::json_requested(args);
     machine::reject_flags(&args, USAGE)?;
     if args.len() < 2 {
-        return Err(USAGE.into());
+        return Err(CliError::usage(USAGE, ""));
     }
     let id = parse_entity_id(&args[0])?;
     let body = args[1..].join(" ").trim().to_string();
     if body.is_empty() {
-        return Err("comment body must be non-empty".into());
+        return Err(CliError::usage("comment body must be non-empty", ""));
     }
     let (store, actor) = open_mutation_store()?;
     let r = crate::store::pr_head_ref(id);
     if !store_has_ref(store.store(), &r) {
-        return Err(format!("PR #{id} does not exist"));
+        return Err(CliError::not_found(
+            format!("PR #{id} does not exist"),
+            id.to_string(),
+        ));
     }
     let ev = Event::new(
         EventKind::PrComment,
@@ -427,148 +450,8 @@ fn cmd_pr_comment(args: &[String]) -> Result<String, String> {
         &actor,
         body_obj(&[("body", json_str(&body))]),
     );
-    store.append_event(&r, &ev).map_err(|e| e.to_string())?;
+    store.append_event(&r, &ev).map_err(CliError::from)?;
     Ok(format!("comment added to PR #{id}"))
-}
-
-/// `git forge pr review <n> --approve|--reject [--file <f> --line <l> --commit <c>]`
-fn cmd_pr_review(args: &[String]) -> Result<String, String> {
-    const USAGE: &str =
-        "usage: git forge pr review <n> --approve|--reject [--file <f> --line <l> --commit <c>]";
-    let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
-    let mut decision = None;
-    let mut file = None;
-    let mut line = None;
-    let mut commit = None;
-    let mut i = 1;
-    let next_arg = |i: &mut usize, msg: &str| -> Result<String, String> {
-        *i += 1;
-        if *i >= args.len() {
-            return Err(msg.into());
-        }
-        Ok(args[*i].clone())
-    };
-    while i < args.len() {
-        match args[i].as_str() {
-            "--approve" => decision = Some("approve".to_string()),
-            "--reject" => decision = Some("reject".to_string()),
-            "--file" => file = Some(next_arg(&mut i, "--file requires a path")?),
-            "--line" => line = Some(next_arg(&mut i, "--line requires a number")?),
-            "--commit" => commit = Some(next_arg(&mut i, "--commit requires a hash")?),
-            "-h" | "--help" => return Ok(USAGE.into()),
-            a if a.starts_with('-') => return Err(format!("unknown option '{a}'")),
-            _ => {}
-        }
-        i += 1;
-    }
-    let decision = decision.ok_or_else(|| USAGE.to_string())?;
-    // Read-only path first: PR existence and terminality are validated WITHOUT
-    // resolving the mutable identity, so every refusal resolves nothing and
-    // writes nothing. The append below reopens the store bound to the actor.
-    let store = open_store()?;
-    let r = crate::store::pr_head_ref(id);
-    if !store_has_ref(&store, &r) {
-        return Err(format!("PR #{id} does not exist"));
-    }
-    let chain = store.read_chain(&r).map_err(|e| e.to_string())?;
-    let state = crate::event::fold(&chain).pr;
-    // Abandoned PRs are terminal (pr.abandoned): refuse BEFORE any write and
-    // name the abandon reason, so an abandoned PR never gains a review event.
-    if let Some(reason) = &state.abandoned {
-        return Err(format!("PR #{id} is abandoned: {reason}"));
-    }
-    let (store, actor) = open_mutation_store()?;
-    // FR-005: inline review comments anchor to a commit hash. --file/--line
-    // are only meaningful as inline comments, so they require the anchor;
-    // an unanchored inline review would not reference anything immutable.
-    if (file.is_some() || line.is_some()) && commit.is_none() {
-        return Err(
-            "inline review requires --commit <hash> to anchor the comment (FR-005); \
-             add --commit or drop --file/--line"
-                .into(),
-        );
-    }
-    // The anchor must resolve to a real commit object. It is intentionally NOT
-    // constrained to the PR snapshot: spec.md explicitly permits inline
-    // comments on commits outside the PR snapshot (anchored reference). The
-    // resolved commit OID is what gets stored — never the raw input — so a
-    // mutable ref like `main` cannot smuggle a moving anchor into the event.
-    let commit = match commit {
-        Some(c) => Some(
-            store
-                .repo()
-                .revparse_single(&c)
-                .and_then(|o| o.peel_to_commit())
-                .map(|c| c.id().to_string())
-                .map_err(|_| {
-                    format!(
-                        "inline review --commit '{c}' does not resolve to a commit \
-                         (FR-005 anchor must be a real commit)"
-                    )
-                })?,
-        ),
-        None => None,
-    };
-    let mut body = HashMap::new();
-    body.insert("decision".into(), json_str(&decision));
-    if let Some(f) = file {
-        body.insert("file".into(), json_str(&f));
-    }
-    if let Some(l) = line {
-        body.insert("line".into(), json_str(&l));
-    }
-    if let Some(c) = commit {
-        // Inline comment anchored to a commit (immutable; never follows later
-        // diff changes).
-        body.insert("commit".into(), json_str(&c));
-    }
-    // Generation binding (F-006): the decision authorizes the snapshot
-    // generation CAPTURED at review time — the fold state read at command
-    // start, before the append. `append_event`'s CAS retry re-parents the
-    // SAME event body onto a moved tip, so an in-flight gen0 review whose
-    // append lands after a concurrent `pr update` still carries generation 0;
-    // the merge gate refuses it as stale instead of folding it as gen1.
-    // (The gate's decision check compares this captured generation with the
-    // PR's CURRENT generation at merge time.)
-    body.insert(
-        "generation".into(),
-        JsonValue::Number(state.generation as i64),
-    );
-    // #2 result-bound review: the decision also records the LIVE base-branch
-    // tip at review time, so the live-base merge gate can require a decision
-    // bound to the current base tip when the base has moved since the PR
-    // snapshot.
-    if let Some(bh) =
-        crate::pr_prepare::live_base_head_entry(store.repo(), state.base_ref.as_deref())
-    {
-        body.insert("base_head".into(), bh);
-    }
-    // F-002 candidate-bound review: when a prepared candidate exists at
-    // review time (fold candidate whose generation matches the current
-    // snapshot AND whose identity is corroborated by the pinned result ref),
-    // the decision binds THAT candidate (strategy/result_commit/result_tree
-    // stamped from the CAPTURED fold state, not re-read after the append).
-    // The merge gate requires decision identity == candidate identity, so a
-    // stale approve (bound to a superseded candidate) or an unbound legacy
-    // approve refuses with a re-review remedy.
-    let candidate_bind = match &state.prepared {
-        Some(p) if p.generation == state.generation => store
-            .repo()
-            .find_reference(&crate::store::pr_result_ref(id))
-            .ok()
-            .and_then(|r| r.target())
-            .filter(|pin| pin.to_string() == p.result_commit)
-            .map(|_| p.clone()),
-        _ => None,
-    };
-    if let Some(c) = &candidate_bind {
-        body.insert("strategy".into(), json_str(&c.strategy));
-        body.insert("result_commit".into(), json_str(&c.result_commit));
-        body.insert("result_tree".into(), json_str(&c.result_tree));
-    }
-    let ev = Event::new(EventKind::PrReview, "pr", id, &actor, body);
-    store.append_event(&r, &ev).map_err(|e| e.to_string())?;
-    Ok(format!("reviewed PR #{id} ({decision})"))
 }
 
 /// `git forge pr abandon <n> --reason <text>` — abandon is terminal: appends a
@@ -577,9 +460,9 @@ fn cmd_pr_review(args: &[String]) -> Result<String, String> {
 /// every refusal writes nothing. The reason is required and must survive
 /// trimming (whitespace-only is rejected before any write). No reopen: a
 /// reopened PR is a new entity.
-fn cmd_pr_abandon(args: &[String]) -> Result<String, String> {
+fn cmd_pr_abandon(args: &[String]) -> Result<String, CliError> {
     const USAGE: &str = "usage: git forge pr abandon <n> --reason <text>";
-    let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
+    let id = parse_entity_id(args.first().ok_or_else(|| CliError::usage(USAGE, ""))?)?;
     let mut reason: Option<String> = None;
     let mut i = 1;
     while i < args.len() {
@@ -587,23 +470,31 @@ fn cmd_pr_abandon(args: &[String]) -> Result<String, String> {
             "--reason" => {
                 i += 1;
                 if i >= args.len() {
-                    return Err("--reason requires a text".into());
+                    return Err(CliError::usage("--reason requires a text", ""));
                 }
                 reason = Some(args[i].clone());
             }
             "-h" | "--help" => return Ok(USAGE.into()),
-            a if a.starts_with('-') => return Err(format!("unknown option '{a}'")),
+            a if a.starts_with('-') => {
+                return Err(CliError::usage(format!("unknown option '{a}'"), a))
+            }
             other => {
-                return Err(format!(
+                return Err(CliError::usage(
+                    format!(
                     "unexpected argument '{other}'; usage: git forge pr abandon <n> --reason <text>"
+                ),
+                    "",
                 ))
             }
         }
         i += 1;
     }
-    let reason = reason.ok_or_else(|| USAGE.to_string())?;
+    let reason = reason.ok_or_else(|| CliError::usage(USAGE, ""))?;
     if reason.trim().is_empty() {
-        return Err("--reason is required and must be non-empty".into());
+        return Err(CliError::usage(
+            "--reason is required and must be non-empty",
+            "",
+        ));
     }
     // Read-only path first: PR existence and terminality are validated WITHOUT
     // resolving the mutable identity, so every refusal resolves nothing and
@@ -611,15 +502,20 @@ fn cmd_pr_abandon(args: &[String]) -> Result<String, String> {
     let store = open_store()?;
     let r = crate::store::pr_head_ref(id);
     if !store_has_ref(&store, &r) {
-        return Err(format!("PR #{id} does not exist"));
+        return Err(CliError::not_found(
+            format!("PR #{id} does not exist"),
+            id.to_string(),
+        ));
     }
-    let chain = store.read_chain(&r).map_err(|e| e.to_string())?;
+    let chain = store.read_chain(&r).map_err(CliError::from)?;
     let state = crate::event::fold(&chain).pr;
     if state.merge_result.is_some() {
-        return Err(format!("PR #{id} is already merged"));
+        return Err(CliError::invalid(format!("PR #{id} is already merged")));
     }
     if let Some(original) = &state.abandoned {
-        return Err(format!("PR #{id} is already abandoned: {original}"));
+        return Err(CliError::invalid(format!(
+            "PR #{id} is already abandoned: {original}"
+        )));
     }
     let (store, actor) = open_mutation_store()?;
     let ev = Event::new(
@@ -629,12 +525,12 @@ fn cmd_pr_abandon(args: &[String]) -> Result<String, String> {
         &actor,
         body_obj(&[("reason", json_str(&reason))]),
     );
-    store.append_event(&r, &ev).map_err(|e| e.to_string())?;
+    store.append_event(&r, &ev).map_err(CliError::from)?;
     Ok(format!("PR #{id} abandoned: {reason}"))
 }
 
 /// Dispatch a `git forge pr` subcommand. `argv` excludes the `pr` token.
-pub fn run_pr(argv: &[String]) -> Result<String, String> {
+pub fn run_pr(argv: &[String]) -> Result<String, CliError> {
     let sub = argv.first().map(|s| s.as_str()).unwrap_or("");
     if help_requested(argv.get(1..).unwrap_or(&[])) {
         if sub == "merge" {
@@ -650,17 +546,30 @@ pub fn run_pr(argv: &[String]) -> Result<String, String> {
     match sub {
         "create" => cmd_pr_create(&argv[1..]),
         "list" => cmd_pr_list(&open_store()?, &argv[1..]),
-        "show" => cmd_pr_show(&open_store()?, &argv[1..]),
+        "show" => {
+            if argv[1..].iter().all(|arg| arg == "--json") {
+                return Err(CliError::usage("usage: git forge pr show <n> [--json]", ""));
+            }
+            cmd_pr_show(&open_store()?, &argv[1..])
+        }
         "comment" => cmd_pr_comment(&argv[1..]),
-        "review" => cmd_pr_review(&argv[1..]),
+        "review" => crate::pr_review::cmd_pr_review(&argv[1..]),
         "update" => crate::pr_merge::cmd_pr_update(&argv[1..]),
         "prepare" => crate::pr_prepare::cmd_pr_prepare(&argv[1..]),
-        "diff" => crate::pr_merge::cmd_pr_diff(&open_store()?, &argv[1..]),
+        "diff" => {
+            if argv[1..].iter().all(|arg| arg == "--json") {
+                return Err(CliError::usage("usage: git forge pr diff <n> [--json]", ""));
+            }
+            crate::pr_merge::cmd_pr_diff(&open_store()?, &argv[1..])
+        }
         "merge" => crate::pr_merge::cmd_pr_merge(open_store()?, &argv[1..]),
         "abandon" => cmd_pr_abandon(&argv[1..]),
         "help" | "-h" | "--help" => Ok(pr_help()),
         "" => Ok(pr_help()),
-        other => Err(format!("unknown pr subcommand '{other}'")),
+        other => Err(CliError::usage(
+            format!("unknown pr subcommand '{other}'"),
+            other,
+        )),
     }
 }
 
@@ -736,10 +645,13 @@ fn worktree_leftover(repo_dir: &std::path::Path, tmp: &std::path::Path) -> Optio
 fn ci_run_read_only_check(
     store: &EventStore,
     id: u64,
-) -> Result<(String, crate::event::PrState), String> {
+) -> Result<(String, crate::event::PrState), CliError> {
     let head = crate::store::pr_head_ref(id);
     if !store_has_ref(store, &head) {
-        return Err(format!("PR #{id} does not exist"));
+        return Err(CliError::not_found(
+            format!("PR #{id} does not exist"),
+            id.to_string(),
+        ));
     }
     // Anchored read (F-008): the WHOLE chain folded here must be anchored to
     // PR #id's authoritative pr.created — a forged/foreign chain must not
@@ -751,38 +663,44 @@ fn ci_run_read_only_check(
         .map_err(|_| format!("PR #{id} does not exist"))?;
     let (anchored, chain) = store
         .read_pr_chain_anchored(id, head_tip)
-        .map_err(|e| e.to_string())?;
+        .map_err(CliError::from)?;
     if !anchored {
-        return Err(format!(
+        return Err((format!(
             "refs/forge/prs/{id}/head points at a tip whose chain is not anchored \
              to PR #{id}"
-        ));
+        ))
+        .into());
     }
     let state = crate::event::fold(&chain).pr;
     // Abandoned PRs are terminal (pr.abandoned): refuse BEFORE the plan is
     // materialized or any worktree is created — no ci.check is appended and
     // the plan never executes, so the PR's existing CI state stays as is.
     if let Some(reason) = &state.abandoned {
-        return Err(format!("PR #{id} is abandoned: {reason}"));
+        return Err(CliError::invalid(format!(
+            "PR #{id} is abandoned: {reason}"
+        )));
     }
     Ok((head, state))
 }
-fn cmd_ci_run(args: &[String]) -> Result<String, String> {
+fn cmd_ci_run(args: &[String]) -> Result<String, CliError> {
     // `--json` (#7): the recorded Check's outcome as one JSON line on stdout
     // (success path only; failures keep the prose stderr + exit 1 contract).
     let (json, args) = machine::json_requested(args);
     if args.len() != 1 {
         // Name the offending token so a rejected flag is diagnosable
         // (unknown flag keeps exit-1, VAL-202).
-        return Err(match args.first() {
-            Some(a) if a.starts_with('-') => {
-                format!("unknown option '{a}'; usage: git forge ci run <pr>")
-            }
-            _ => format!(
-                "usage: git forge ci run <pr> (got {} argument(s), expected exactly 1)",
-                args.len()
-            ),
-        });
+        return Err(CliError::usage(
+            match args.first() {
+                Some(a) if a.starts_with('-') => {
+                    format!("unknown option '{a}'; usage: git forge ci run <pr>")
+                }
+                _ => format!(
+                    "usage: git forge ci run <pr> (got {} argument(s), expected exactly 1)",
+                    args.len()
+                ),
+            },
+            args.first().map(String::as_str).unwrap_or(""),
+        ));
     }
     let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
     // Read-only refusal path + identity binding live in the extracted helper
@@ -911,10 +829,11 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
         // add never registered (clean early-validation failure) is no leftover.
         let leftover = worktree_leftover(&repo_dir, &tmp);
         release_lock(&mut lock_handle, &tmp);
-        return Err(match leftover {
+        return Err((match leftover {
             Some(l) => format!("failed to create temporary worktree for CI run: {err_wt}; {l}"),
             None => format!("failed to create temporary worktree for CI run: {err_wt}"),
-        });
+        })
+        .into());
     }
 
     // Run the plan. The exact immutable snapshot bytes are materialized and
@@ -967,7 +886,7 @@ fn cmd_ci_run(args: &[String]) -> Result<String, String> {
 }
 
 /// Dispatch a `git forge ci` subcommand. `argv` excludes the `ci` token.
-pub fn run_ci(argv: &[String]) -> Result<String, String> {
+pub fn run_ci(argv: &[String]) -> Result<String, CliError> {
     let sub = argv.first().map(|s| s.as_str()).unwrap_or("");
     if help_requested(argv.get(1..).unwrap_or(&[])) && sub == "run" {
         return Ok("usage: git forge ci run <pr>".into());
@@ -976,7 +895,10 @@ pub fn run_ci(argv: &[String]) -> Result<String, String> {
         "run" => cmd_ci_run(&argv[1..]),
         "help" | "-h" | "--help" => Ok(ci_help()),
         "" => Ok(ci_help()),
-        other => Err(format!("unknown ci subcommand '{other}'")),
+        other => Err(CliError::usage(
+            format!("unknown ci subcommand '{other}'"),
+            other,
+        )),
     }
 }
 

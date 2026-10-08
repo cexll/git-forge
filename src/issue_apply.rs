@@ -1,4 +1,5 @@
 //! Declarative issue graph reconciliation and the shared issue creation path.
+use crate::cli_error::CliError;
 use crate::event::{Event, EventKind, IssueState, JsonValue};
 use crate::issue_plan::{self, Entry};
 use crate::store::{EventStore, IssueSnapshot};
@@ -21,25 +22,48 @@ fn reference(
     value: &str,
     ids: &HashMap<String, u64>,
     snapshot: &IssueSnapshot,
-) -> Result<u64, String> {
+) -> Result<u64, CliError> {
     if let Some(id) = value.strip_prefix('#') {
-        let id = crate::cli::parse_entity_id(id)?;
+        let id = crate::cli::parse_entity_id(id).map_err(|error| {
+            CliError::new(
+                "E_INVALID",
+                error.message,
+                value,
+                "Use an existing issue reference in the form '#<n>'.",
+                false,
+            )
+        })?;
         if !snapshot.states.contains_key(&id) {
-            return Err(format!("issue #{id} does not exist"));
+            return Err(CliError::not_found(
+                format!("issue #{id} does not exist"),
+                value,
+            ));
         }
         Ok(id)
     } else {
-        ids.get(value)
-            .copied()
-            .ok_or_else(|| format!("unknown key '{value}'"))
+        ids.get(value).copied().ok_or_else(|| {
+            CliError::new(
+                "E_INVALID",
+                format!("unknown key '{value}'"),
+                value,
+                "Reference a key defined in this issue plan.",
+                false,
+            )
+        })
     }
 }
-fn prepare(entries: &[Entry], snapshot: &IssueSnapshot, actor: &str) -> Result<Plan, String> {
+fn prepare(entries: &[Entry], snapshot: &IssueSnapshot, actor: &str) -> Result<Plan, CliError> {
     let mut existing_keys = HashMap::new();
     for state in snapshot.states.values() {
         if let Some(key) = &state.key {
             if existing_keys.insert(key.clone(), state.id).is_some() {
-                return Err(format!("stored key '{key}' is ambiguous"));
+                return Err(CliError::new(
+                    "E_INVALID",
+                    format!("stored key '{key}' is ambiguous"),
+                    key,
+                    "Resolve the duplicate stored issue keys.",
+                    false,
+                ));
             }
         }
     }
@@ -53,9 +77,23 @@ fn prepare(entries: &[Entry], snapshot: &IssueSnapshot, actor: &str) -> Result<P
             next = next
                 .checked_add(1)
                 .filter(|n| *n <= i64::MAX as u64)
-                .ok_or_else(|| entry.error("key", "issue counter exhausted"))?;
+                .ok_or_else(|| {
+                    CliError::new(
+                        "E_INVALID",
+                        entry.error("key", "issue counter exhausted"),
+                        &entry.key,
+                        "Inspect the issue counter before creating more issues.",
+                        false,
+                    )
+                })?;
             if snapshot.tips.contains_key(&id) {
-                return Err(entry.error("key", "counter collides with an existing issue ref"));
+                return Err(CliError::new(
+                    "E_INVALID",
+                    entry.error("key", "counter collides with an existing issue ref"),
+                    &entry.key,
+                    "Correct the issue counter before applying the plan.",
+                    false,
+                ));
             }
             id
         };
@@ -72,16 +110,32 @@ fn prepare(entries: &[Entry], snapshot: &IssueSnapshot, actor: &str) -> Result<P
         let parent = entry
             .parent
             .as_ref()
-            .map(|r| reference(r, &ids, snapshot).map_err(|e| entry.error("parent", &e)))
+            .map(|r| {
+                reference(r, &ids, snapshot).map_err(|mut error| {
+                    error.message = entry.error("parent", &error.message);
+                    error
+                })
+            })
             .transpose()?;
         let mut blockers = entry
             .blocked_by
             .iter()
-            .map(|r| reference(r, &ids, snapshot).map_err(|e| entry.error("blocked_by", &e)))
+            .map(|r| {
+                reference(r, &ids, snapshot).map_err(|mut error| {
+                    error.message = entry.error("blocked_by", &error.message);
+                    error
+                })
+            })
             .collect::<Result<Vec<_>, _>>()?;
         blockers.sort_unstable();
         if blockers.windows(2).any(|w| w[0] == w[1]) {
-            return Err(entry.error("blocked_by", "duplicate resolved issue"));
+            return Err(CliError::new(
+                "E_INVALID",
+                entry.error("blocked_by", "duplicate resolved issue"),
+                &entry.key,
+                "Remove duplicate blocking references from the plan.",
+                false,
+            ));
         }
         let old = snapshot.states.get(&id);
         let state = IssueState {
@@ -111,13 +165,19 @@ fn prepare(entries: &[Entry], snapshot: &IssueSnapshot, actor: &str) -> Result<P
                 }
             })
         };
-        entries
+        let entry = entries
             .iter()
             .filter(implicated)
             .find(changed_edge)
             .or_else(|| entries.iter().find(implicated))
-            .unwrap_or(&entries[0])
-            .error(field, &message)
+            .unwrap_or(&entries[0]);
+        CliError::new(
+            "E_INVALID",
+            entry.error(field, &message),
+            &entry.key,
+            "Correct the issue parent and blocking graph in the plan.",
+            false,
+        )
     })?;
     Ok(plan)
 }
@@ -308,30 +368,48 @@ fn render(plan: &Plan, json: bool) -> String {
             .join("\n")
     }
 }
-pub(crate) fn cmd_apply(args: &[String]) -> Result<String, String> {
+pub(crate) fn cmd_apply(args: &[String]) -> Result<String, CliError> {
     let (json, args) = crate::machine::json_requested(args);
     let mut dry = false;
     let mut path = None;
     for arg in &args {
         match arg.as_str() {
             "--dry-run" => dry = true,
-            a if a.starts_with('-') => return Err(format!("unknown option '{a}'; usage: git forge issue apply <dir|file> [--dry-run] [--json]")),
+            a if a.starts_with('-') => return Err(CliError::usage(format!("unknown option '{a}'; usage: git forge issue apply <dir|file> [--dry-run] [--json]"), a)),
             _ if path.is_none() => path = Some(arg),
-            _ => return Err("issue apply: expected one plan path".into()),
+            _ => return Err(CliError::usage("issue apply: expected one plan path", arg)),
         }
     }
-    let entries = issue_plan::load(Path::new(path.ok_or("issue apply: expected a plan path")?))?;
+    let path = path.ok_or_else(|| {
+        CliError::usage(
+            "usage: git forge issue apply <dir|file> [--dry-run] [--json]",
+            "",
+        )
+    })?;
+    let entries = issue_plan::load(Path::new(path)).map_err(|message| {
+        CliError::new(
+            "E_INVALID",
+            message,
+            path,
+            "Correct the issue plan path and contents before applying it.",
+            false,
+        )
+    })?;
     if dry {
-        let store = EventStore::open(".").map_err(|e| e.to_string())?;
-        let snapshot = store.issue_snapshot().map_err(|e| e.to_string())?;
+        let store = EventStore::open(".")?;
+        let snapshot = store.issue_snapshot()?;
         return Ok(render(&prepare(&entries, &snapshot, "dry-run")?, json));
     }
     let (store, actor) = crate::identity::open_mutation_store()?;
-    let snapshot = store.store().issue_snapshot().map_err(|e| e.to_string())?;
+    let snapshot = store.store().issue_snapshot()?;
     let plan = prepare(&entries, &snapshot, &actor)?;
     store
         .apply_issue_batch(&snapshot, plan.next, &plan.events)
-        .map_err(|e| format!("issue apply: atomic transaction failed: {e}"))?;
+        .map_err(|error| {
+            let mut error = CliError::from(error);
+            error.message = format!("issue apply: atomic transaction failed: {}", error.message);
+            error
+        })?;
     Ok(render(&plan, json))
 }
 pub(crate) fn new_issue(
@@ -341,26 +419,59 @@ pub(crate) fn new_issue(
     parent: Option<u64>,
     mut blocked_by: Vec<u64>,
     json: bool,
-) -> Result<String, String> {
+) -> Result<String, CliError> {
     let (store, actor) = crate::identity::open_mutation_store()?;
     blocked_by.sort_unstable();
     if blocked_by.windows(2).any(|w| w[0] == w[1]) {
-        return Err("issue new: blocked_by: duplicate issue".into());
+        return Err(CliError::new(
+            "E_INVALID",
+            "issue new: blocked_by: duplicate issue",
+            "blocked_by",
+            "Remove duplicate blocking issue identifiers.",
+            false,
+        ));
     }
     for _ in 0..crate::store::MAX_ALLOC_RETRIES {
         let snapshot = match store.store().issue_snapshot() {
             Ok(snapshot) => snapshot,
             Err(crate::store::StoreError::CasConflict) => continue,
-            Err(error) => return Err(error.to_string()),
+            Err(error) => return Err(error.into()),
         };
         let id = snapshot.next;
         if snapshot.tips.contains_key(&id) {
-            return Err("issue new: counter collides with an existing issue ref".into());
+            return Err(CliError::new(
+                "E_INVALID",
+                "issue new: counter collides with an existing issue ref",
+                id.to_string(),
+                "Correct the issue counter before creating an issue.",
+                false,
+            ));
         }
         let next = id
             .checked_add(1)
             .filter(|n| *n <= i64::MAX as u64)
-            .ok_or("issue counter exhausted")?;
+            .ok_or_else(|| {
+                CliError::new(
+                    "E_INVALID",
+                    "issue counter exhausted",
+                    id.to_string(),
+                    "Inspect the issue counter before creating more issues.",
+                    false,
+                )
+            })?;
+        for reference in parent.iter().chain(blocked_by.iter()) {
+            if *reference != id && !snapshot.states.contains_key(reference) {
+                let field = if parent.as_ref() == Some(reference) {
+                    "parent"
+                } else {
+                    "blocked_by"
+                };
+                return Err(CliError::not_found(
+                    format!("issue new: {field}: issue #{reference} does not exist"),
+                    reference.to_string(),
+                ));
+            }
+        }
         let state = IssueState {
             id,
             title: Some(title.clone()),
@@ -378,12 +489,19 @@ pub(crate) fn new_issue(
             next,
         };
         record(&mut plan, state.clone(), None, &actor);
-        validate_graph(&plan.states, &[id])
-            .map_err(|(_, field, e)| format!("issue new: {field}: {e}"))?;
+        validate_graph(&plan.states, &[id]).map_err(|(_, field, error)| {
+            CliError::new(
+                "E_INVALID",
+                format!("issue new: {field}: {error}"),
+                field,
+                "Correct the issue parent and blocking graph.",
+                false,
+            )
+        })?;
         match store.apply_issue_batch(&snapshot, next, &plan.events) {
             Ok(()) => {}
             Err(crate::store::StoreError::CasConflict) => continue,
-            Err(error) => return Err(error.to_string()),
+            Err(error) => return Err(error.into()),
         }
         return if json {
             Ok(crate::machine::issue_json(
@@ -394,5 +512,5 @@ pub(crate) fn new_issue(
             Ok(format!("issue #{id} created: {title}"))
         };
     }
-    Err(crate::store::StoreError::Exhausted.to_string())
+    Err(crate::store::StoreError::Exhausted.into())
 }

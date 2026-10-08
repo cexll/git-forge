@@ -8,12 +8,64 @@
 //! its result_commit — never re-materializing at merge time. This module
 //! owns the prepare command; the candidate gate lives in `merge_state`.
 
+use crate::cli_error::CliError;
+
 use std::collections::HashMap;
 
 use git2::Oid;
 
 use crate::event::{Event, EventKind, JsonValue};
 use crate::store::{pr_head_ref, pr_result_ref, EventStore, StoreError, ZERO_OID};
+
+fn prepare_arguments(args: &[String]) -> Result<(u64, String), CliError> {
+    let mut id_arg: Option<String> = None;
+    let mut strategy: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--strategy" => {
+                i += 1;
+                if i >= args.len() {
+                    return Err(CliError::usage("--strategy requires a value", ""));
+                }
+                if strategy.is_some() {
+                    return Err(CliError::usage("--strategy specified more than once", ""));
+                }
+                strategy = Some(args[i].clone());
+            }
+            s if s.starts_with('-') => {
+                return Err(CliError::usage(format!("unknown option '{s}'"), s))
+            }
+            s => {
+                if id_arg.is_some() {
+                    return Err(CliError::usage("usage: git forge pr prepare <n> --strategy <merge|squash|rebase|ff> (only one PR id allowed)", s));
+                }
+                id_arg = Some(s.to_string());
+            }
+        }
+        i += 1;
+    }
+    let strategy = strategy.ok_or_else(|| {
+        CliError::usage(
+            "usage: git forge pr prepare <n> --strategy <merge|squash|rebase|ff> \
+         (--strategy is required)",
+            "",
+        )
+    })?;
+    if !matches!(strategy.as_str(), "merge" | "squash" | "rebase" | "ff") {
+        return Err(CliError::usage(
+            format!("unknown strategy '{strategy}'; use --strategy merge|squash|rebase|ff"),
+            &strategy,
+        ));
+    }
+    let id = crate::cli::parse_entity_id(id_arg.as_deref().ok_or_else(|| {
+        CliError::usage(
+            "usage: git forge pr prepare <n> --strategy <merge|squash|rebase|ff>",
+            "",
+        )
+    })?)?;
+    Ok((id, strategy))
+}
 
 /// `git forge pr prepare <n> --strategy <merge|squash|rebase|ff>`
 ///
@@ -26,75 +78,49 @@ use crate::store::{pr_head_ref, pr_result_ref, EventStore, StoreError, ZERO_OID}
 /// the prior candidate (CAS old→new); it does NOT bump the generation. The
 /// stdout line and `pr show`'s additive `prepared:` line are the adapter
 /// contract surface.
-pub(crate) fn cmd_pr_prepare(args: &[String]) -> Result<String, String> {
-    let mut id_arg: Option<String> = None;
-    let mut strategy: Option<String> = None;
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--strategy" => {
-                i += 1;
-                if i >= args.len() {
-                    return Err("--strategy requires a value".into());
-                }
-                if strategy.is_some() {
-                    return Err("--strategy specified more than once".into());
-                }
-                strategy = Some(args[i].clone());
-            }
-            "-h" | "--help" => return Ok(pr_prepare_help()),
-            s if s.starts_with('-') => return Err(format!("unknown option '{s}'")),
-            s => {
-                if id_arg.is_some() {
-                    return Err(
-                        "usage: git forge pr prepare <n> --strategy <merge|squash|rebase|ff> \
-                         (only one PR id allowed)"
-                            .into(),
-                    );
-                }
-                id_arg = Some(s.to_string());
-            }
-        }
-        i += 1;
+pub(crate) fn cmd_pr_prepare(args: &[String]) -> Result<String, CliError> {
+    let (_, args) = crate::machine::json_requested(args);
+    if args
+        .iter()
+        .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
+    {
+        return Ok(pr_prepare_help());
     }
-    let strategy = strategy.ok_or(
-        "usage: git forge pr prepare <n> --strategy <merge|squash|rebase|ff> \
-         (--strategy is required)",
-    )?;
-    if !matches!(strategy.as_str(), "merge" | "squash" | "rebase" | "ff") {
-        return Err(format!(
-            "unknown strategy '{strategy}'; use --strategy merge|squash|rebase|ff"
-        ));
-    }
-    let id = crate::cli::parse_entity_id(id_arg.as_deref().unwrap_or(""))?;
+    let (id, strategy) = prepare_arguments(&args)?;
     // Read-only path first: existence and terminality resolve nothing and
     // write nothing.
     let store = open_read_store()?;
     let head = crate::store::pr_head_ref(id);
     if !crate::cli::store_has_ref(&store, &head) {
-        return Err(format!("PR #{id} does not exist"));
+        return Err(CliError::not_found(
+            format!("PR #{id} does not exist"),
+            id.to_string(),
+        ));
     }
     // Anchored read (F-008): only PR #id's own chain supplies the snapshot.
     let head_tip = store
         .repo()
         .find_reference(&head)
         .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
-        .map_err(|_| format!("PR #{id} does not exist"))?;
+        .map_err(|_| CliError::not_found(format!("PR #{id} does not exist"), id.to_string()))?;
     let (anchored, chain) = store
         .read_pr_chain_anchored(id, head_tip)
-        .map_err(|e| e.to_string())?;
+        .map_err(CliError::from)?;
     if !anchored {
-        return Err(format!(
+        return Err((format!(
             "refs/forge/prs/{id}/head points at a tip whose chain is not anchored \
              to PR #{id}"
-        ));
+        ))
+        .into());
     }
     let state = crate::event::fold(&chain).pr;
     if let Some(reason) = &state.abandoned {
-        return Err(format!("PR #{id} is abandoned: {reason}"));
+        return Err(CliError::invalid(format!(
+            "PR #{id} is abandoned: {reason}"
+        )));
     }
     if state.merge_result.is_some() {
-        return Err(format!("PR #{id} is already merged"));
+        return Err(CliError::invalid(format!("PR #{id} is already merged")));
     }
     let base_ref = state
         .base_ref
@@ -138,12 +164,13 @@ pub(crate) fn cmd_pr_prepare(args: &[String]) -> Result<String, String> {
     // directly on top of the CURRENT base tip. Any other strategy is fine
     // (merge/squash/rebase), matching the merge command's own precondition.
     if strategy == "ff" && exec_merge_base != current_base {
-        return Err(format!(
+        return Err((format!(
             "PR #{id} cannot fast-forward: the source does not sit directly on \
              top of the current base tip of '{base_ref}' (merge_base \
              {exec_merge_base} != base tip {current_base}); use --strategy \
              rebase to replay the source or recreate the PR"
-        ));
+        ))
+        .into());
     }
     // The PR title is required by squash only (VAL-101); validate up front so
     // the refusal happens before any worktree side effect.
@@ -187,7 +214,7 @@ pub(crate) fn cmd_pr_prepare(args: &[String]) -> Result<String, String> {
         result_tree,
         &actor,
     )
-    .map_err(|e| e.to_string())?;
+    .map_err(CliError::from)?;
     Ok(format!(
         "prepared PR #{id} for strategy {strategy} (candidate {result_commit}, \
          generation {generation}, base {current_base})"
@@ -196,7 +223,7 @@ pub(crate) fn cmd_pr_prepare(args: &[String]) -> Result<String, String> {
 
 /// Open the read store (thin wrapper for symmetry with cmd_pr_update's
 /// read-then-reopen pattern; the mutation store is bound inside).
-fn open_read_store() -> Result<EventStore, String> {
+fn open_read_store() -> Result<EventStore, CliError> {
     crate::cli::open_store()
 }
 
@@ -217,7 +244,9 @@ struct MaterializeInputs<'a> {
 /// base tip, or the source snapshot for rebase); returns (result_commit,
 /// result_tree) and cleans up the worktree. Errors carry the user-facing
 /// message with the worktree already removed best-effort.
-fn materialize_candidate(inputs: MaterializeInputs<'_>) -> Result<(git2::Oid, git2::Oid), String> {
+fn materialize_candidate(
+    inputs: MaterializeInputs<'_>,
+) -> Result<(git2::Oid, git2::Oid), CliError> {
     let MaterializeInputs {
         store,
         repo_dir,
@@ -284,7 +313,7 @@ fn materialize_candidate(inputs: MaterializeInputs<'_>) -> Result<(git2::Oid, gi
     };
     if !ok_wt {
         release_lock(&mut lock_handle, &tmp);
-        return Err(format!("failed to create temporary worktree: {err_wt}"));
+        return Err(format!("failed to create temporary worktree: {err_wt}").into());
     }
     // Execute the strategy in the worktree; result_commit = worktree HEAD.
     let exec = crate::git::execute_strategy(
@@ -300,7 +329,17 @@ fn materialize_candidate(inputs: MaterializeInputs<'_>) -> Result<(git2::Oid, gi
         Ok(o) => o,
         Err(e) => {
             release_lock(&mut lock_handle, &tmp);
-            return Err(e);
+            return Err(if e.conflict {
+                CliError::new(
+                    "E_PREPARE_CONFLICT",
+                    e.message,
+                    id.to_string(),
+                    "Inspect the repository and the reported failure before retrying.",
+                    false,
+                )
+            } else {
+                CliError::from(e.message)
+            });
         }
     };
     let result_commit = result_commit.parse::<git2::Oid>().map_err(|_| {
@@ -332,16 +371,18 @@ fn materialize_candidate(inputs: MaterializeInputs<'_>) -> Result<(git2::Oid, gi
     if let Err(err_rm) = crate::git::worktree_remove(repo_dir, &tmp) {
         let _ = std::fs::remove_file(tmp.with_extension("lock"));
         return Err(format!(
-                "strategy executed but temp worktree removal failed: {err_rm}                  (worktree left at {})",
-                tmp.display()
-            ));
+            "strategy executed but temp worktree removal failed: {err_rm}                  (worktree left at {})",
+            tmp.display()
+        )
+        .into());
     }
     if tmp.exists() {
         let _ = std::fs::remove_file(tmp.with_extension("lock"));
         return Err(format!(
             "strategy executed but temp worktree directory still exists at {}",
             tmp.display()
-        ));
+        )
+        .into());
     }
     release_lock(&mut lock_handle, &tmp);
     Ok((result_commit, result_tree))
@@ -368,33 +409,42 @@ pub(crate) fn validate_prepared_candidate(
     base_ref: &str,
     current_base: Oid,
     strategy: &str,
-) -> Result<(), String> {
+) -> Result<(), CliError> {
+    let gate_error = |message: String| {
+        CliError::new(
+            "E_GATE",
+            message,
+            id.to_string(),
+            "Inspect PR review and CI state and satisfy the reported merge gate.",
+            false,
+        )
+    };
     if candidate.generation != state.generation {
-        return Err(format!(
+        return Err(gate_error(format!(
             "PR #{id} prepared candidate is stale (prepared on generation {}, current \
              snapshot generation {}); re-run `git forge pr prepare {id} --strategy \
              {strategy}`, then `git forge ci run {id}` and `git forge pr review {id} \
              --approve`, then merge",
             candidate.generation, state.generation
-        ));
+        )));
     }
     if candidate.base_head != current_base.to_string() {
-        return Err(format!(
+        return Err(gate_error(format!(
             "PR #{id} prepared candidate is stale (built against base tip {}, current \
              base tip of '{base_ref}' is {current_base}); re-run `git forge pr prepare \
              {id} --strategy {strategy}`, then `git forge ci run {id}` and `git forge pr \
              review {id} --approve`, then merge",
             candidate.base_head
-        ));
+        )));
     }
     if candidate.strategy != strategy {
-        return Err(format!(
+        return Err(gate_error(format!(
             "PR #{id} prepared candidate is for strategy '{candidate_strategy}' but the \
              merge requested '{strategy}'; re-run `git forge pr prepare {id} --strategy \
              {strategy}`, then `git forge ci run {id}` and `git forge pr review {id} \
              --approve`, then merge",
             candidate_strategy = candidate.strategy
-        ));
+        )));
     }
     // Approve bound to the candidate (issue #2: a review decision must bind
     // the result being merged). A legacy approve (no candidate identity) or
@@ -403,12 +453,12 @@ pub(crate) fn validate_prepared_candidate(
         || state.decision_result_commit.as_deref() != Some(candidate.result_commit.as_str())
         || state.decision_result_tree.as_deref() != Some(candidate.result_tree.as_str())
     {
-        return Err(format!(
+        return Err(gate_error(format!(
             "PR #{id} approve is not bound to the prepared candidate (generation {}, \
              base {}, result {}); re-approve after re-running the candidate CI: \
              `git forge pr review {id} --approve`, then merge",
             candidate.generation, candidate.base_head, candidate.result_commit
-        ));
+        )));
     }
     // Latest CI Check success AND bound to this candidate.
     match state.ci_status.as_deref() {
@@ -417,23 +467,23 @@ pub(crate) fn validate_prepared_candidate(
                 && state.ci_result_commit.as_deref() == Some(candidate.result_commit.as_str())
                 && state.ci_result_tree.as_deref() == Some(candidate.result_tree.as_str()) => {}
         Some("success") => {
-            return Err(format!(
+            return Err(gate_error(format!(
                 "PR #{id} is not mergeable: latest CI Check is valid but not bound to \
                  the prepared candidate (generation {}, base {}, result {}); run \
                  `git forge ci run {id}` against the candidate, then merge",
                 candidate.generation, candidate.base_head, candidate.result_commit
-            ));
+            )));
         }
         Some(status) => {
-            return Err(format!(
+            return Err(gate_error(format!(
                 "PR #{id} is not mergeable: latest CI Check is `{status}` (expected \
                  `success`); run `git forge ci run {id}`, then merge"
-            ));
+            )));
         }
         None => {
-            return Err(format!(
+            return Err(gate_error(format!(
                 "PR #{id} is not mergeable: no CI Check recorded; run `git forge ci run {id}`, then merge"
-            ));
+            )));
         }
     }
     Ok(())
@@ -541,7 +591,7 @@ pub(crate) fn record_and_report_ci_check(
     ran_out: bool,
     run_detail: Option<String>,
     actor: &str,
-) -> Result<String, String> {
+) -> Result<String, CliError> {
     let mut body = HashMap::new();
     body.insert("status".into(), crate::cli::json_str(status));
     body.insert("plan".into(), crate::cli::json_str(plan_label));
@@ -575,15 +625,21 @@ pub(crate) fn record_and_report_ci_check(
     let append = store.append_event(head, &ev);
     if let Some(ar) = append.as_ref().err() {
         let msg = format!("CI run completed but recording the CI Check failed: {ar}");
-        return Err(match leftover {
+        let mut error = CliError::from(append.err().ok_or("CI append error missing")?);
+        error.message = match leftover {
             Some(l) => format!("{msg}; temp worktree cleanup failed: {l}"),
             None => msg,
-        });
+        };
+        return Err(error);
     }
 
     if let Some(leftover) = leftover {
-        return Err(format!(
-            "CI run recorded {status} but temp worktree cleanup failed: {leftover}"
+        return Err(CliError::new(
+            "E_CI_FAILED",
+            format!("CI run recorded {status} but temp worktree cleanup failed: {leftover}"),
+            id.to_string(),
+            "Inspect the reported worktree cleanup failure.",
+            false,
         ));
     }
     append.map_err(|e| format!("CI run completed but recording the CI Check failed: {e}"))?;
@@ -600,7 +656,13 @@ pub(crate) fn record_and_report_ci_check(
                 .map(|c| format!(": exited with status {c}"))
                 .unwrap_or_default()
         };
-        Err(format!("CI run for PR #{id} failed ({plan_label}){detail}"))
+        Err(CliError::new(
+            "E_CI_FAILED",
+            format!("CI run for PR #{id} failed ({plan_label}){detail}"),
+            id.to_string(),
+            "Fix the CI plan and run CI again.",
+            false,
+        ))
     }
 }
 

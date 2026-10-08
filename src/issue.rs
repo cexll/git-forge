@@ -4,6 +4,8 @@
 //! human-readable output only. Shared CLI plumbing (entity-id parsing, terminal
 //! sanitization, store openers, JSON body builders) lives in `crate::cli`.
 
+use crate::cli_error::CliError;
+
 use crate::cli::{
     body_obj, help_requested, json_str, open_store, parse_entity_id, sanitize_terminal,
     store_has_ref,
@@ -28,7 +30,7 @@ fn issue_event(kind: EventKind, id: u64, actor: &str, body: HashMap<String, Json
 }
 
 /// `git forge issue new <title> [description]`
-fn cmd_new(args: &[String]) -> Result<String, String> {
+fn cmd_new(args: &[String]) -> Result<String, CliError> {
     const USAGE: &str = "usage: git forge issue new <title> [description] [--label <x>]... [--parent <n>] [--blocked-by <n>]... [--json]";
     // Pure argument validation first — a usage error must not be masked by a
     // later config-open failure (error precedence, F-028). Supports
@@ -51,11 +53,11 @@ fn cmd_new(args: &[String]) -> Result<String, String> {
             "--label" | "-l" => {
                 i += 1;
                 if i >= args.len() {
-                    return Err("--label requires a value".into());
+                    return Err(CliError::usage("--label requires a value", ""));
                 }
                 let v = args[i].trim().to_string();
                 if v.is_empty() {
-                    return Err("--label requires a non-empty value".into());
+                    return Err(CliError::usage("--label requires a non-empty value", ""));
                 }
                 labels.push(v);
             }
@@ -64,29 +66,37 @@ fn cmd_new(args: &[String]) -> Result<String, String> {
                 i += 1;
                 let value = args
                     .get(i)
-                    .ok_or_else(|| format!("{flag} requires an issue id"))?;
+                    .ok_or_else(|| CliError::usage(format!("{flag} requires an issue id"), flag))?;
                 let id = parse_entity_id(value)?;
                 if flag == "--parent" {
                     if parent.replace(id).is_some() {
-                        return Err("--parent may only be specified once".into());
+                        return Err(CliError::usage("--parent may only be specified once", ""));
                     }
                 } else {
                     blocked_by.push(id);
                 }
             }
-            a if a.starts_with('-') => return Err(format!("unknown option '{a}'; {USAGE}")),
+            a if a.starts_with('-') => {
+                return Err(CliError::usage(format!("unknown option '{a}'; {USAGE}"), a))
+            }
             _ => positional.push(args[i].clone()),
         }
         i += 1;
     }
     if positional.is_empty() || positional[0].trim().is_empty() {
-        return Err(format!("{USAGE} — title is required and non-empty"));
+        return Err(CliError::usage(
+            format!("{USAGE} — title is required and non-empty"),
+            "",
+        ));
     }
     if positional.len() > 2 {
         // Documented grammar is `<title> [description]`; a third value after
         // `--` (or an over-long positional list) would otherwise be silently
         // discarded.
-        return Err(format!("{USAGE} — too many positional arguments"));
+        return Err(CliError::usage(
+            format!("{USAGE} — too many positional arguments"),
+            "",
+        ));
     }
     let title = positional[0].trim().to_string();
     let description = positional
@@ -97,7 +107,7 @@ fn cmd_new(args: &[String]) -> Result<String, String> {
 }
 
 /// `git forge issue list`
-fn cmd_list(store: &EventStore, args: &[String]) -> Result<String, String> {
+fn cmd_list(store: &EventStore, args: &[String]) -> Result<String, CliError> {
     const USAGE: &str =
         "usage: git forge issue list [--parent <n>] [--state open|closed|all] [--json]";
     let (json, args) = machine::json_requested(args);
@@ -110,20 +120,20 @@ fn cmd_list(store: &EventStore, args: &[String]) -> Result<String, String> {
                 i += 1;
                 let value = args
                     .get(i)
-                    .ok_or_else(|| "--parent requires an issue id".to_string())?;
+                    .ok_or_else(|| CliError::usage("--parent requires an issue id", "--parent"))?;
                 if parent.replace(parse_entity_id(value)?).is_some() {
-                    return Err("--parent may only be specified once".into());
+                    return Err(CliError::usage("--parent may only be specified once", ""));
                 }
             }
             "--state" => {
                 i += 1;
-                desired_state = args
-                    .get(i)
-                    .map(String::as_str)
-                    .ok_or_else(|| "--state requires open, closed, or all".to_string())?;
+                desired_state = args.get(i).map(String::as_str).ok_or_else(|| {
+                    CliError::usage("--state requires open, closed, or all", "--state")
+                })?;
                 if !matches!(desired_state, "open" | "closed" | "all") {
-                    return Err(format!(
-                        "invalid --state '{desired_state}'; expected open, closed, or all"
+                    return Err(CliError::usage(
+                        format!("invalid --state '{desired_state}'; expected open, closed, or all"),
+                        desired_state,
                     ));
                 }
             }
@@ -162,20 +172,26 @@ fn cmd_list(store: &EventStore, args: &[String]) -> Result<String, String> {
 }
 
 /// `git forge issue show <n>`
-fn cmd_show(store: &EventStore, args: &[String]) -> Result<String, String> {
+fn cmd_show(store: &EventStore, args: &[String]) -> Result<String, CliError> {
     let (json, args) = machine::json_requested(args);
     machine::reject_leftover_flags(
         args.get(1..).unwrap_or(&[]),
         "usage: git forge issue show <n>",
     )?;
-    let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
+    let id = parse_entity_id(
+        args.first()
+            .ok_or_else(|| CliError::usage("usage: git forge issue show <n> [--json]", ""))?,
+    )?;
     let r = crate::store::issue_ref(id);
     if !store_has_ref(store, &r) {
-        return Err(format!("issue #{id} does not exist"));
+        return Err(CliError::not_found(
+            format!("issue #{id} does not exist"),
+            id.to_string(),
+        ));
     }
-    let chain = store.read_chain(&r).map_err(|e| e.to_string())?;
+    let chain = store.read_chain(&r).map_err(CliError::from)?;
     if chain.is_empty() {
-        return Err(format!("issue #{id} has no events"));
+        return Err((format!("issue #{id} has no events")).into());
     }
     let state = crate::event::fold(&chain).issue;
     let all = machine::fold_all_issues(store)?;
@@ -216,7 +232,7 @@ fn cmd_show(store: &EventStore, args: &[String]) -> Result<String, String> {
 }
 
 /// `git forge issue comment <n> <body>`
-fn cmd_comment(args: &[String]) -> Result<String, String> {
+fn cmd_comment(args: &[String]) -> Result<String, CliError> {
     const USAGE: &str = "usage: git forge issue comment <n> <body>";
     // Same strict flag/token split as every other issue subcommand: an
     // unknown option is a clean usage error naming the flag (VAL-202),
@@ -227,17 +243,20 @@ fn cmd_comment(args: &[String]) -> Result<String, String> {
     // emptiness are checked below, as before.
     machine::reject_flags(&args, USAGE)?;
     if args.len() < 2 {
-        return Err(USAGE.into());
+        return Err(CliError::usage(USAGE, ""));
     }
     let id = parse_entity_id(&args[0])?;
     let body = args[1..].join(" ").trim().to_string();
     if body.is_empty() {
-        return Err("comment body must be non-empty".into());
+        return Err(CliError::usage("comment body must be non-empty", ""));
     }
     let (store, actor) = open_mutation_store()?;
     let r = crate::store::issue_ref(id);
     if !store_has_ref(store.store(), &r) {
-        return Err(format!("issue #{id} does not exist"));
+        return Err(CliError::not_found(
+            format!("issue #{id} does not exist"),
+            id.to_string(),
+        ));
     }
     let ev = issue_event(
         EventKind::IssueComment,
@@ -245,12 +264,12 @@ fn cmd_comment(args: &[String]) -> Result<String, String> {
         &actor,
         body_obj(&[("body", json_str(&body))]),
     );
-    store.append_event(&r, &ev).map_err(|e| e.to_string())?;
+    store.append_event(&r, &ev).map_err(CliError::from)?;
     Ok(format!("comment added to issue #{id}"))
 }
 
 /// `git forge issue close <n>` / `reopen <n>`
-fn cmd_state(kind: EventKind, args: &[String]) -> Result<String, String> {
+fn cmd_state(kind: EventKind, args: &[String]) -> Result<String, CliError> {
     // One positional, no options: anything dash-leading is a usage error
     // naming the flag (VAL-202).
     let (_, args) = machine::json_requested(args);
@@ -263,16 +282,22 @@ fn cmd_state(kind: EventKind, args: &[String]) -> Result<String, String> {
     // error. One positional, no options.
     machine::reject_flags(&args, &format!("usage: git forge issue {verb} <n>"))?;
     if args.len() != 1 {
-        return Err(format!("usage: git forge issue {verb} <n>"));
+        return Err(CliError::usage(
+            format!("usage: git forge issue {verb} <n>"),
+            "",
+        ));
     }
     let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
     let (store, actor) = open_mutation_store()?;
     let r = crate::store::issue_ref(id);
     if !store_has_ref(store.store(), &r) {
-        return Err(format!("issue #{id} does not exist"));
+        return Err(CliError::not_found(
+            format!("issue #{id} does not exist"),
+            id.to_string(),
+        ));
     }
     let ev = issue_event(kind, id, &actor, HashMap::new());
-    store.append_event(&r, &ev).map_err(|e| e.to_string())?;
+    store.append_event(&r, &ev).map_err(CliError::from)?;
     let verb = match kind {
         EventKind::IssueClose => "closed",
         EventKind::IssueReopen => "reopened",
@@ -282,7 +307,7 @@ fn cmd_state(kind: EventKind, args: &[String]) -> Result<String, String> {
 }
 
 /// Dispatch a `git forge issue` subcommand. `argv` excludes the `issue` token.
-pub fn run_issue(argv: &[String]) -> Result<String, String> {
+pub fn run_issue(argv: &[String]) -> Result<String, CliError> {
     let sub = argv.first().map(|s| s.as_str()).unwrap_or("");
     // Subcommand-level `-h`/`--help` is answered HERE, before any store open,
     // so help works outside a git repository (same as the namespace helps).
@@ -293,9 +318,10 @@ pub fn run_issue(argv: &[String]) -> Result<String, String> {
     }
     match sub {
         "new" => cmd_new(&argv[1..]),
-        "apply" => {
-            crate::issue_apply::cmd_apply(&argv[1..]).map_err(|error| sanitize_terminal(&error))
-        }
+        "apply" => crate::issue_apply::cmd_apply(&argv[1..]).map_err(|mut error| {
+            error.message = sanitize_terminal(&error.message);
+            error
+        }),
         "list" => cmd_list(&open_store()?, &argv[1..]),
         "show" => cmd_show(&open_store()?, &argv[1..]),
         "comment" => cmd_comment(&argv[1..]),
@@ -309,7 +335,10 @@ pub fn run_issue(argv: &[String]) -> Result<String, String> {
         }
         "help" | "-h" | "--help" => Ok(issue_help()),
         "" => Ok(issue_help()),
-        other => Err(format!("unknown issue subcommand '{other}'")),
+        other => Err(CliError::usage(
+            format!("unknown issue subcommand '{other}'"),
+            other,
+        )),
     }
 }
 
