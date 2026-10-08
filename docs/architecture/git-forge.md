@@ -281,8 +281,11 @@ failed: <leftover>` message, followed by the same reason and tail clauses,
 and the hint `Inspect the reported worktree cleanup failure.`
 
 The tail is the last 4096 bytes of the plan's combined stdout and stderr.
-When the cut splits a UTF-8 character, the partial character is dropped.
-Bytes that are not valid UTF-8 become U+FFFD, and the text is trimmed again
+When the cut splits a UTF-8 character, the partial character is dropped. A
+split is proven only by a lead byte at most 3 bytes before the cut, followed
+only by continuation bytes, whose declared length reaches past the cut. Other
+bytes that are not valid UTF-8, including a standalone continuation byte at
+the cut, become U+FFFD, and the text is trimmed again
 so that the stored tail never exceeds 4096 bytes. `data.tail` and the stored
 `tail` are this exact text; the message shows it through the terminal escape
 (`\xNN` for control characters, so a newline is `\x0a`).

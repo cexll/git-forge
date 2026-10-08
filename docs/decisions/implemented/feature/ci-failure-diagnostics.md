@@ -36,10 +36,13 @@ codes and write no Check: a missing or abandoned PR, a missing snapshot ref,
 a temporary worktree that cannot be created, and a failed Check append.
 
 The plan's stdout and stderr share one pipe. A reader thread
-(`src/ci/output.rs`) drains it and keeps at most 4097 bytes; the extra byte
-records that the output was cut. The tail is the last 4096 bytes; a cut
-inside a UTF-8 character drops the partial character; invalid bytes become
-U+FFFD; the text is trimmed again so the stored tail is at most 4096 bytes.
+(`src/ci/output.rs`) drains it and keeps at most 4099 bytes; the 3 extra
+bytes keep the lead byte of a character split by the cut. The tail is the
+last 4096 bytes. Leading continuation bytes are dropped only when a lead byte
+at most 3 bytes before the cut, followed only by continuation bytes, declares
+a length that reaches them. Every other invalid byte, including a standalone
+continuation byte at the cut, becomes U+FFFD; the text is trimmed again so the
+stored tail is at most 4096 bytes.
 After the run, `ci run` waits at most about one second for end of file.
 
 `record_and_report_ci_check` (`src/pr_prepare.rs`) stores `reason` and `tail`
@@ -82,7 +85,10 @@ the plan's stdout and stderr were not pipes, as a proxy for unbounded
 `Command::output()` buffering. Capturing the tail makes them a pipe, so that
 oracle now checks a 32 MiB plan: the run drains the pipe (`nonzero_exit`, not
 `timeout`) and stores exactly the last 4096 bytes. The heap bound moved to the
-`Capture` module test, which fails if the kept buffer grows past 4097 bytes.
+`Capture` module test, which fails if the kept buffer grows past 4099 bytes.
+The `bounded_tail_cut_table` test pins the cut rule: split 2-, 3- and 4-byte
+sequences, standalone continuation bytes, a lead that does not reach the
+cut, invalid leads, and outputs of exactly 4096 and 4097 bytes.
 
 `cli_errors.rs::failed_ci_has_json_error_and_records_failed_check` and the
 `pr-create.json` and `pr-show.json` fixtures changed for the new message,

@@ -1,5 +1,5 @@
 //! Bounded capture of a CI plan's combined stdout/stderr: a reader thread
-//! drains one pipe and keeps only the last [`TAIL_BYTES`] (+1) bytes, so a
+//! drains one pipe and keeps only the last [`TAIL_BYTES`] (+3) bytes, so a
 //! high-volume plan neither blocks on a full pipe nor grows git-forge's heap.
 
 use std::io::Read as _;
@@ -10,27 +10,48 @@ use std::time::Duration;
 pub(crate) const TAIL_BYTES: usize = 4096;
 
 /// The text tail of `output`: at most [`TAIL_BYTES`] bytes of valid UTF-8.
-/// The raw cut takes the last `TAIL_BYTES` bytes; when that cut lands inside
-/// a UTF-8 sequence, its leading continuation bytes are dropped. Bytes that
-/// are not valid UTF-8 decode to U+FFFD, and because that replacement can
-/// grow the text, the result is trimmed again at a character boundary.
+/// The raw cut takes the last `TAIL_BYTES` bytes. Leading continuation bytes
+/// are dropped only when a lead byte at most 3 bytes before the cut declares
+/// a sequence that reaches them (a character split by the cut). Every other
+/// byte that is not valid UTF-8 decodes to U+FFFD, and because that
+/// replacement can grow the text, the result is trimmed again at a character
+/// boundary.
 pub(crate) fn bounded_tail(output: &[u8]) -> String {
     let start = output.len().saturating_sub(TAIL_BYTES);
-    let mut cut = &output[start..];
-    if start > 0 {
-        let partial = cut
-            .iter()
-            .take(3)
-            .take_while(|b| **b & 0xC0 == 0x80)
-            .count();
-        cut = &cut[partial..];
-    }
-    let text = String::from_utf8_lossy(cut);
+    let cut = &output[start..];
+    let text = String::from_utf8_lossy(&cut[split_continuations(output, start)..]);
     let mut from = text.len().saturating_sub(TAIL_BYTES);
     while !text.is_char_boundary(from) {
         from += 1;
     }
     text[from..].to_string()
+}
+
+fn is_continuation(byte: u8) -> bool {
+    byte & 0xC0 == 0x80
+}
+
+/// Number of bytes at `output[start..]` that continue a UTF-8 sequence whose
+/// lead byte lies before `start`: the lead must be at most 3 bytes back,
+/// only continuation bytes may sit between it and the cut, and its declared
+/// length must reach past the cut.
+fn split_continuations(output: &[u8], start: usize) -> usize {
+    let before = &output[start.saturating_sub(3)..start];
+    let Some(lead_at) = before.iter().rposition(|b| !is_continuation(*b)) else {
+        return 0;
+    };
+    let declared = match before[lead_at] {
+        0xC2..=0xDF => 2,
+        0xE0..=0xEF => 3,
+        0xF0..=0xF4 => 4,
+        _ => return 0,
+    };
+    let reach = (lead_at + declared).saturating_sub(before.len());
+    output[start..]
+        .iter()
+        .take(reach)
+        .take_while(|b| is_continuation(**b))
+        .count()
 }
 
 /// A running capture: the pipe reader thread and the bytes it kept.
@@ -45,7 +66,7 @@ impl Capture {
     /// see end of file.
     pub(crate) fn start() -> std::io::Result<(Self, std::io::PipeWriter)> {
         let (mut pipe, writer) = std::io::pipe()?;
-        let kept = Arc::new(Mutex::new(Vec::with_capacity(TAIL_BYTES + 1)));
+        let kept = Arc::new(Mutex::new(Vec::with_capacity(TAIL_BYTES + 3)));
         let sink = Arc::clone(&kept);
         let reader = std::thread::Builder::new()
             .name("ci-output".into())
@@ -60,9 +81,9 @@ impl Capture {
                     };
                     let mut kept = sink.lock().unwrap_or_else(|p| p.into_inner());
                     kept.extend_from_slice(&chunk[..n]);
-                    // One byte beyond the bound records that output was cut,
-                    // so `bounded_tail` knows a sequence may be split.
-                    let excess = kept.len().saturating_sub(TAIL_BYTES + 1);
+                    // Three bytes beyond the bound keep the lead byte of a
+                    // sequence split by the cut visible to `bounded_tail`.
+                    let excess = kept.len().saturating_sub(TAIL_BYTES + 3);
                     kept.drain(..excess);
                 }
             })?;
