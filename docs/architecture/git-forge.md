@@ -199,7 +199,8 @@ and `ci run` are unchanged; `tests/fixtures/json/` pins them byte for byte.
 Mutation results open with `id` (the Issue or PR number) and `state`, the
 entity state after the command: `open|closed` for an Issue and
 `open|merged|abandoned` for a PR. `event` is the commit the command appended
-to the entity chain. Commit ids are full 40-character hex strings.
+to the entity chain; `pr merge` has no `event` and returns `merge_commit`
+instead. Commit ids are full 40-character hex strings.
 
 | Command | Result object (keys in order) |
 |---|---|
@@ -222,6 +223,11 @@ form prints. Unlike `pr show`, `base` here is a commit, not a branch name.
 {"id":3,"state":"open","decision":"approve","generation":1,"candidate":"9ab1...","event":"77de..."}
 {"id":3,"state":"merged","strategy":"squash","base":"main","generation":1,"merge_commit":"9ab1...","recycle":null}
 ```
+
+Help has no JSON result. A help request combined with `--json` exits 1 with
+`E_USAGE` before any command runs. A help request is a `-h` or `--help` token
+before any `--` separator, or a `help` word in the subcommand position. Under
+`--json`, an option value that equals `-h` or `--help` is also refused.
 
 A `pr merge --recycle-worktree` whose recycle step fails after the merge is
 already final still exits 1 with the merged line and the recycle failure in

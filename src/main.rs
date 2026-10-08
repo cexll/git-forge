@@ -14,11 +14,15 @@ fn main() -> ExitCode {
         })
         .unwrap_or(false);
 
-    let result = if invoked_as_wrapper {
-        run_wrapper(&argv)
-    } else {
-        run_forge(&argv)
-    };
+    // `--json` with a help request is refused before any dispatch (help has
+    // no JSON result).
+    let result = git_forge::machine::reject_json_help(&argv).and_then(|()| {
+        if invoked_as_wrapper {
+            run_wrapper(&argv)
+        } else {
+            run_forge(&argv)
+        }
+    });
 
     match result {
         Ok(out) => {

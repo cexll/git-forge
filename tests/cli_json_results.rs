@@ -366,3 +366,91 @@ fn pr_merge_of_a_prepared_candidate_reports_the_recycle_outcome() {
     );
     assert!(!worktree.exists());
 }
+
+/// `--json` with a help request is a usage error, never prose on stdout: help
+/// has no JSON result. Covers every command that accepts `--json`, with the
+/// help flag before and after `--json`, plus the namespace help words.
+#[test]
+fn json_with_help_is_a_usage_error_for_every_json_command() {
+    let repo = Repo::new();
+    let commands: &[&[&str]] = &[
+        &["issue", "new"],
+        &["issue", "apply"],
+        &["issue", "list"],
+        &["issue", "show", "1"],
+        &["issue", "comment", "1"],
+        &["issue", "close", "1"],
+        &["issue", "reopen", "1"],
+        &["pr", "create"],
+        &["pr", "list"],
+        &["pr", "show", "1"],
+        &["pr", "comment", "1"],
+        &["pr", "review", "1"],
+        &["pr", "update", "1"],
+        &["pr", "prepare", "1"],
+        &["pr", "diff", "1"],
+        &["pr", "merge"],
+        &["pr", "merge", "1"],
+        &["pr", "abandon", "1"],
+        &["ci", "run", "1"],
+    ];
+    let mut cases: Vec<Vec<&str>> = Vec::new();
+    for command in commands {
+        for flag in ["--help", "-h"] {
+            for tail in [["--json", flag], [flag, "--json"]] {
+                cases.push(command.iter().copied().chain(tail).collect());
+                // Help directly after the subcommand takes the dispatcher's
+                // early help path.
+                let mut early = command[..2].to_vec();
+                early.extend(tail);
+                cases.push(early);
+            }
+        }
+    }
+    for namespace_help in [
+        vec!["help", "--json"],
+        vec!["--json", "--help"],
+        vec!["forge", "help", "--json"],
+        vec!["issue", "help", "--json"],
+        vec!["pr", "--help", "--json"],
+        vec!["ci", "help", "--json"],
+    ] {
+        cases.push(namespace_help);
+    }
+    for args in cases {
+        let output = repo.run(&args);
+        assert_eq!(output.status.code(), Some(1), "{args:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert_eq!(stdout.lines().count(), 1, "{args:?}: {stdout}");
+        let document: serde_json::Value =
+            serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{args:?}: {e}: {stdout}"));
+        assert_eq!(document["error"]["code"], "E_USAGE", "{args:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&output.stderr),
+            format!(
+                "git-forge: {}\n",
+                document["error"]["message"].as_str().unwrap()
+            )
+        );
+    }
+    // Nothing was written: no forge refs exist.
+    assert_eq!(repo.git(&["for-each-ref", "refs/forge"]), "");
+    // A literal `--help` after `--` is data, not a help request.
+    let created = json_result(
+        &repo.run(&["issue", "new", "--json", "--", "--help"]),
+        &[
+            "id",
+            "title",
+            "description",
+            "labels",
+            "open",
+            "comments",
+            "key",
+            "parent",
+            "blocked_by",
+            "children",
+            "blocked",
+        ],
+    );
+    assert_eq!(created["title"], "--help");
+}
