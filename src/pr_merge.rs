@@ -246,24 +246,6 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
         })
         .map_err(|_| format!("base branch '{base_ref}' does not exist"))?;
     let moved = current_base != base_oid;
-    // merge_base recomputed against the CURRENT base tip. When the base has
-    // not moved the recomputation is deterministic over the snapshot OIDs,
-    // so one code path serves both the unmoved and the live-base merge.
-    let exec_merge_base =
-        crate::git::require_single_merge_base(store.repo(), source_oid, current_base)?;
-    // --ff precondition (VAL-102): the source must sit directly on top of
-    // the CURRENT base tip (recomputed merge_base == base tip), whether or
-    // not the base has moved since the snapshot. A moved base is revalidated,
-    // never blanket-refused (supersedes the pre-#2 VAL-103 refusal).
-    if strategy == "ff" && exec_merge_base != current_base {
-        return Err((format!(
-            "PR #{id} cannot fast-forward: the source does not sit directly on \
-             top of the current base tip of '{base_ref}' (merge_base \
-             {exec_merge_base} != base tip {current_base}); use \
-             `pr merge --rebase` to replay the source or recreate the PR"
-        ))
-        .into());
-    }
     // F-002 prepared-candidate routing: the merge of a moved base (or any
     // candidate-pinned PR) binds the PREPARED candidate — result committed
     // at prepare time, never re-materialized. When a current, validated
@@ -323,6 +305,24 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
             "Inspect PR review and CI state and satisfy the reported merge gate.",
             false,
         ));
+    }
+    // merge_base recomputed against the CURRENT base tip. When the base has
+    // not moved the recomputation is deterministic over the snapshot OIDs,
+    // so one code path serves both the unmoved and the live-base merge.
+    let exec_merge_base =
+        crate::git::require_single_merge_base(store.repo(), source_oid, current_base)?;
+    // --ff precondition (VAL-102): the source must sit directly on top of
+    // the CURRENT base tip (recomputed merge_base == base tip), whether or
+    // not the base has moved since the snapshot. A moved base is revalidated,
+    // never blanket-refused (supersedes the pre-#2 VAL-103 refusal).
+    if strategy == "ff" && exec_merge_base != current_base {
+        return Err((format!(
+            "PR #{id} cannot fast-forward: the source does not sit directly on \
+             top of the current base tip of '{base_ref}' (merge_base \
+             {exec_merge_base} != base tip {current_base}); use \
+             `pr merge --rebase` to replay the source or recreate the PR"
+        ))
+        .into());
     }
 
     // Temporary worktree, detached at the immutable base OID. worktree

@@ -1695,6 +1695,159 @@ fn assert_finalize_json_error(
     );
 }
 
+/// Every finalization operation expects an existing, nonzero OID: `/result`
+/// is deleted and the base, PR head, and linked Issue are updated. Therefore
+/// created/expected-absent cells are structurally unreachable here; pending-ref
+/// creation and entity allocation belong to other transactions, not this matrix.
+#[test]
+#[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
+fn finalize_ref_failure_matrix_preserves_json_and_atomicity() {
+    let completion_refs = [
+        "refs/heads/main",
+        "refs/forge/prs/2/head",
+        "refs/forge/issues/1",
+    ];
+    let result_ref = "refs/forge/prs/2/result";
+    // Deleted base comes first: the reported regression must surface before
+    // any already-working moved-ref case can obscure the missing-ref failure.
+    let cases = [
+        ("base/deleted", "refs/heads/main", true),
+        ("base/moved", "refs/heads/main", false),
+        ("result/moved", result_ref, false),
+        ("result/deleted", result_ref, true),
+        ("pr-head/moved", "refs/forge/prs/2/head", false),
+        ("pr-head/deleted", "refs/forge/prs/2/head", true),
+        ("linked-issue/moved", "refs/forge/issues/1", false),
+        ("linked-issue/deleted", "refs/forge/issues/1", true),
+    ];
+    for (label, target, deleted) in cases {
+        eprintln!("finalization matrix case: {label}");
+        let dir = tmpdir(&format!("finalize-matrix-{}", label.replace('/', "-")));
+        init_repo(&dir);
+        let (code, _, stderr) = forge(&dir, &["forge", "issue", "new", "linked Issue"]);
+        assert_eq!(code, 0, "{label}: create linked Issue: {stderr}");
+        create_approved_pr_closes(&dir, "feature", "matrix PR", 1, 2);
+        checkout(&dir, "feature");
+        let barrier = tmpdir("finalize-matrix-window");
+        let child = Command::new(env!("CARGO_BIN_EXE_git-forge"))
+            .args(["forge", "pr", "merge", "2", "--json"])
+            .current_dir(&dir)
+            .env("LC_ALL", "C")
+            .env("GIT_FORGE_TEST_MERGE_ISSUE_BARRIER", &barrier)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(30);
+        wait_issue_barrier_round(&barrier, 0, deadline, label);
+        assert_no_temp_worktree_pr(&dir, 2);
+        let result_expected = ref_oid(&dir, result_ref).unwrap();
+        let mut rejected_expected = ref_oid(&dir, target).unwrap();
+        let mut injected_actual = None;
+        let issue_exhaustion = target == "refs/forge/issues/1" && !deleted;
+        let rounds = if issue_exhaustion { 4 } else { 1 };
+        let mut completion_after_interference = Vec::new();
+        for round in 0..rounds {
+            if round != 0 {
+                wait_issue_barrier_round(&barrier, round, deadline, label);
+                rejected_expected = ref_oid(&dir, target).unwrap();
+            }
+            if deleted {
+                let (code, _, stderr) = git(&dir, &["update-ref", "-d", target]);
+                assert_eq!(code, 0, "{label}: delete ref: {stderr}");
+            } else if issue_exhaustion {
+                // A legitimate Issue append must remain adoptable. Force a
+                // fresh CAS loss AFTER staging in all four existing rounds,
+                // rather than manufacturing a domain/staging refusal.
+                let (code, _, stderr) = forge(
+                    &dir,
+                    &[
+                        "forge",
+                        "issue",
+                        "comment",
+                        "1",
+                        &format!("matrix concurrent append {round}"),
+                    ],
+                );
+                assert_eq!(code, 0, "{label}: append Issue comment: {stderr}");
+            } else {
+                let replacement_ref = match target {
+                    "refs/heads/main" => "refs/heads/feature",
+                    "refs/forge/prs/2/head" => "refs/forge/issues/1",
+                    _ => "refs/heads/main",
+                };
+                // The PR head replacement is a valid foreign event chain,
+                // not a valid PR extension that the retry loop could adopt.
+                let replacement = ref_oid(&dir, replacement_ref).unwrap();
+                assert_ne!(
+                    replacement, rejected_expected,
+                    "{label}: setup must move ref"
+                );
+                let (code, _, stderr) = git(&dir, &["update-ref", target, &replacement]);
+                assert_eq!(code, 0, "{label}: move ref: {stderr}");
+            }
+            injected_actual = ref_oid(&dir, target);
+            assert_ne!(
+                injected_actual.as_deref(),
+                Some(rejected_expected.as_str()),
+                "{label}: interference must reject this attempt's expected OID"
+            );
+            completion_after_interference = completion_refs
+                .iter()
+                .map(|reference| ref_oid(&dir, reference))
+                .collect::<Vec<_>>();
+            release_issue_barrier(&barrier);
+        }
+        let diagnostic = if deleted {
+            format!("fatal: prepare: cannot lock ref '{target}': unable to resolve reference '{target}'")
+        } else {
+            format!(
+                "fatal: prepare: cannot lock ref '{target}': is at {} but expected {rejected_expected}",
+                injected_actual.as_ref().unwrap()
+            )
+        };
+        let cleanup_suffix = if target == result_ref && !deleted {
+            "; pending result ref refs/forge/prs/2/result left in place"
+        } else {
+            ""
+        };
+        let context = if issue_exhaustion {
+            "the merge inputs kept moving during finalization"
+        } else {
+            "final transaction failed"
+        };
+        let expected = format!(
+            "merge execution finished but {context} (git command failed: {diagnostic}); refs unchanged{cleanup_suffix}"
+        );
+        let output = child.wait_with_output().unwrap();
+        for (reference, expected_tip) in completion_refs.iter().zip(&completion_after_interference)
+        {
+            assert_eq!(
+                ref_oid(&dir, reference),
+                *expected_tip,
+                "{label}: failed transaction must preserve {reference} after interference"
+            );
+        }
+        let result_after = ref_oid(&dir, result_ref);
+        if target == result_ref && !deleted {
+            assert_eq!(
+                result_after, injected_actual,
+                "{label}: retain foreign result"
+            );
+            assert_ne!(result_after.as_deref(), Some(result_expected.as_str()));
+        } else {
+            assert_eq!(
+                result_after, None,
+                "{label}: expected result must be cleaned or remain absent"
+            );
+        }
+        assert_no_temp_worktree_pr(&dir, 2);
+        assert_finalize_json_error(&output, "E_CONFLICT", &expected, "", true);
+        std::fs::remove_dir_all(&barrier).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
 #[test]
 fn finalize_retry_gate_refusal_preserves_json_classification() {
     let dir = tmpdir("finalize-retry-gate");
@@ -3826,49 +3979,6 @@ fn ff_non_ffable_pr_rejected_naming_rebase_remedy() {
         ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
         head_before,
         "PR head unchanged on ff refusal"
-    );
-    let (_cs, os, _) = forge(&dir, &["forge", "pr", "show", "1"]);
-    assert!(!os.contains("merged:"), "PR must remain unmerged: {os}");
-}
-
-#[test]
-fn ff_moved_base_refuses_naming_rebase_remedy() {
-    // VAL-103, superseded by #2 (live-base): a moved base is revalidated
-    // against the CURRENT base tip, not blanket-refused. For `--ff` the
-    // ff-ability precondition is judged against the recomputed merge_base:
-    // a source that does not sit directly on the current tip still refuses,
-    // naming the rebase/recreate remedy; base/PR refs unchanged.
-    let dir = tmpdir("ffmoved");
-    init_repo(&dir);
-    create_approved_pr(&dir, "feature", "ff moved PR");
-    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
-    let head_before = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
-    // Advance main after PR creation.
-    let (c, _, e) = git(&dir, &["checkout", "-q", "main"]);
-    assert_eq!(c, 0, "co main: {e}");
-    std::fs::write(dir.join("later.txt"), "later\n").unwrap();
-    let (c, _, e) = git(&dir, &["add", "later.txt"]);
-    assert_eq!(c, 0, "add: {e}");
-    let (c, _, e) = git(&dir, &["commit", "-q", "-m", "later"]);
-    assert_eq!(c, 0, "commit: {e}");
-    let moved_base = ref_oid(&dir, "refs/heads/main").unwrap();
-    assert_ne!(base_before, moved_base);
-    checkout(&dir, "feature");
-    let (cm, _, em) = forge(&dir, &["forge", "pr", "merge", "1", "--ff"]);
-    assert_ne!(cm, 0, "non-ffable source on a moved base must refuse --ff");
-    assert!(
-        em.contains("cannot fast-forward") && em.contains("rebase"),
-        "refusal must name the fast-forward precondition and the rebase remedy: {em}"
-    );
-    assert_eq!(
-        ref_oid(&dir, "refs/heads/main").unwrap(),
-        moved_base,
-        "base unchanged"
-    );
-    assert_eq!(
-        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
-        head_before,
-        "PR head unchanged"
     );
     let (_cs, os, _) = forge(&dir, &["forge", "pr", "show", "1"]);
     assert!(!os.contains("merged:"), "PR must remain unmerged: {os}");

@@ -127,6 +127,17 @@ pub(crate) fn expected_value_rejected(error: &StoreError, lines: &[String]) -> b
         if expected == ZERO_OID {
             return reason == "reference already exists";
         }
+        // update-ref exposes only stderr, not structured rejection codes. A
+        // missing ref is a CAS failure only for this named update's nonzero
+        // expected OID; absent-ref verifies and unrelated failures stay fatal.
+        if operation == Some("update")
+            && reason
+                .strip_prefix("unable to resolve reference '")
+                .and_then(|name| name.strip_suffix('\''))
+                == Some(reference)
+        {
+            return true;
+        }
         reason
             .strip_prefix("is at ")
             .and_then(|s| s.split_once(" but expected "))

@@ -169,10 +169,17 @@ the rejected role in `input`. Version usage failures retain the offending
 flag or positional in `input`.
 
 Merge and prepare accept the bare `--json` selector for failures without
-changing their human success output. Prepared-candidate staleness, mismatched
-candidate gate inputs, and missing required candidates return `E_GATE`.
+changing their human success output. Prepared-candidate currentness, strategy
+binding, and gate validation precede merge-base and strategy preconditions for
+every merge strategy. Staleness, mismatched candidate gate inputs, and missing
+required candidates return `E_GATE` with the existing candidate remedy.
 Finalization preserves the original human context and cleanup suffix while
 retaining retryable `E_CONFLICT` for recognized CAS rejection and exhaustion.
+Each finalization ref expects a nonzero existing OID; movement or deletion
+rejects the entire transaction. Expected-absent creation occurs only in the
+separate pending-result publication, not finalization. Unknown Git diagnostics
+remain `E_INTERNAL`; missing-reference classification requires an exact named
+update operation with a nonzero expected OID.
 Preparation returns `E_PREPARE_CONFLICT` when a failed strategy leaves an
 unmerged index, subject to the hook limitation documented beside the code list.
 
