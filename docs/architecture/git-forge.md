@@ -29,7 +29,9 @@ Must-not-haves (L1): web UI, single-file export, GitHub bridge, accounts/permiss
 | `ci` (runner) | `ci_timeout`, `snapshot_ci_plan`, `run_ci_plan` | Bounded CI plan execution in a disposable worktree: immutable-snapshot plan resolution/materialization, process-group kill+reap under a deadline, env tightening | Security-sensitive: isolates the plan subprocess (`/bin/bash` / `just`) and its environment |
 | `merge_state` (merge gate + finalize) | `read_merge_gate`/`validate_merge_gate_at`, `finalize_pr_merge`, `run_finalize`, `create_pending_result_ref`/`delete_pending_result_ref` | Merge-gate predicate (effective approve + latest CI Check) bound to the exact validated head OID (F-007/F-008), one-transaction merge completion with CAS retry (F-009/F-010), pending-result ref lifecycle | Deep: the gate predicate + merge atomicity live here (not `cli`); `cli` dispatches to it 
 | `pr_merge` (merge commands) | `cmd_pr_merge`, `pr_merge_help` | Merge orchestration (live-base resolution + moved-base candidate routing, checked-out-base guard, temp-worktree lifecycle, pending-result cleanup); gate + finalize delegated to `merge_state` | Deep: the orchestration boundary; `cli` dispatches to it |
-| `issue` (commands) | `run_issue` dispatch; issue `cmd_*` handlers | Issue command parsing + human-readable output; all storage via `store`; shared plumbing (entity-id parsing, sanitization, store openers) from `cli` | Shallow: command surface only |
+| `issue` (commands) | `run_issue` dispatch; issue `cmd_*` handlers | Issue command parsing + human-readable output; apply and new graph publication delegated to `issue_apply`; graph JSON derived from folded states | Shallow: command surface only |
+| `issue_plan` (plans) | strict plan parsing, whole-graph validation, desired-state diff | Minimal frontmatter grammar; repository-wide key mapping and reference resolution; parent/blocking cycle checks | No YAML dependency; shared graph rules for apply and new |
+| `issue_apply` (publication) | `cmd_apply`, `new_issue` | Complete Issue graph snapshot, allocation, event construction and one atomic snapshot/CAS publication via store | Owns orchestration, not a second storage implementation |
 | `cli` (entry) | `run_pr`, `run_ci` dispatch; `cmd_pr_diff` (arguments + result handling) | Command parsing; the merge-gate predicate + finalize live in `merge_state`, orchestration in `pr_merge`; `cmd_pr_diff` delegates the subprocess to `git::git_in_ci` | Shallow by design: dispatch only, no direct subprocess spawning (diff goes through the sanitized git adapter) |
 | `sync` (L2) | — | Explicit forge refspec push, additive fetch refspec, per-entity DAG merge convergence | Not built in L1; no `src/sync.rs` yet |
 | `hooks` (L2) | — | Pre-receive/post-receive hooks, refspec validation | Not built in L1; no `src/hooks.rs` yet |
@@ -43,6 +45,8 @@ cli → ci
 cli → pr_merge → store → event/fold
 cli → merge_state → store → event/fold
 cli → identity
+issue → issue_apply → issue_plan
+issue_apply → store → event/fold
 ci → git2 (plan materialization; no core, no store)
 git → git2 (no core, no store)
 event/fold: zero external dependencies (no git, no I/O)
@@ -50,7 +54,7 @@ event/fold: zero external dependencies (no git, no I/O)
 
 - `event`/`fold` never import git2 or perform I/O; tests run with no infrastructure.
 - `store` depends on `event`/`fold` types only.
-- `cli` is the only module that parses user input; the merge-gate predicate + finalize construction live in `merge_state`; merge orchestration lives in `pr_merge`.
+- Command modules parse user input; `issue_plan` parses the strict Markdown plan format. The merge-gate predicate + finalize construction live in `merge_state`; merge orchestration lives in `pr_merge`.
 - `merge_state` owns the merge-gate predicate + finalize transaction construction; `pr_merge` owns the merge orchestration; `cli` dispatches to it. `identity` resolves the actor/signature once per write.
 - `git` is the only module that shells out for merge execution; it does not import `cli` or `store`.
 - `ci` is the only module that executes the CI plan subprocess (`/bin/bash` for `.forge/ci.sh`, `just` for the `just check` fallback) and performs process-group signalling via a direct `kill(2)` syscall (`libc`, no spawned `/bin/kill`); it imports git2 for plan materialization but never `core`/`store`.
@@ -80,7 +84,10 @@ git-forge/
 │   ├── fold.rs          # state derivation (pure)
 │   ├── git.rs           # git binary adapter: merge-execution shell-outs (worktree, strategies, cleanup, merge-base)
 │   ├── identity.rs      # actor/user.email resolution (F-028) + commit-signature binding
-│   ├── issue.rs         # issue command surface (t1b): new/list/show/comment/close/reopen
+│   ├── issue.rs         # issue command surface: new/apply/list/show/comment/close/reopen
+│   ├── issue_plan.rs    # strict plan parser, complete graph validation and diff
+│   ├── issue_apply.rs   # snapshot + atomic apply/new graph publication
+│   ├── store/issue_batch.rs # snapshot/CAS batch ref transaction
 │   ├── pr_merge.rs      # cmd_pr_merge: merge-gate predicate + orchestration (temp worktree, pending result, atomic finalize)
 │   └── store.rs         # refs read/write via git2
 └── tests/
@@ -164,7 +171,8 @@ Kinds and body fields:
 
 | kind | entity | body |
 |---|---|---|
-| `issue.created` | issue | `{title, description?, labels?}` |
+| `issue.created` | issue | `{title, description?, labels?, key?, parent?, blocked_by?}` |
+| `issue.updated` | issue | changed fields only: `{title?, description?, labels?, parent?, blocked_by?}` |
 | `issue.comment` | issue | `{body}` |
 | `issue.close` | issue | `{}` |
 | `issue.reopen` | issue | `{}` |
@@ -183,6 +191,118 @@ Kinds and body fields:
 `ci.check` records an on-demand **CI Run** on a PR. Its `body` carries `status` (`pending` | `success` | `failed`) and, once a run has executed, `plan` (the plan that ran: `.forge/ci.sh`, or the `just check` fallback), plus the `generation` captured at run start and the live `base_head` (and the prepared-candidate identity when the run validated a candidate); the initial pending marker from `pr create` carries only `status: "pending"` — no plan executes at creation. The top-level `ts`/`actor` record when the Check was written and who invoked the run. Folding keeps the LATEST `ci.check` for the PR, so the merge gate reads a single current status and requires it to be `success` on the PR's CURRENT snapshot generation — a green Check from an older generation is stale (an in-flight run whose append lands after a concurrent `pr update` still carries its captured generation and never greens the new one).
 
 **Effective review decision (L1)**: the last reachable `pr.review` event in the entity chain's parent order (single local chain in L1) is the effective PR decision; the merge gate requires that decision to be `approve` AND bound to the PR's current snapshot generation — each `pr.review` stamps the `generation` captured at review time (plus the live `base_head`, and the prepared-candidate identity when one is current), and the gate compares that captured generation with the PR's CURRENT generation, so a pre-update approval is stale and refused with a re-review remedy. Repeated decisions by the same or different actors simply advance the effective decision; no per-actor union semantics. DAG linearization for multi-chain convergence is deferred to ADR-0004/L2. `approve → reject` and `reject → approve` transitions are first-class test cases.
+
+### Issue Graph and Declarative Apply (L1)
+
+`git forge issue apply <dir|file> [--dry-run] [--json]` (also `git issue apply`)
+publishes the desired Issue metadata and state from Markdown plans. A directory
+is nonrecursive: read directly contained regular `.md` files in filename order;
+ignore symlinks within directories. A single file uses the same parser. All
+files must parse and validate before any ref write.
+
+#### Strict frontmatter format
+
+```markdown
+---
+key: project-schema       # stable repository-wide identity
+title: Store tickets
+parent: project-spec
+blocked_by: [project-api, "#12"]
+labels: [ready-for-agent]
+state: open
+---
+<exact Markdown description>
+```
+
+- Opening and closing frontmatter delimiters are `---` lines. `key` and `title`
+  are required non-empty scalar strings; whitespace-only titles are invalid.
+- The only fields are `key`, `title`, `parent`, `blocked_by`, `labels`, and
+  `state`. Unknown/duplicate fields, missing delimiters and malformed values
+  are errors naming the file and field. This is not general YAML: no nested
+  mappings, block lists, tags, anchors, or multiline scalar syntax. The parser
+  remains minimal without a heavy YAML dependency.
+- Scalars are strings, optionally enclosed in single or double quotes. Single
+  quoted strings cannot contain an internal single quote; double quoted strings
+  use JSON escapes. Plain scalars cannot contain `[`, `]`, commas or quotes;
+  quote titles/labels containing those characters.
+  `blocked_by` and `labels` are inline arrays of scalar strings, for example
+  `[api, "#12"]` or `['ready-for-agent']`; an empty array is `[]`.
+  Comments start at an unquoted `#` preceded by whitespace. Existing Issue
+  references must be quoted (`"#12"` or `'#12'`); bare `#n` is not a reference.
+- `parent` is one reference; `blocked_by` is an array of references. References
+  resolve to another entry's key in this apply or an existing Issue id `"#<n>"`.
+  Keys are stable repository-wide identities stored on Issues, not scoped to a
+  directory, filename or session. A repeated apply matches the existing Issue
+  by key; duplicate plan keys or ambiguous stored identities are errors.
+- The bytes after the closing delimiter line are the description: preserve
+  Markdown, whitespace and trailing newlines exactly, without trimming or
+  injecting a ticket identity line.
+- Omitted `labels`, `parent`, and `blocked_by` mean empty labels, no parent,
+  and no blockers; they clear existing values. Omitted `state` preserves an
+  existing Issue's open/closed state; a new Issue starts open. Explicit
+  `state: open` or `state: closed` enforces that state. Title is always required.
+
+#### Graph, diff and event semantics
+
+Validate the complete resulting graph, including existing Issues outside the
+plan. Every parent/blocker must resolve to an Issue (not a PR). Parent links
+and blocking edges are independent acyclic graphs; unknown references,
+self-blocking, blocking cycles and parent cycles are rejected before publication.
+An Issue's optional `key`, optional `parent` id, and `blocked_by` ids are stored;
+`children` and `blocked` are derived, never stored.
+
+Each entry is `create`, `update`, or `unchanged`, with its resolved sequential
+Issue id and changed fields. Apply JSON is a plain array of objects
+`{key, id, action, changed_fields}`; human output reports the same diff.
+Prospective ids are allocated deterministically in filename order. `--dry-run`
+reports tentative ids but publishes no refs/events and consumes no counter
+values. Re-applying an identical plan appends no events and allocates no ids.
+
+`issue.created` gains optional `key`, `parent` and `blocked_by` fields under
+schema v1. Old chains lacking them fold to `key: null`, `parent: null`, and
+`blocked_by: []`. `issue.updated` carries only metadata fields actually changed:
+title/description strings, a labels array, a parent id or `null` (clear), and a
+blocked_by id array. It does not change the key or carry state. State transitions
+use existing `issue.close`/`issue.reopen` events; an already-satisfied state
+writes neither. New Issues begin open and an explicit closed plan adds a close
+event to the same unpublished chain. Metadata-only edits write only
+`issue.updated`, never a replacement `issue.created`.
+
+#### Atomic complete-graph snapshot/CAS
+
+Read and fold the entire Issue graph together with its observed ref tips and
+the counter tip. Resolve keys, allocate prospective ids, validate the complete
+desired graph, and prepare all event chains before publishing. ONE
+`git update-ref --stdin` transaction verifies every read Issue tip (including
+unchanged Issues and dependency targets outside the plan) and the counter tip.
+Changed tips are CAS updates; unchanged read tips are verify-only operations;
+new Issue refs require expected absence. Allocation advances the shared counter
+in that transaction; without allocations the observed counter is still verified.
+The counter also protects against concurrent allocations introducing graph
+members after the snapshot. An absent counter is verified as absent.
+
+A moved dependency, changed Issue tip, counter conflict or occupied new ref
+fails the entire transaction: no partial Issue refs or counter advancement.
+Prepared immutable git objects may exist, but are not published forge state.
+A fresh snapshot and full revalidation are required before another publication
+attempt; never retry only the stale changed subset. `issue new` uses the same
+whole-graph validator and atomic graph publication, not separate edge rules.
+
+#### Individual commands and graph display
+
+- `issue new <title> [description] [--label <x>]... [--parent <n>]
+  [--blocked-by <n>]... [--json]` accepts an optional parent and repeatable
+  blockers, sharing apply's graph validation. The existing comment, close,
+  reopen and `pr create --closes <n>` commands remain available.
+- `issue list [--parent <n>] [--state open|closed|all] [--json]` filters by direct
+  parent and state; the default state filter is `all` (preserves existing list
+  behavior). `issue show <n> [--json]` displays one Issue.
+- JSON keeps the existing fields and adds `key` (string or null), `parent`
+  (Issue id or null), `blocked_by` (Issue ids), and `blocked` (boolean). Show
+  also adds `children` (direct child Issue ids). Compute `blocked` against the
+  complete graph, not a filtered list: it is true if any referenced blocker is
+  open, and false for an empty blocker array. Children are derived from all
+  parent links. An open, unblocked child is the executor's frontier.
 
 ### PR Lifecycle (L1: immutable snapshot)
 

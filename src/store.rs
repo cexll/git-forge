@@ -18,6 +18,8 @@ use std::process::Command;
 use git2::{Commit, Error as GitError, Oid, Repository, Signature, TreeBuilder, TreeEntry};
 
 use crate::event::{Event, EventKind, JsonValue};
+mod issue_batch;
+pub(crate) use issue_batch::IssueSnapshot;
 
 /// The single mutable counter ref holding the next sequential id.
 pub const COUNTER_REF: &str = "refs/forge/meta/counter";

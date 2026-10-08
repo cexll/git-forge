@@ -1,1 +1,1 @@
-[{"id":1,"title":"dogfood bug","open":true},{"id":2,"title":"closed one","open":false}]
+[{"id":1,"title":"dogfood bug","open":true,"key":null,"parent":null,"blocked_by":[],"blocked":false},{"id":2,"title":"closed one","open":false,"key":null,"parent":null,"blocked_by":[],"blocked":false}]

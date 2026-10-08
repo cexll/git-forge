@@ -34,12 +34,12 @@ Every row above points at what actually runs. Rows marked review-only are not ma
 
 Local, git-native forge: issues, pull requests, review, and merge inside an ordinary git repository — git protocol only, zero resident processes, no GitHub synchronization. Commands surface as `git forge ...` plus thin `git issue`/`git pr` wrappers. L1 is single-user, single-machine, single repository.
 
-- **Primary consumers**: the developer (CLI), and the devflow multi-agent pipeline that implements the L1 feature plan.
+- **Primary consumers**: the developer (CLI), and AI planners/executors authoring declarative Issue plans and consuming the Issue graph.
 - **Lifecycle**: months-scale MVP (L1 milestone, L2 features deferred).
 - **Team scale**: single developer + AI agents.
 - **Strictness profile**: L3 (strict) — chosen explicitly at init; thresholds live in `constraints.yaml`. Re-run `eng-init` to change the profile; do not relax individual gates ad hoc.
-- **AI tools targeting this repo**: devflow (`implement` skill) as mission orchestrator; `eng-init` maintains this harness.
-- **Domain language**: `CONTEXT.md` is the canonical glossary (Issue, PR, Forge Event, Event Chain, Review, Forge Ref, Counter Ref, Merge Gate). Check it before naming domain concepts.
+- **AI tools targeting this repo**: agents use the native forge CLI for Issue plans and PR execution; `eng-init` maintains this harness. Historical devflow mission records are retained, not a current integration requirement.
+- **Domain language**: `CONTEXT.md` is the canonical glossary (Issue, Issue Key, Issue Parent, Blocking Edge, Issue Plan, PR, Forge Event, Event Chain, Review, Forge Ref, Counter Ref, Merge Gate). Check it before naming domain concepts.
 
 ## Stack & Versions
 
@@ -76,9 +76,12 @@ git-forge/
 │   └── architecture/git-forge.md   # WIRE CONTRACT — normative
 ├── src/
 │   ├── main.rs           # `git forge` entry binary
-│   ├── lib.rs            # module root: declares ci, cli, event, fold, git, identity, issue, merge_state, pr_merge, store
+│   ├── lib.rs            # module root: declares ci, cli, event, fold, git, identity, issue, issue_plan, issue_apply, merge_state, pr_merge, store
 │   ├── cli.rs            # shared CLI plumbing + pr/ci command surfaces + dispatch
-│   ├── issue.rs          # issue command surface (t1b): new/list/show/comment/close/reopen
+│   ├── issue.rs          # issue command surface: new/apply/list/show/comment/close/reopen
+│   ├── issue_plan.rs     # strict Markdown plan parser + graph validation + diff
+│   ├── issue_apply.rs    # complete graph snapshot + atomic plan publication
+│   ├── store/issue_batch.rs # graph snapshot + atomic batch ref publication
 │   ├── merge_state.rs     # merge-gate predicate + finalize transaction construction
 │   ├── pr_merge.rs       # cmd_pr_merge orchestration (worktree lifecycle) + pending-result cleanup
 │   ├── ci.rs + ci/       # CI plan runner; ci/validate.rs = justfile fallback validator (F-012)
@@ -98,10 +101,10 @@ git-forge/
 | core (pure) | `src/event.rs`, `src/fold.rs` | std only | git2, I/O |
 | store | `src/store.rs` | core | — |
 | git adapter | `src/git.rs` | git2 only | core, cli (merge-gate predicate stays in merge_state) |
-| cli | `src/cli.rs`, `src/issue.rs`, `src/merge_state.rs`, `src/pr_merge.rs`, `src/ci.rs`, `src/identity.rs`, `src/main.rs` | core, store, git | — |
+| cli | `src/cli.rs`, `src/issue.rs`, `src/issue_plan.rs`, `src/issue_apply.rs`, `src/merge_state.rs`, `src/pr_merge.rs`, `src/ci.rs`, `src/identity.rs`, `src/main.rs` | core, store, git | — |
 
 - `core` has zero external dependencies and no I/O — enforced by clippy? No: enforced by review; `Cargo.toml` stays dep-free for the core slice.
-- Wire contract (`docs/architecture/git-forge.md`) is normative for ref layout, event JSON schema v1, counter CAS, and merge semantics. When in doubt, the architecture doc wins.
+- Wire contract (`docs/architecture/git-forge.md`) is normative for ref layout, event JSON schema v1, strict Issue plan format, complete-graph snapshot/CAS, counter allocation, and merge semantics. When in doubt, the architecture doc wins.
 
 ## Development Workflow
 
@@ -209,7 +212,7 @@ White-box review required for changes touching these (L3): `src/store.rs` (git2 
 ## Agent Operating Rules
 
 - **Read this file, `CONTEXT.md`, and `docs/architecture/git-forge.md` before working.**
-- Devflow mission state is scheduler-owned: never edit `.specs/*/missions/` files (`state.json`, `runtime.json`, `progress_log.jsonl`, `validation-state.json`, handoffs) directly. The plan-of-record `features.json` lives at `.specs/<session>/features.json` and is planDigest-pinned — committed plan, not mission state. State changes go only through `devflow.cjs` subcommands (`end-feature`, `record-verdicts`, `reconcile`, …).
+- Historical devflow mission runtime is scheduler-owned: never edit `.specs/*/missions/` files (`state.json`, `runtime.json`, `progress_log.jsonl`, `validation-state.json`, handoffs) directly. New spec-driven work uses native `issue apply` and the Issue graph; the historical mission artifacts are not a companion runtime dependency.
 - Never submit a receipt that is not backed by real work: a success receipt requires a real commit with a non-empty diff; a validation receipt requires per-assertion evidence. Faking a receipt is a trust violation.
 - Before reporting failure, revert your own edits — the scheduler refuses to spawn into a dirty worktree.
 - Evidence: verification claims require fresh evidence from the current session (command + exit code + output). No "I ran it before" claims.

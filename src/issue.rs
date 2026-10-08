@@ -29,12 +29,14 @@ fn issue_event(kind: EventKind, id: u64, actor: &str, body: HashMap<String, Json
 
 /// `git forge issue new <title> [description]`
 fn cmd_new(args: &[String]) -> Result<String, String> {
-    const USAGE: &str = "usage: git forge issue new <title> [description] [--label <x>]...";
+    const USAGE: &str = "usage: git forge issue new <title> [description] [--label <x>]... [--parent <n>] [--blocked-by <n>]... [--json]";
     // Pure argument validation first — a usage error must not be masked by a
     // later config-open failure (error precedence, F-028). Supports
     // `--label <x>` (repeatable) alongside the positional `<title> [description]`.
     let (json, args) = machine::json_requested(args);
     let mut labels: Vec<String> = Vec::new();
+    let mut parent = None;
+    let mut blocked_by = Vec::new();
     let mut positional: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -57,6 +59,21 @@ fn cmd_new(args: &[String]) -> Result<String, String> {
                 }
                 labels.push(v);
             }
+            "--parent" | "--blocked-by" => {
+                let flag = args[i].as_str();
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| format!("{flag} requires an issue id"))?;
+                let id = parse_entity_id(value)?;
+                if flag == "--parent" {
+                    if parent.replace(id).is_some() {
+                        return Err("--parent may only be specified once".into());
+                    }
+                } else {
+                    blocked_by.push(id);
+                }
+            }
             a if a.starts_with('-') => return Err(format!("unknown option '{a}'; {USAGE}")),
             _ => positional.push(args[i].clone()),
         }
@@ -76,43 +93,58 @@ fn cmd_new(args: &[String]) -> Result<String, String> {
         .get(1)
         .map(|d| d.trim().to_string())
         .filter(|d| !d.is_empty());
-    // Identity + open + bind — malformed .git/config surfaces here as a clean
-    // CLI error (git binary resolver), never as an libgit2 open/SIGSEGV.
-    let (store, actor) = open_mutation_store()?;
-    let id = store.allocate_id().map_err(|e| e.to_string())?;
-    let mut body = body_obj(&[("title", json_str(&title))]);
-    if let Some(d) = &description {
-        body.insert("description".into(), json_str(d));
-    }
-    if !labels.is_empty() {
-        body.insert("labels".into(), crate::event::json_string_array(&labels));
-    }
-    let ev = issue_event(EventKind::IssueCreated, id, &actor, body);
-    store
-        .append_event(&crate::store::issue_ref(id), &ev)
-        .map_err(|e| e.to_string())?;
-    if json {
-        // The allocated issue id (the machine surface's reason to exist) plus
-        // the folded-equivalent state, rendered from the same values persisted.
-        return Ok(machine::issue_json(&crate::event::IssueState {
-            id,
-            title: Some(title),
-            description,
-            labels,
-            open: true,
-            comments: Vec::new(),
-        }));
-    }
-    Ok(format!("issue #{id} created: {title}"))
+    crate::issue_apply::new_issue(title, description, labels, parent, blocked_by, json)
 }
 
 /// `git forge issue list`
 fn cmd_list(store: &EventStore, args: &[String]) -> Result<String, String> {
+    const USAGE: &str =
+        "usage: git forge issue list [--parent <n>] [--state open|closed|all] [--json]";
     let (json, args) = machine::json_requested(args);
-    machine::reject_leftover_flags(&args, "usage: git forge issue list")?;
-    let states = machine::fold_all_issues(store)?;
+    let mut parent = None;
+    let mut desired_state = "all";
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--parent" => {
+                i += 1;
+                let value = args
+                    .get(i)
+                    .ok_or_else(|| "--parent requires an issue id".to_string())?;
+                if parent.replace(parse_entity_id(value)?).is_some() {
+                    return Err("--parent may only be specified once".into());
+                }
+            }
+            "--state" => {
+                i += 1;
+                desired_state = args
+                    .get(i)
+                    .map(String::as_str)
+                    .ok_or_else(|| "--state requires open, closed, or all".to_string())?;
+                if !matches!(desired_state, "open" | "closed" | "all") {
+                    return Err(format!(
+                        "invalid --state '{desired_state}'; expected open, closed, or all"
+                    ));
+                }
+            }
+            _ => machine::reject_leftover_flags(&args[i..=i], USAGE)?,
+        }
+        i += 1;
+    }
+    let all = machine::fold_all_issues(store)?;
+    let states: Vec<_> = all
+        .iter()
+        .filter(|state| {
+            parent.is_none_or(|id| state.parent == Some(id))
+                && match desired_state {
+                    "open" => state.open,
+                    "closed" => !state.open,
+                    _ => true,
+                }
+        })
+        .collect();
     if json {
-        return Ok(machine::issue_list_json(&states));
+        return Ok(machine::issue_list_json(&states, &all));
     }
     let mut out = String::new();
     for state in &states {
@@ -132,7 +164,10 @@ fn cmd_list(store: &EventStore, args: &[String]) -> Result<String, String> {
 /// `git forge issue show <n>`
 fn cmd_show(store: &EventStore, args: &[String]) -> Result<String, String> {
     let (json, args) = machine::json_requested(args);
-    machine::reject_leftover_flags(&args[1..], "usage: git forge issue show <n>")?;
+    machine::reject_leftover_flags(
+        args.get(1..).unwrap_or(&[]),
+        "usage: git forge issue show <n>",
+    )?;
     let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
     let r = crate::store::issue_ref(id);
     if !store_has_ref(store, &r) {
@@ -143,8 +178,9 @@ fn cmd_show(store: &EventStore, args: &[String]) -> Result<String, String> {
         return Err(format!("issue #{id} has no events"));
     }
     let state = crate::event::fold(&chain).issue;
+    let all = machine::fold_all_issues(store)?;
     if json {
-        return Ok(machine::issue_json(&state));
+        return Ok(machine::issue_json(&state, &all));
     }
     let mut out = format!(
         "#{} {} — {}\n",
@@ -160,6 +196,14 @@ fn cmd_show(store: &EventStore, args: &[String]) -> Result<String, String> {
             "labels: {}\n",
             sanitize_terminal(&state.labels.join(", "))
         ));
+    }
+    let children: Vec<_> = all
+        .iter()
+        .filter(|issue| issue.parent == Some(state.id))
+        .map(|issue| format!("#{}", issue.id))
+        .collect();
+    if !children.is_empty() {
+        out.push_str(&format!("children: {}\n", children.join(", ")));
     }
     out.push('\n');
     if !state.comments.is_empty() {
@@ -249,6 +293,9 @@ pub fn run_issue(argv: &[String]) -> Result<String, String> {
     }
     match sub {
         "new" => cmd_new(&argv[1..]),
+        "apply" => {
+            crate::issue_apply::cmd_apply(&argv[1..]).map_err(|error| sanitize_terminal(&error))
+        }
         "list" => cmd_list(&open_store()?, &argv[1..]),
         "show" => cmd_show(&open_store()?, &argv[1..]),
         "comment" => cmd_comment(&argv[1..]),
@@ -268,8 +315,9 @@ pub fn run_issue(argv: &[String]) -> Result<String, String> {
 
 fn issue_sub_usage(sub: &str) -> Option<&'static str> {
     Some(match sub {
-        "new" => "usage: git forge issue new <title> [description] [--label <x>]...",
-        "list" => "usage: git forge issue list",
+        "new" => "usage: git forge issue new <title> [description] [--label <x>]... [--parent <n>] [--blocked-by <n>]... [--json]",
+        "apply" => "usage: git forge issue apply <dir|file> [--dry-run] [--json]",
+        "list" => "usage: git forge issue list [--parent <n>] [--state open|closed|all] [--json]",
         "show" => "usage: git forge issue show <n>",
         "comment" => "usage: git forge issue comment <n> <body>",
         "close" => "usage: git forge issue close <n>",
@@ -279,10 +327,11 @@ fn issue_sub_usage(sub: &str) -> Option<&'static str> {
 }
 
 fn issue_help() -> String {
-    "usage: git forge issue <new|list|show|comment|close|reopen> ...\n\
+    "usage: git forge issue <new|apply|list|show|comment|close|reopen> ...\n\
      \nsubcommands:\n\
-     \x20 new <title> [description] [--label <x>]...\n\
-     \x20 list\n\
+     \x20 new <title> [description] [--label <x>]... [--parent <n>] [--blocked-by <n>]... [--json]\n\
+     \x20 apply <dir|file> [--dry-run] [--json]\n\
+     \x20 list [--parent <n>] [--state open|closed|all] [--json]\n\
      \x20 show <n>\n\
      \x20 comment <n> <body>\n\
      \x20 close <n>\n\

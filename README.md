@@ -15,7 +15,7 @@ Requests tabs stay unused. A web view is deferred L2 roadmap.
 
 ## What it does
 
-- **Issues**: sequential ids via an atomic counter CAS, comments, close/reopen. `pr create --closes <n>` links a PR to an Issue, and a successful merge closes it in the same ref transaction as the branch advance.
+- **Issues**: sequential ids via an atomic counter CAS, comments, close/reopen, parent/spec links and blocking edges. `issue apply` validates and atomically publishes declarative Markdown plans, matching stable repository-wide keys for idempotent re-apply. `pr create --closes <n>` links a PR to an Issue, and a successful merge closes it in the same ref transaction as the branch advance.
 - **Pull requests**: immutable snapshots (`source_ref`/`base_ref`/`source_head`/
   `base_head`/`merge_base`), list/show/three-dot diff, whole-PR and
   commit-anchored inline reviews (`--approve`/`--reject`).
@@ -44,7 +44,7 @@ Requests tabs stay unused. A web view is deferred L2 roadmap.
   merge result against the CURRENT base tip and pins it as an immutable
   candidate; `ci run` and `pr review --approve` then validate and authorize
   exactly that candidate, and `pr merge` finalizes it atomically.
-- **Machine interface (t7)**: `--json` on `issue new/list/show`,
+- **Machine interface (t7)**: `--json` on `issue new/apply/list/show`,
   `pr create/list/show`, and `ci run` emits stable machine-readable results
   (allocated ids included); `git forge version` prints a semver and exits 0
   — automation version-gates on it instead of parsing prose.
@@ -97,8 +97,11 @@ argv[0]-dispatch wrappers over the same binary.
 ```sh
 # issues
 git forge issue new "track a bug"        # -> issue #1
-git forge issue list
-git forge issue show 1
+git forge issue new "implement slice" --parent 1 --blocked-by 1 --json
+git forge issue apply plans/ --dry-run --json
+git forge issue apply plans/ --json
+git forge issue list --parent 1 --state open --json
+git forge issue show 1 --json
 git forge issue comment 1 "noted"
 git forge issue close 1 && git forge issue reopen 1
 
@@ -131,6 +134,53 @@ the merge refreshes it to the result commit — while a stale base, a dirty
 base worktree, or a source not sitting directly on the snapshot base (for
 `--ff`) refuses, and it finalizes base + PR chain atomically in one ref
 transaction.
+
+## Declarative issue plans
+
+Use one parent Issue for the spec and child Issues for vertical-slice tickets.
+Each plan file declares a stable repository-wide `key`, a required non-empty
+`title`, and the desired metadata. Keys refer to other entries in the same apply;
+quoted `"#<n>"` references target existing Issues.
+
+```markdown
+---
+key: project-schema
+title: Store tickets
+parent: project-spec
+blocked_by: [project-api, "#12"]
+labels: [ready-for-agent]
+state: open
+---
+Implement the schema slice.
+```
+
+`project-spec` and `project-api` must also be entries in that apply, and Issue
+`#12` must already exist. A directory reads only directly contained regular `.md`
+files, sorted by filename, ignoring symlinks within directories. Frontmatter is
+a strict small format, not general YAML: inline arrays of scalar strings,
+optional single/double quotes, and comments at unquoted whitespace followed by
+`#`. Double quoted strings support JSON escapes; single quoted strings cannot
+contain an internal single quote. Quote scalars containing brackets, commas or
+quotes, and always quote existing `"#n"` references. Unknown/duplicate fields and
+malformed values fail with file/field diagnostics.
+The Markdown after the closing delimiter is the exact description, untrimmed.
+
+Omitted `labels`, `parent`, and `blocked_by` clear them. Omitted `state` preserves
+an existing Issue's state; a new Issue starts open. Explicit `open` or `closed`
+enforces that state. Re-apply computes create/update/unchanged per key; a no-op
+writes no events and consumes no ids. `--dry-run` returns the same diff without
+publishing it. The apply validates the complete resulting graph and publishes
+all changes in one ref transaction, checking every read graph tip and the counter
+with CAS. Duplicate keys, unknown references, self-blocking and graph cycles
+reject the whole apply with nothing published.
+Apply JSON is a plain array of `{key, id, action, changed_fields}` objects;
+prospective ids follow filename order and dry-run ids are tentative.
+
+Issue JSON exposes `key`, `parent`, `blocked_by`, and computed `blocked`; show
+also exposes derived `children`. An open ticket with `blocked: false` is ready
+for execution. Close tickets with `pr create --closes <n>` on successful merge,
+or keep using the individual new/comment/close/reopen commands. Full format,
+event and transaction rules: [wire contract](docs/architecture/git-forge.md).
 
 ## Design
 

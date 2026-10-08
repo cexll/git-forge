@@ -65,7 +65,7 @@ fn run_forge(argv: &[String]) -> Result<String, String> {
 fn top_help() -> String {
     "usage: git forge <issue|pr|ci> ...\n\
      \nsubcommands:\n\
-     \x20 issue  new|list|show|comment|close|reopen\n\
+     \x20 issue  apply|new|list|show|comment|close|reopen\n\
      \x20 pr     create|list|show|comment|review|diff|merge\n\
      \x20 ci     run <n>\n\
      \x20 version\n\

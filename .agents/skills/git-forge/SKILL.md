@@ -28,17 +28,73 @@ Verify with `git-forge --help` (direct binary, exit 0) or a non-leading form lik
 ### Issues — `git forge issue <sub>` (or `git issue <sub>`)
 
 ```
-new <title> [description] [--label <x>]...   # create; prints `issue #<n> created: <title>` (sequential id)
-list                                         # all issues, folded state
-show <n>                                     # state (open/closed), title, comments
+new <title> [description] [--label <x>]... [--parent <n>] [--blocked-by <n>]... [--json]
+apply <dir|file> [--dry-run] [--json]          # atomic, idempotent declarative issue graph
+list [--parent <n>] [--state open|closed|all] [--json]
+show <n> [--json]                            # state, metadata, graph, comments
 comment <n> <body>
 close <n>  /  reopen <n>
 ```
 
+### Declarative issue plans
+
+Use one parent Issue for the spec and child Issues for vertical-slice tickets. A
+ticket's `blocked_by` edges identify the Issues that must close first. Author
+the whole graph, inspect the diff, then apply it once:
+
+```sh
+git forge issue apply plans/ --dry-run --json
+git forge issue apply plans/ --json
+git forge issue list --parent <spec-id> --state open --json
+git forge issue show <ticket-id> --json
+```
+
+Each `.md` file has strict frontmatter, followed by the exact description body:
+
+```markdown
+---
+key: project-schema
+title: Store tickets
+parent: project-spec
+blocked_by: [project-api, "#12"]
+labels: [ready-for-agent]
+state: open
+---
+Implement the schema slice.
+```
+
+`key` and a non-empty `title` are required. Keys are stable repository-wide
+identities: reuse a key to update its existing Issue, not to create another one.
+References are other keys in this apply or quoted existing Issue ids (`"#12"`).
+Directories read only directly contained regular `.md` files, sorted by filename;
+symlinks within directories are ignored. Arrays are inline scalar strings with
+optional single/double quotes; comments start at unquoted whitespace followed
+by `#`. Double quotes support JSON escapes; single quotes cannot contain an
+internal single quote. Quote scalar titles/labels containing brackets, commas
+or quotes. This is not general YAML: unknown/duplicate fields, nested values,
+and malformed frontmatter fail before any write.
+
+Omitted `labels`, `parent`, and `blocked_by` clear those fields. Omitted `state`
+preserves an existing Issue's open/closed state; a new Issue starts open.
+Explicit `state: open|closed` enforces that state. The body is not trimmed or
+rewritten. Re-apply with no differences writes no events and consumes no ids.
+Validation covers the complete resulting graph, including existing Issues;
+unknown references, duplicate keys, self edges and cycles refuse the apply.
+One ref transaction verifies all read graph tips and the counter, then publishes
+every change or none. `--dry-run` publishes nothing.
+
+JSON adds `key`, `parent`, `blocked_by`, and computed `blocked` (any blocker is
+open); show also includes derived `children`. Select the frontier from open
+tickets whose `blocked` is false. Create the implementation PR with
+`--closes <ticket-id>` so a successful merge closes the ticket atomically.
+See the wire contract for the complete parser, event, and transaction rules.
+Apply JSON is a plain array of `{key, id, action, changed_fields}` objects in
+filename order; dry-run ids are tentative.
+
 ### Pull requests — `git forge pr <sub>` (or `git pr <sub>`)
 
 ```
-create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]...
+create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]... [--closes <n>] [--json]
 list
 show <n>                                     # snapshot fields + generation + effective review decision + CI status
 comment <n> <body>
@@ -89,6 +145,3 @@ git forge issue close <n>                               # 8. close the loop on t
 
 Normative wire contract (ref layout, event JSON schema v1, counter CAS, merge semantics): `docs/architecture/git-forge.md`. Glossary: `CONTEXT.md`. Legacy rationale: `docs/adr/`.
 
-## Optional Issue workflow companion
-
-See `docs/issue-workflow-bridge.md` for `git forge-workflow`. It delegates to devflow and does not change native L1 refs or introduce a native `issue sync` subcommand.

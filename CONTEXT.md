@@ -4,7 +4,15 @@
 
 ### Entities
 
-**Issue** — a tracked request, defect, or discussion item on the repository. Its state is derived by replaying its event chain. A devflow **Ticket** is not an Issue: the Ticket is the authored vertical slice, and an Issue is the tracking projection filed against it. _Avoid_: bug, task.
+**Issue** — a tracked request, defect, or discussion item on the repository. Its state is derived by replaying its event chain. In spec-driven work, a parent Issue represents the spec and child Issues represent authored vertical-slice tickets. _Avoid_: bug, task.
+
+**Issue Key** — an optional stable, repository-wide identity stored on an Issue by declarative apply. Re-applying a key updates the same Issue regardless of the plan's path. Distinct from the sequential Issue id. _Avoid_: filename, session-local key.
+
+**Issue Parent** — the Issue representing a child's spec; `parent` stores its Issue id. Children are derived from parent links, not stored on the parent. Parent links must be acyclic. _Avoid_: blocker, owner.
+
+**Blocking Edge** — a directed `blocked_by` reference from a ticket Issue to an Issue that must close first. An Issue is blocked while any referenced blocker is open; blocking edges must be acyclic and cannot reference the Issue itself. Parent and blocking links are independent. _Avoid_: parent, execution order.
+
+**Issue Plan** — one Markdown file or a nonrecursive, filename-sorted directory of Markdown files with the .md extension describing the desired Issue graph. `issue apply` validates and diffs the complete graph before publishing the plan in one atomic ref transaction. _Avoid_: mission runtime, general YAML.
 
 **Pull Request (PR)** — a proposal to merge a set of commits from a source ref into a base ref, carrying review events and merge state. Its state is derived by replaying its event chain. _Avoid_: merge request.
 

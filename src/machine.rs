@@ -111,33 +111,70 @@ fn str_array(items: &[String]) -> String {
 
 // ─────────────────────────── issue schemas ───────────────────────────
 
-/// `issue new --json` / `issue show --json` result.
-pub(crate) fn issue_json(state: &crate::event::IssueState) -> String {
+fn id_array(ids: impl Iterator<Item = u64>) -> String {
+    let mut out = String::from("[");
+    for (index, id) in ids.enumerate() {
+        if index != 0 {
+            out.push(',');
+        }
+        out.push_str(&num(id));
+    }
+    out.push(']');
+    out
+}
+
+fn issue_blocked(state: &crate::event::IssueState, all: &[crate::event::IssueState]) -> bool {
+    state
+        .blocked_by
+        .iter()
+        .any(|id| all.iter().any(|issue| issue.id == *id && issue.open))
+}
+
+/// `issue new --json` / `issue show --json` result, with derived graph fields.
+pub(crate) fn issue_json(
+    state: &crate::event::IssueState,
+    all: &[crate::event::IssueState],
+) -> String {
     format!(
-        "{{\"id\":{},\"title\":{},\"description\":{},\"labels\":{},\"open\":{},\"comments\":{}}}",
+        "{{\"id\":{},\"title\":{},\"description\":{},\"labels\":{},\"open\":{},\"comments\":{},\"key\":{},\"parent\":{},\"blocked_by\":{},\"children\":{},\"blocked\":{}}}",
         num(state.id),
         opt_str(state.title.as_deref()),
         opt_str(state.description.as_deref()),
         str_array(&state.labels),
         state.open,
         str_array(&state.comments),
+        opt_str(state.key.as_deref()),
+        state.parent.map(num).unwrap_or_else(|| "null".into()),
+        id_array(state.blocked_by.iter().copied()),
+        id_array(all.iter().filter(|issue| issue.parent == Some(state.id)).map(|issue| issue.id)),
+        issue_blocked(state, all),
     )
 }
 
-/// `issue list --json` result: one compact issue object per line, in id order.
-pub(crate) fn issue_list_json(states: &[crate::event::IssueState]) -> String {
+/// `issue list --json` result in id order; blockers derive from the unfiltered graph.
+pub(crate) fn issue_list_json(
+    states: &[&crate::event::IssueState],
+    all: &[crate::event::IssueState],
+) -> String {
+    let open_ids: std::collections::HashSet<_> = all
+        .iter()
+        .filter(|issue| issue.open)
+        .map(|issue| issue.id)
+        .collect();
     let mut out = String::from("[");
-    let mut first = true;
-    for s in states {
-        if !first {
+    for (index, state) in states.iter().enumerate() {
+        if index != 0 {
             out.push(',');
         }
-        first = false;
         out.push_str(&format!(
-            "{{\"id\":{},\"title\":{},\"open\":{}}}",
-            num(s.id),
-            opt_str(s.title.as_deref()),
-            s.open,
+            "{{\"id\":{},\"title\":{},\"open\":{},\"key\":{},\"parent\":{},\"blocked_by\":{},\"blocked\":{}}}",
+            num(state.id),
+            opt_str(state.title.as_deref()),
+            state.open,
+            opt_str(state.key.as_deref()),
+            state.parent.map(num).unwrap_or_else(|| "null".into()),
+            id_array(state.blocked_by.iter().copied()),
+            state.blocked_by.iter().any(|id| open_ids.contains(id)),
         ));
     }
     out.push(']');
@@ -285,4 +322,40 @@ pub(crate) fn fold_all_issues(store: &EventStore) -> Result<Vec<crate::event::Is
 /// The prose/JSON `pr list` scan, in id order.
 pub(crate) fn fold_all_prs(store: &EventStore) -> Result<Vec<crate::event::PrState>, String> {
     fold_all(store, crate::store::pr_head_ref, |s| s.pr.clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{issue_json, issue_list_json};
+    use crate::event::IssueState;
+
+    #[test]
+    fn filtered_issue_json_uses_all_issues_for_blocked_and_children() {
+        let mut all = vec![
+            IssueState {
+                id: 1,
+                open: true,
+                ..IssueState::default()
+            },
+            IssueState {
+                id: 2,
+                parent: Some(1),
+                blocked_by: vec![3],
+                open: true,
+                ..IssueState::default()
+            },
+            IssueState {
+                id: 3,
+                open: true,
+                ..IssueState::default()
+            },
+        ];
+        let listed = issue_list_json(&[&all[1]], &all);
+        assert!(listed.contains("\"blocked_by\":[3],\"blocked\":true"));
+        assert!(!listed.contains("\"id\":3"));
+        assert!(issue_json(&all[0], &all).contains("\"children\":[2]"));
+        all[2].open = false;
+        assert!(issue_list_json(&[&all[1]], &all).contains("\"blocked\":false"));
+        assert!(issue_json(&all[1], &all).contains("\"blocked\":false"));
+    }
 }
