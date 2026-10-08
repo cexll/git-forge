@@ -1,6 +1,11 @@
 # Forge-pipeline adapter contract: one embedded owner, labelled projections, mirrored events
 
-Status: active
+Status: superseded by docs/decisions/implemented/feature/declarative-issue-plans-and-graph.md
+
+The runtime-specific instructions below are historical, not current operational
+guidance. The successor record governs native Issue filing, stable identity and
+the spec/ticket execution workflow; it does not replace independent PR recovery
+decisions recorded elsewhere. The original rationale is retained.
 
 ## Problem
 
