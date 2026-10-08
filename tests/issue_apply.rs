@@ -165,6 +165,55 @@ fn quoted_keys_resolve_parent_and_blocker_references() {
 }
 
 #[test]
+fn new_description_omission_matches_master_human_output() {
+    let repo = Repo::new();
+    // Captured from master: omitted and empty positional descriptions are absent.
+    for (id, args, expected, description) in [
+        (
+            1,
+            vec!["issue", "new", "Ticket"],
+            "#1 Ticket — open\n",
+            None,
+        ),
+        (
+            2,
+            vec!["issue", "new", "Empty", ""],
+            "#2 Empty — open\n",
+            None,
+        ),
+        (
+            3,
+            vec!["issue", "new", "Detailed", "Body"],
+            "#3 Detailed — open\ndescription: Body\n",
+            Some("Body"),
+        ),
+    ] {
+        repo.ok(&args);
+        assert_eq!(repo.ok(&["issue", "show", &id.to_string()]), expected);
+        let store = EventStore::open(&repo.0).unwrap();
+        let chain = store.read_chain(&issue_ref(id)).unwrap();
+        assert_eq!(
+            git_forge::event::fold(&chain).issue.description.as_deref(),
+            description
+        );
+        assert_eq!(
+            chain[0].body.contains_key("description"),
+            description.is_some()
+        );
+    }
+    let plan = repo.plan("empty-body.md", &entry("empty-body", "", ""));
+    repo.ok(&["issue", "apply", path_str(&plan)]);
+    let store = EventStore::open(&repo.0).unwrap();
+    assert_eq!(
+        git_forge::event::fold(&store.read_chain(&issue_ref(4)).unwrap())
+            .issue
+            .description
+            .as_deref(),
+        Some("")
+    );
+}
+
+#[test]
 fn metadata_diff_only_appends_updated_and_state_omission_preserves_closed() {
     let repo = Repo::new();
     let dir = graph(&repo);

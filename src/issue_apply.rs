@@ -140,7 +140,7 @@ fn record(plan: &mut Plan, state: IssueState, old: Option<&IssueState>, actor: &
         (
             "description",
             JsonValue::String(state.description.clone().unwrap_or_default()),
-            old.is_none_or(|s| {
+            old.map_or(state.description.is_some(), |s| {
                 s.description.as_deref().unwrap_or("") != state.description.as_deref().unwrap_or("")
             }),
         ),

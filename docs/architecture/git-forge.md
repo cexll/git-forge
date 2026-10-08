@@ -184,6 +184,11 @@ Kinds and body fields:
 | `pr.abandoned` | pr | `{reason}` |
 | `ci.check` | pr | `{status: "pending"|"success"|"failed", plan?, generation, base_head, strategy?, result_commit?, result_tree?}` |
 
+For `issue new`, an omitted or empty positional description leaves the created
+event's `description` field absent. Human `issue show` omits the description
+line for that absent field. An apply plan's empty body is an explicit empty
+description and remains stored as `""`.
+
 `pr.review` and `ci.check` bind the `generation` they were taken against (t1) and the live `base_head` (t2); when a prepared candidate exists at the time of the event, both also bind the candidate identity (`strategy`, `result_commit`, `result_tree`). `pr.review` is anchored to optional `commit` + permission to include `file`/`line` for inline comment. Inline comments are immutable references to a snapshot commit; they never follow later diff changes.
 
 `pr.abandoned` makes the PR **terminal** (see PR Lifecycle): `reason` is the required abandonment text; the PR is then refused by `pr merge`, `pr review`, and `ci run` before any write, and no reopen exists — a reopened PR is a new entity.
