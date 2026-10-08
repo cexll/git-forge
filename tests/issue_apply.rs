@@ -567,6 +567,57 @@ fn new_does_not_retry_nonconflict_transaction_failure() {
 }
 
 #[test]
+fn new_propagates_noncas_failure_despite_concurrent_counter_movement() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = Repo::new();
+    let shims = repo.0.join("shims");
+    std::fs::create_dir(&shims).unwrap();
+    let attempts = shims.join("attempts");
+    let shim = shims.join("git");
+    std::fs::write(
+        &shim,
+        format!(
+            "#!/bin/bash\nif [[ \"$*\" == *'update-ref --stdin'* ]]; then\n  echo attempted >> '{}'\n  if [[ ! -e '{}'/competed ]]; then\n    touch '{}'/competed\n    PATH=/usr/bin:/bin '{}' issue new Competitor || exit $?\n    echo 'injected non-CAS failure' >&2\n    exit 73\n  fi\nfi\nexec /usr/bin/git \"$@\"\n",
+            attempts.display(),
+            shims.display(),
+            shims.display(),
+            env!("CARGO_BIN_EXE_git-forge"),
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_git-forge"))
+        .args(["issue", "new", "Requested"])
+        .current_dir(&repo.0)
+        .env(
+            "PATH",
+            format!("{}:{}", shims.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_FORGE_ROLE")
+        .output()
+        .unwrap();
+    assert!(
+        !output.status.success(),
+        "non-CAS failure was hidden: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("injected non-CAS failure"));
+    assert_eq!(std::fs::read_to_string(attempts).unwrap(), "attempted\n");
+    let store = EventStore::open(&repo.0).unwrap();
+    assert_eq!(store.counter_next().unwrap(), 2);
+    assert_eq!(
+        git_forge::event::fold(&store.read_chain(&issue_ref(1)).unwrap())
+            .issue
+            .title
+            .as_deref(),
+        Some("Competitor")
+    );
+    assert!(store.repo().find_reference(&issue_ref(2)).is_err());
+}
+
+#[test]
 fn cycle_diagnostic_names_changed_entry_not_unrelated_first_file() {
     let repo = Repo::new();
     let a = repo.plan("a.md", &entry("a", "", ""));

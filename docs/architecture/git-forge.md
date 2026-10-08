@@ -297,7 +297,10 @@ whole-graph validator and atomic graph publication, not separate edge rules.
 `issue apply` reports a conflict without retrying. Individual `issue new` keeps
 the existing three-attempt allocation bound: only an identified moved-ref CAS
 conflict retries, with a fresh complete snapshot, id and graph validation.
-Other transaction failures propagate without retrying.
+Other transaction failures propagate without retrying, even if another ref
+moves concurrently. Retry classification requires Git's expected-old-value
+rejection for a ref and expected value in the attempted transaction. Git runs
+with `LC_ALL=C`; unrecognized diagnostics fail closed without retrying.
 
 #### Individual commands and graph display
 

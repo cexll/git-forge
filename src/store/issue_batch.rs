@@ -83,19 +83,47 @@ impl BoundEventStore {
             let old = expected.map_or_else(|| ZERO_OID.into(), |tip| tip.to_string());
             lines.push(format!("update {} {tip} {old}", issue_ref(*id)));
         }
-        if let Err(error) = self.inner.run_update_ref_stdin(&lines) {
-            if self.inner.current_tip(COUNTER_REF)? != snapshot.counter_tip {
-                return Err(StoreError::CasConflict);
-            }
-            for id in snapshot.tips.keys().chain(changes.keys()) {
-                if self.inner.current_tip(&issue_ref(*id))? != snapshot.tips.get(id).copied() {
-                    return Err(StoreError::CasConflict);
-                }
-            }
-            return Err(error);
+        match self.inner.run_update_ref_stdin(&lines) {
+            Err(error) if expected_value_rejected(&error, &lines) => Err(StoreError::CasConflict),
+            result => result,
         }
-        Ok(())
     }
+}
+
+// Git has no structured update-ref error code. Only recognized expected-value
+// diagnostics for this transaction permit retry; unknown failures stay fatal.
+fn expected_value_rejected(error: &StoreError, lines: &[String]) -> bool {
+    let StoreError::Command(stderr) = error else {
+        return false;
+    };
+    lines.iter().any(|line| {
+        let mut fields = line.split_whitespace();
+        let operation = fields.next();
+        let Some(reference) = fields.next() else {
+            return false;
+        };
+        let expected = match operation {
+            Some("update") => fields.nth(1),
+            Some("verify") => fields.next(),
+            _ => None,
+        };
+        let Some(expected) = expected else {
+            return false;
+        };
+        let prefix = format!("fatal: prepare: cannot lock ref '{reference}': ");
+        let Some(reason) = stderr.strip_prefix(&prefix) else {
+            return false;
+        };
+        if expected == ZERO_OID {
+            return reason == "reference already exists";
+        }
+        reason
+            .strip_prefix("is at ")
+            .and_then(|s| s.split_once(" but expected "))
+            .is_some_and(|(actual, rejected)| {
+                rejected == expected && actual != expected && Oid::from_str(actual).is_ok()
+            })
+    })
 }
 
 #[cfg(test)]

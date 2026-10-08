@@ -224,6 +224,7 @@ impl EventStore {
             .arg(&self.git_dir)
             .arg("update-ref")
             .arg("--stdin")
+            .env("LC_ALL", "C")
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
