@@ -2,6 +2,7 @@
 use super::{
     build_merge_event, cleanup_pending_result, finalize_pr_merge, finish_merge_output,
     refresh_base_worktrees, stage_issue_close, validate_merge_gate_at, MergeFinalizeSpec,
+    MergeOutcome,
 };
 #[cfg(debug_assertions)]
 use super::{maybe_run_issue_stage_barrier, maybe_run_test_retry_barrier};
@@ -37,7 +38,7 @@ pub(crate) fn run_finalize(
     spec: MergeFinalizeSpec<'_>,
     lock_handle: &mut Option<std::fs::File>,
     tmp: &std::path::Path,
-) -> Result<String, CliError> {
+) -> Result<MergeOutcome, CliError> {
     let merge_event = build_merge_event(&spec);
     // Single `issue.close` event constructed ONCE (F-009 analogue): every
     // finalize attempt re-parents the SAME event to the then-current issue
@@ -57,7 +58,7 @@ pub(crate) fn run_finalize(
     let mut head_expected = spec.gate_head;
     let mut attempts = 0u32;
     let head = pr_head_ref(spec.id);
-    let (head_applied, applied_issue) = loop {
+    let (merge_event_oid, head_applied, applied_issue) = loop {
         // Stage the issue close for THIS attempt (fresh fold + fresh tip):
         // the CAS retry loop rebuilds the parent/expected tip every attempt
         // (t2), so an attempt that fails because the issue moved concurrently
@@ -87,7 +88,7 @@ pub(crate) fn run_finalize(
             maybe_run_issue_stage_barrier(store, &spec, attempts, lock_handle, tmp)?;
         }
         match finalize_pr_merge(store, &spec, &merge_event, head_expected, issue_stage) {
-            Ok(()) => break (head_expected, issue_stage),
+            Ok(merged) => break (merged, head_expected, issue_stage),
             Err(mut e) => {
                 // F-008: read the EXACT current head tip ONCE. The candidate we
                 // validate, fold, and CAS is the SAME OID — never a re-read tip
@@ -241,7 +242,7 @@ pub(crate) fn run_finalize(
     // base worktree to the result commit and roll the whole completion back
     // (never split) when a refresh fails. Detail in `refresh_base_worktrees`.
     refresh_base_worktrees(store, &spec, head_applied, applied_issue)?;
-    finish_merge_output(store, &spec).map_err(CliError::from)
+    finish_merge_output(store, &spec, merge_event_oid)
 }
 
 fn finalize_exhausted_error(mut error: CliError, pending: &str) -> CliError {

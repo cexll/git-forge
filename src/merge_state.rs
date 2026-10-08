@@ -355,7 +355,7 @@ pub(crate) fn finalize_pr_merge(
     merge_event: &Event,
     head_expected: Oid,
     issue_close: Option<(u64, Oid, Oid)>,
-) -> Result<(), CliError> {
+) -> Result<Oid, CliError> {
     let head_ref = pr_head_ref(spec.id);
     let head_new = write_unappended_event_commit(store, merge_event, head_expected)?;
     let result = pr_result_ref(spec.id);
@@ -380,16 +380,20 @@ pub(crate) fn finalize_pr_merge(
             issue_ref(issue_id)
         ));
     }
-    store.store().run_update_ref_stdin(&lines).map_err(|error| {
-        let message = error.to_string();
-        let mut classified = if crate::store::expected_value_rejected(&error, &lines) {
-            CliError::from(StoreError::CasConflict)
-        } else {
-            CliError::from(error)
-        };
-        classified.message = message;
-        classified
-    })
+    store
+        .store()
+        .run_update_ref_stdin(&lines)
+        .map(|()| head_new)
+        .map_err(|error| {
+            let message = error.to_string();
+            let mut classified = if crate::store::expected_value_rejected(&error, &lines) {
+                CliError::from(StoreError::CasConflict)
+            } else {
+                CliError::from(error)
+            };
+            classified.message = message;
+            classified
+        })
 }
 
 /// The gate-validated inputs of one merge completion, captured at the gate
@@ -603,6 +607,37 @@ fn build_merge_event(spec: &MergeFinalizeSpec<'_>) -> Event {
     Event::new(EventKind::PrMerge, "pr", spec.id, spec.actor, merge_body)
 }
 
+/// A finalized merge: the PR is terminal and `merge_commit` is the new base
+/// tip. `state` is the PR lifecycle state folded at the applied `pr.merge`
+/// event. `recycle` holds the `--recycle-worktree` outcome when one was run.
+#[derive(Debug, PartialEq)]
+pub(crate) struct MergeOutcome {
+    pub id: u64,
+    pub state: &'static str,
+    pub base_ref: String,
+    pub strategy: String,
+    pub generation: u64,
+    pub merge_commit: String,
+    pub recycle: Option<String>,
+}
+
+impl MergeOutcome {
+    fn merged_line(&self) -> String {
+        format!(
+            "merged PR #{} into {} ({})",
+            self.id, self.base_ref, self.merge_commit
+        )
+    }
+
+    /// The human success line: the merged line, then the recycle outcome.
+    pub(crate) fn prose(&self) -> String {
+        match &self.recycle {
+            Some(recycle) => format!("{}; {recycle}", self.merged_line()),
+            None => self.merged_line(),
+        }
+    }
+}
+
 /// The #4 recycle epilogue, extracted from `run_finalize` (clippy
 /// too_many_lines): after base refresh (#3) and finalization, run the
 /// source-worktree recycle when `--recycle-worktree` was passed (recycle is
@@ -612,13 +647,20 @@ fn build_merge_event(spec: &MergeFinalizeSpec<'_>) -> Event {
 fn finish_merge_output(
     store: &BoundEventStore,
     spec: &MergeFinalizeSpec<'_>,
-) -> Result<String, String> {
-    let merged = format!(
-        "merged PR #{} into {} ({})",
-        spec.id, spec.base_ref, spec.result_commit
-    );
+    merge_event: Oid,
+) -> Result<MergeOutcome, CliError> {
+    let mut outcome = MergeOutcome {
+        id: spec.id,
+        state: crate::machine::pr_state_at(store.store(), merge_event)?,
+        base_ref: spec.base_ref.to_string(),
+        strategy: spec.strategy.to_string(),
+        generation: spec.generation,
+        merge_commit: spec.result_commit.to_string(),
+        recycle: None,
+    };
+    let merged = outcome.merged_line();
     let Some((target, force)) = spec.recycle else {
-        return Ok(merged);
+        return Ok(outcome);
     };
     let source_ref = spec
         .source_ref
@@ -637,14 +679,17 @@ fn finish_merge_output(
         spec.strategy,
         force,
     ) {
-        Ok(outcome) => Ok(format!("{merged}; {outcome}")),
+        Ok(recycle) => {
+            outcome.recycle = Some(recycle);
+            Ok(outcome)
+        }
         // CR-01 (code review): a recycle epilogue failure (phase-2 refused-dirty,
         // partial-leftover) does NOT undo the merge — the PR is terminal. Keep the
         // merged line in the error so the adapter can classify the outcome (its
         // contract: the merged line always precedes the recycle outcome, success
         // or failure); a bare Err would send a terminal merge into the adapter's
         // bridge-failure catch-all with the wrong remedy.
-        Err(recycle_err) => Err(format!("{merged}; {recycle_err}")),
+        Err(recycle_err) => Err(format!("{merged}; {recycle_err}").into()),
     }
 }
 
@@ -827,7 +872,7 @@ fn worktree_registered_path(repo_dir: &std::path::Path, target: &std::path::Path
 ///   4. on deadline, remove both sentinels best-effort and fail the merge with
 ///      no ref updates.
 #[cfg(debug_assertions)]
-fn run_test_barrier(env_key: &str) -> Result<(), String> {
+pub(crate) fn run_test_barrier(env_key: &str) -> Result<(), String> {
     use std::io::Write;
     let Ok(dir) = std::env::var(env_key) else {
         return Ok(());
@@ -929,4 +974,30 @@ fn maybe_run_test_issue_barrier(attempt: u32) -> Result<(), String> {
 #[cfg(debug_assertions)]
 fn maybe_run_test_retry_barrier() -> Result<(), String> {
     run_test_barrier("GIT_FORGE_TEST_MERGE_RETRY_BARRIER")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MergeOutcome;
+
+    /// The human success line stays byte-identical to the pre-JSON output:
+    /// the merged line, then `; <recycle outcome>` when a recycle ran.
+    #[test]
+    fn merge_outcome_prose_keeps_the_human_success_line() {
+        let mut outcome = MergeOutcome {
+            id: 7,
+            state: "merged",
+            base_ref: "main".into(),
+            strategy: "squash".into(),
+            generation: 2,
+            merge_commit: "0123abcd".into(),
+            recycle: None,
+        };
+        assert_eq!(outcome.prose(), "merged PR #7 into main (0123abcd)");
+        outcome.recycle = Some("recycle outcome: removed".into());
+        assert_eq!(
+            outcome.prose(),
+            "merged PR #7 into main (0123abcd); recycle outcome: removed"
+        );
+    }
 }

@@ -10,6 +10,8 @@ use crate::identity::open_mutation_store;
 pub(crate) fn cmd_pr_review(args: &[String]) -> Result<String, CliError> {
     const USAGE: &str =
         "usage: git forge pr review <n> --approve|--reject [--file <f> --line <l> --commit <c>]";
+    let (json, args) = crate::machine::json_requested(args);
+    let args = args.as_slice();
     let id = parse_entity_id(args.first().ok_or_else(|| CliError::usage(USAGE, ""))?)?;
     let mut decision = None;
     let mut file = None;
@@ -30,7 +32,7 @@ pub(crate) fn cmd_pr_review(args: &[String]) -> Result<String, CliError> {
             "--file" => file = Some(next_arg(&mut i, "--file requires a path")?),
             "--line" => line = Some(next_arg(&mut i, "--line requires a number")?),
             "--commit" => commit = Some(next_arg(&mut i, "--commit requires a hash")?),
-            "-h" | "--help" => return Ok(USAGE.into()),
+            h @ ("-h" | "--help") => return crate::cli::help_result(json, h, USAGE.into()),
             a if a.starts_with('-') => {
                 return Err(CliError::usage(format!("unknown option '{a}'"), a))
             }
@@ -145,6 +147,16 @@ pub(crate) fn cmd_pr_review(args: &[String]) -> Result<String, CliError> {
         body.insert("result_tree".into(), json_str(&c.result_tree));
     }
     let ev = Event::new(EventKind::PrReview, "pr", id, &actor, body);
-    store.append_event(&r, &ev).map_err(CliError::from)?;
+    let event = store.append_event(&r, &ev).map_err(CliError::from)?;
+    if json {
+        return Ok(crate::machine::pr_review_json(
+            id,
+            crate::machine::pr_state_at(store.store(), event)?,
+            &decision,
+            state.generation,
+            candidate_bind.as_ref().map(|c| c.result_commit.as_str()),
+            &event.to_string(),
+        ));
+    }
     Ok(format!("reviewed PR #{id} ({decision})"))
 }

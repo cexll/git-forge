@@ -46,8 +46,11 @@ Requests tabs stay unused. A web view is deferred L2 roadmap.
   exactly that candidate, and `pr merge` finalizes it atomically.
 - **Machine interface (t7)**: `--json` on `issue new/apply/list/show`,
   `pr create/list/show`, and `ci run` emits stable machine-readable results
-  (allocated ids included); `git forge version` prints a semver and exits 0
-  — automation version-gates on it instead of parsing prose.
+  (allocated ids included); `issue comment/close/reopen` and
+  `pr comment/review/update/prepare/merge/abandon/diff` print a JSON result
+  with the entity id, its resulting state, and the relevant commit ids;
+  `git forge version` prints a semver and exits 0 — automation version-gates
+  on it instead of parsing prose.
 - **Actor roles (t8)**: `GIT_FORGE_ROLE` (worker | reviewer | orchestrator)
   attributes events to a role; the merge gate refuses a self-approval when
   both sides carry roles. Per-worktree identity (`extensions.worktreeConfig`)

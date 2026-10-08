@@ -9,18 +9,18 @@
 use crate::cli_error::CliError;
 
 use crate::identity::{bind_identity, resolve_identity};
-use crate::store::EventStore;
 
 /// `git forge pr diff <n>` — three-dot diff from the immutable snapshot refs.
-pub(crate) fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String, CliError> {
+pub(crate) fn cmd_pr_diff(args: &[String]) -> Result<String, CliError> {
     // Same strict guard as `pr show`: one positional, no options — any
     // dash-leading leftover is a usage error naming the flag (VAL-202).
-    let (_, args) = crate::machine::json_requested(args);
+    let (json, args) = crate::machine::json_requested(args);
     let (id_arg, rest) = args
         .split_first()
         .ok_or_else(|| CliError::usage("usage: git forge pr diff <n> [--json]", ""))?;
     crate::machine::reject_leftover_flags(rest, "usage: git forge pr diff <n>")?;
     let id = crate::cli::parse_entity_id(id_arg)?;
+    let store = &crate::cli::open_store()?;
     let head = crate::store::pr_head_ref(id);
     if !crate::cli::store_has_ref(store, &head) {
         return Err(CliError::not_found(
@@ -93,6 +93,14 @@ pub(crate) fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String,
         })
         .into());
     }
+    if json {
+        return Ok(crate::machine::pr_diff_json(
+            &state,
+            &base_oid.to_string(),
+            &source_oid.to_string(),
+            &out,
+        ));
+    }
     Ok(out)
 }
 
@@ -107,8 +115,15 @@ pub(crate) fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String,
 // Baseline exemption (removal trigger in constraints.yaml baseline.lint_allow):
 // the sole lib/src function over the 150-line clippy::too_many_lines threshold.
 #[allow(clippy::too_many_lines)]
-pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String, CliError> {
-    let (_, args) = crate::machine::json_requested(args);
+pub(crate) fn cmd_pr_merge(args: &[String]) -> Result<String, CliError> {
+    let (json, args) = crate::machine::json_requested(args);
+    let render = |outcome: crate::merge_state::MergeOutcome| {
+        if json {
+            crate::machine::pr_merge_json(&outcome)
+        } else {
+            outcome.prose()
+        }
+    };
     let mut id_arg = None;
     let mut strategy: Option<&str> = None; // merge | squash | rebase
     let mut recycle: Option<String> = None;
@@ -173,7 +188,7 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
                 // #4: unlocks ONLY the dirty-source-worktree recycle refusal.
                 force = true;
             }
-            "-h" | "--help" => return Ok(pr_merge_help()),
+            h @ ("-h" | "--help") => return crate::cli::help_result(json, h, pr_merge_help()),
             s if s.starts_with('-') => {
                 return Err(CliError::usage(format!("unknown option '{s}'"), s))
             }
@@ -197,6 +212,7 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
             "",
         )
     })?)?;
+    let store = crate::cli::open_store()?;
     let head = crate::store::pr_head_ref(id);
     // Bind the gate decision to the EXACT PR-head OID it validated (F-007):
     // the completion transaction CASes the head chain from OID `gate_head`,
@@ -461,7 +477,8 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
             },
             &mut no_lock,
             &prepared_tmp,
-        );
+        )
+        .map(render);
     }
 
     // Repo-specific temp worktree path: hash the canonical workdir so parallel
@@ -729,6 +746,7 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
         &mut lock_handle,
         &tmp,
     )
+    .map(render)
 }
 
 /// `git forge pr update <n>` — re-pin the PR to the source branch tip as a
@@ -741,6 +759,7 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
 /// that already IS the snapshot source_head (nothing to update).
 pub(crate) fn cmd_pr_update(args: &[String]) -> Result<String, CliError> {
     const USAGE: &str = "usage: git forge pr update <n>";
+    let (json, args) = crate::machine::json_requested(args);
     if args.len() != 1 {
         // Name the offending token so a rejected flag is diagnosable
         // (unknown flag keeps exit-1, VAL-202).
@@ -825,7 +844,7 @@ pub(crate) fn cmd_pr_update(args: &[String]) -> Result<String, CliError> {
     let new_merge_base = crate::git::require_single_merge_base(store.repo(), new_base, new_source)?;
     let (store, actor) = crate::identity::open_mutation_store()?;
     let generation = state.generation + 1;
-    store
+    let event = store
         .update_pr(
             id,
             old_source,
@@ -838,6 +857,17 @@ pub(crate) fn cmd_pr_update(args: &[String]) -> Result<String, CliError> {
             &actor,
         )
         .map_err(CliError::from)?;
+    if json {
+        return Ok(crate::machine::pr_update_json(
+            id,
+            crate::machine::pr_state_at(store.store(), event)?,
+            generation,
+            &new_source.to_string(),
+            &new_base.to_string(),
+            &new_merge_base.to_string(),
+            &event.to_string(),
+        ));
+    }
     Ok(format!(
         "PR #{id} updated to snapshot generation {generation} \
          (source {source_ref} -> {new_source})"
@@ -846,7 +876,7 @@ pub(crate) fn cmd_pr_update(args: &[String]) -> Result<String, CliError> {
 
 pub(crate) fn pr_merge_help() -> String {
     "usage: git forge pr merge [<n>] [--merge|--squash|--rebase|--ff]\n\
-     \x20                   [--recycle-worktree <path>] [--force]\n\
+     \x20                   [--recycle-worktree <path>] [--force] [--json]\n\
      \x20 default / --merge: merge commit (--no-ff --no-edit)\n\
      \x20 --squash: single squashed commit\n\
      \x20 --rebase: replay source onto base (linear history)\n\

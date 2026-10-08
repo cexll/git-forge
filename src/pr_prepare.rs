@@ -33,6 +33,9 @@ fn prepare_arguments(args: &[String]) -> Result<(u64, String), CliError> {
                 }
                 strategy = Some(args[i].clone());
             }
+            // Reached only under `--json`: without it any help token already
+            // printed help before parsing.
+            h @ ("-h" | "--help") => return Err(crate::cli::json_help_refused(h)),
             s if s.starts_with('-') => {
                 return Err(CliError::usage(format!("unknown option '{s}'"), s))
             }
@@ -79,10 +82,14 @@ fn prepare_arguments(args: &[String]) -> Result<(u64, String), CliError> {
 /// stdout line and `pr show`'s additive `prepared:` line are the adapter
 /// contract surface.
 pub(crate) fn cmd_pr_prepare(args: &[String]) -> Result<String, CliError> {
-    let (_, args) = crate::machine::json_requested(args);
-    if args
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
+    let (json, args) = crate::machine::json_requested(args);
+    // Without `--json` any help token prints help (existing behavior). Under
+    // `--json` the parser below decides: a standalone help token is refused,
+    // and a `--strategy` value is validated as a strategy.
+    if !json
+        && args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
     {
         return Ok(pr_prepare_help());
     }
@@ -202,7 +209,7 @@ pub(crate) fn cmd_pr_prepare(args: &[String]) -> Result<String, CliError> {
     })?;
     // Publish atomically: pr.prepared event + result pin in ONE update-ref
     // batch (all-or-nothing; a CAS conflict re-parents + retries).
-    prepare_pr(
+    let event = prepare_pr(
         &store,
         id,
         generation,
@@ -215,6 +222,18 @@ pub(crate) fn cmd_pr_prepare(args: &[String]) -> Result<String, CliError> {
         &actor,
     )
     .map_err(CliError::from)?;
+    if json {
+        return Ok(crate::machine::pr_prepare_json(
+            id,
+            crate::machine::pr_state_at(store.store(), event)?,
+            &strategy,
+            generation,
+            &result_commit.to_string(),
+            &result_tree.to_string(),
+            &current_base.to_string(),
+            &event.to_string(),
+        ));
+    }
     Ok(format!(
         "prepared PR #{id} for strategy {strategy} (candidate {result_commit}, \
          generation {generation}, base {current_base})"
@@ -683,7 +702,7 @@ pub(crate) fn live_base_head_entry(
 
 /// `git forge pr prepare --help`
 pub(crate) fn pr_prepare_help() -> String {
-    "usage: git forge pr prepare <n> --strategy <merge|squash|rebase|ff>\n\
+    "usage: git forge pr prepare <n> --strategy <merge|squash|rebase|ff> [--json]\n\
      \x20 Materialize the PR's merge candidate against the CURRENT base tip\n\
      \x20 and pin it (refs/forge/prs/<n>/result + pr.prepared event). Re-run\n\
      \x20 to replace the candidate; `pr update` invalidates it."
