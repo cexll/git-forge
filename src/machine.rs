@@ -311,13 +311,15 @@ fn fold_all<T>(
     Ok(states)
 }
 
-/// The prose/JSON `issue list` scan, in id order.
+/// The validated prose/JSON Issue display scan, in id order.
 pub(crate) fn fold_all_issues(store: &EventStore) -> Result<Vec<crate::event::IssueState>, String> {
-    let (tips, states) = store.read_issue_refs().map_err(|e| e.to_string())?;
-    for id in tips.keys() {
-        if !states
-            .get(id)
-            .is_some_and(|state| state.id == *id && state.title.is_some())
+    let refs = store.read_issue_refs().map_err(|e| e.to_string())?;
+    for id in refs.tips.keys() {
+        if !refs.created.contains(id)
+            || !refs
+                .states
+                .get(id)
+                .is_some_and(|state| state.id == *id && state.title.is_some())
         {
             return Err(format!(
                 "cannot read {}: chain has no usable issue #{id} creation",
@@ -325,7 +327,7 @@ pub(crate) fn fold_all_issues(store: &EventStore) -> Result<Vec<crate::event::Is
             ));
         }
     }
-    Ok(states.into_values().collect())
+    Ok(refs.states.into_values().collect())
 }
 
 /// The prose/JSON `pr list` scan, in id order.

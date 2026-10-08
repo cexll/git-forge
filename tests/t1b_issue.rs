@@ -1236,6 +1236,105 @@ fn issue_list_and_show_reject_broken_loose_refs_with_ref_name() {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum IssueChainFault {
+    UnparseableJson,
+    MissingObject,
+    NoCreation,
+    WrongCreationId,
+}
+
+fn assert_issue_chain_fault_rejected(fault: IssueChainFault) {
+    use git_forge::event::{Event, EventKind, JsonValue};
+    use git_forge::store::EventStore;
+
+    let dir = tmpdir("issue-chain-validity");
+    init_repo(&dir);
+    assert_eq!(forge(&dir, &["issue", "new", "Healthy issue"]).0, 0);
+    for args in [
+        vec!["issue", "list"],
+        vec!["issue", "list", "--json"],
+        vec!["issue", "show", "1"],
+        vec!["issue", "show", "1", "--json"],
+    ] {
+        let (code, out, err) = forge(&dir, &args);
+        assert_eq!(code, 0, "healthy control {args:?}: {err}");
+        assert!(out.contains("Healthy issue"), "healthy control: {out}");
+    }
+    let reference = "refs/forge/issues/2";
+    match fault {
+        IssueChainFault::UnparseableJson => {
+            publish_json(&dir, reference, "event.json", "not JSON");
+        }
+        IssueChainFault::MissingObject => {
+            std::fs::write(
+                dir.join(".git/refs/forge/issues/2"),
+                "1111111111111111111111111111111111111111\n",
+            )
+            .unwrap();
+        }
+        IssueChainFault::NoCreation | IssueChainFault::WrongCreationId => {
+            let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+            let store = EventStore::open(&dir).unwrap().bind_signature(signature);
+            if matches!(fault, IssueChainFault::WrongCreationId) {
+                let created = Event::new(
+                    EventKind::IssueCreated,
+                    "issue",
+                    3,
+                    "test@example.com",
+                    [("title".into(), JsonValue::String("Wrong issue".into()))].into(),
+                );
+                store.append_event(reference, &created).unwrap();
+            }
+            let updated = Event::new(
+                EventKind::IssueUpdated,
+                "issue",
+                2,
+                "test@example.com",
+                [("title".into(), JsonValue::String("Orphan".into()))].into(),
+            );
+            store.append_event(reference, &updated).unwrap();
+        }
+    }
+    let mut failures = Vec::new();
+    for args in [
+        vec!["issue", "list"],
+        vec!["issue", "list", "--json"],
+        vec!["issue", "show", "2"],
+        vec!["issue", "show", "2", "--json"],
+        vec!["issue", "show", "1"],
+        vec!["issue", "show", "1", "--json"],
+    ] {
+        let (code, out, err) = forge(&dir, &args);
+        if code != 1 || !err.contains(reference) || !out.is_empty() {
+            failures.push(format!(
+                "{fault:?} {args:?}: exit={code}, stdout={out:?}, stderr={err:?}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn issue_chain_validity_rejects_unparseable_json() {
+    assert_issue_chain_fault_rejected(IssueChainFault::UnparseableJson);
+}
+
+#[test]
+fn issue_chain_validity_rejects_missing_object() {
+    assert_issue_chain_fault_rejected(IssueChainFault::MissingObject);
+}
+
+#[test]
+fn issue_chain_validity_rejects_no_creation() {
+    assert_issue_chain_fault_rejected(IssueChainFault::NoCreation);
+}
+
+#[test]
+fn issue_chain_validity_rejects_wrong_creation_id() {
+    assert_issue_chain_fault_rejected(IssueChainFault::WrongCreationId);
+}
+
 #[test]
 fn issue_list_rejects_unreadable_refs_with_ref_name() {
     for (tag, payload) in [
@@ -1273,26 +1372,6 @@ fn issue_list_rejects_unreadable_refs_with_ref_name() {
             assert!(out.is_empty(), "partial list ({tag}): {out}");
         }
     }
-}
-
-#[test]
-fn issue_show_eventless_ref_is_clean_error() {
-    // cli.rs:189 — a ref that exists but carries no event blob is "has no
-    // events", not a libgit2 internals leak.
-    let dir = tmpdir("shownoevent");
-    init_repo(&dir);
-    git_out(&dir, &["commit", "--allow-empty", "-q", "-m", "base"]);
-    assert_eq!(forge(&dir, &["forge", "issue", "new", "T"]).0, 0);
-    let base = git_out(&dir, &["rev-parse", "HEAD"]).1;
-    let (cr, _) = git_out(&dir, &["update-ref", "refs/forge/issues/1", &base]);
-    assert_eq!(cr, 0, "setup: repoint issue 1 at a plain commit");
-    let (c, _o, e) = forge(&dir, &["forge", "issue", "show", "1"]);
-    assert_ne!(c, 0, "eventless show must fail");
-    assert!(e.contains("issue #1 has no events"), "show: {e}");
-    assert!(
-        !e.contains("class=Object") && !e.contains("could not find"),
-        "must not leak libgit2 internals: {e}"
-    );
 }
 
 #[test]

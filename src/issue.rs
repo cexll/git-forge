@@ -177,16 +177,13 @@ fn cmd_show(store: &EventStore, args: &[String]) -> Result<String, String> {
         }
         Err(e) => return Err(format!("cannot read {r}: {e}")),
     }
-    let chain = store
-        .read_chain(&r)
-        .map_err(|e| format!("cannot read {r}: {e}"))?;
-    if chain.is_empty() {
-        return Err(format!("issue #{id} has no events ({r})"));
-    }
-    let state = crate::event::fold(&chain).issue;
     let all = machine::fold_all_issues(store)?;
+    let state = all
+        .iter()
+        .find(|state| state.id == id)
+        .ok_or_else(|| format!("issue #{id} does not exist"))?;
     if json {
-        return Ok(machine::issue_json(&state, &all));
+        return Ok(machine::issue_json(state, &all));
     }
     let mut out = format!(
         "#{} {} — {}\n",

@@ -334,9 +334,12 @@ with `LC_ALL=C`; unrecognized diagnostics fail closed without retrying.
   in the common Git directory supplement discovery because libgit2 skips
   malformed loose refs. Only canonical positive decimal `u64` suffixes identify
   Issues; unrelated names, leading-zero aliases, and signed names are ignored
-  before resolving targets. All target and chain reads use Git APIs. An
-  unreadable canonical Issue ref or a chain without a usable Issue creation
-  fails list/show with an error naming the ref in prose and JSON output.
+  before resolving targets. All target and chain reads use Git APIs. Display
+  requires readable chain objects, parseable event JSON, and an `issue.created`
+  event whose entity and id match the canonical Issue ref. It also requires a
+  matching folded Issue id and title. Both list and show render the same validated
+  collection. A failing canonical ref makes prose and JSON display exit non-zero
+  with the ref name, even when another Issue is healthy.
 - JSON keeps the existing fields and adds `key` (string or null), `parent`
   (Issue id or null), `blocked_by` (Issue ids), and `blocked` (boolean). Show
   also adds `children` (direct child Issue ids). Compute `blocked` against the

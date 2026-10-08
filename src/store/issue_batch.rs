@@ -3,7 +3,11 @@ use super::*;
 use crate::event::{fold, IssueState};
 use std::collections::{BTreeMap, BTreeSet};
 
-type IssueRefs = (BTreeMap<u64, Oid>, BTreeMap<u64, IssueState>);
+pub(crate) struct IssueRefs {
+    pub tips: BTreeMap<u64, Oid>,
+    pub states: BTreeMap<u64, IssueState>,
+    pub created: BTreeSet<u64>,
+}
 
 pub(crate) struct IssueSnapshot {
     pub counter_tip: Option<Oid>,
@@ -21,7 +25,7 @@ impl EventStore {
             };
             #[cfg(test)]
             tests::after_counter_read(self);
-            let (tips, states) = self.read_issue_refs()?;
+            let IssueRefs { tips, states, .. } = self.read_issue_refs()?;
             // Allocations publish the counter and new Issue together. Reject a
             // graph read that crossed an allocation before checking id collisions.
             if self.current_tip(COUNTER_REF)? != counter_tip {
@@ -40,6 +44,7 @@ impl EventStore {
     pub(crate) fn read_issue_refs(&self) -> Result<IssueRefs, StoreError> {
         let mut tips = BTreeMap::new();
         let mut states = BTreeMap::new();
+        let mut created = BTreeSet::new();
         let mut names = BTreeSet::new();
         for reference in self.repo.references_glob("refs/forge/issues/*")? {
             let reference = reference?;
@@ -102,11 +107,22 @@ impl EventStore {
                 .chain_events_from_tip(tip)
                 .map_err(|e| StoreError::InvalidState(format!("cannot read {name}: {e}")))?;
             tips.insert(id, tip);
+            if events.iter().any(|event| {
+                event.entity == "issue"
+                    && event.kind == EventKind::IssueCreated
+                    && event.entity_id == id
+            }) {
+                created.insert(id);
+            }
             if !events.is_empty() {
                 states.insert(id, fold(&events).issue);
             }
         }
-        Ok((tips, states))
+        Ok(IssueRefs {
+            tips,
+            states,
+            created,
+        })
     }
 }
 impl BoundEventStore {

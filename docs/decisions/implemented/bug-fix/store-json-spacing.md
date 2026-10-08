@@ -26,8 +26,12 @@ Ignore noncanonical suffixes before resolving targets: an Issue ref uses positiv
 decimal digits, without signs or leading zeros, fitting `u64`. Propagate lookup
 and chain errors with the ref name in list/show, including corrupt loose refs
 shadowing packed refs and commands invoked in linked worktrees.
-Issue display rejects chains without a usable creation for the ref's Issue id.
-Graph snapshots retain eventless allocation tips for CAS validation.
+Record matching `issue.created` evidence during each canonical ref's chain read.
+Issue display requires this evidence as well as a matching folded id and title;
+an `issue.updated` title cannot establish creation. Show renders its requested
+Issue from the same validated collection as list, without a second chain fold.
+Graph snapshots retain eventless allocation tips for CAS validation and do not
+apply display-only creation rejection.
 PR listing propagates counter errors instead of treating an invalid counter as
 an empty PR range. Its counter-bounded enumeration otherwise remains unchanged.
 
@@ -48,6 +52,8 @@ An exhausted allocation or batch leaves all refs unchanged.
   an existing Issue ref, including an unreadable one.
 - Use libgit2's name iterator alone: it also resolves loose refs and silently
   skips malformed ones. Loose-name discovery is required to report corruption.
+- Infer creation from the folded id and title: updates can set both, even after
+  a creation for a different Issue id. Only a matching creation event proves it.
 
 ## Consequences
 
