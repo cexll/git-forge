@@ -721,6 +721,7 @@ impl BoundEventStore {
                     // the observed counter tip (wire contract).
                     let following = next
                         .checked_add(1)
+                        .filter(|n| *n <= i64::MAX as u64)
                         .ok_or_else(|| StoreError::InvalidState("counter exhausted".into()))?;
                     let counter_new = self.write_counter_commit(following, Some(counter_tip))?;
                     let genesis = self.genesis_oid()?;
@@ -799,6 +800,7 @@ impl BoundEventStore {
                         let next = self.inner.read_counter_next(ct)?;
                         let following = next
                             .checked_add(1)
+                            .filter(|n| *n <= i64::MAX as u64)
                             .ok_or_else(|| StoreError::InvalidState("counter exhausted".into()))?;
                         (
                             Some(ct),
@@ -976,14 +978,17 @@ impl BoundEventStore {
     }
 }
 
-/// Read the counter's full-range unsigned integer from a JSON document.
+/// Read the positive counter value within the event model's signed range.
 fn parse_counter_next(content: &str) -> Result<u64, StoreError> {
     let value: serde_json::Value = serde_json::from_str(content)
         .map_err(|e| StoreError::InvalidState(format!("invalid counter.json: {e}")))?;
     value
         .get("next")
         .and_then(serde_json::Value::as_u64)
-        .ok_or_else(|| StoreError::InvalidState("counter next not a u64".into()))
+        .filter(|next| (1..=i64::MAX as u64).contains(next))
+        .ok_or_else(|| {
+            StoreError::InvalidState(format!("{COUNTER_REF} next must be in 1..=i64::MAX"))
+        })
 }
 
 #[cfg(test)]

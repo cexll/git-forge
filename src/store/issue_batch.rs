@@ -1,7 +1,7 @@
 //! Snapshot-bound issue graph transactions; no ref changes before final CAS.
 use super::*;
 use crate::event::{fold, IssueState};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 type IssueRefs = (BTreeMap<u64, Oid>, BTreeMap<u64, IssueState>);
 
@@ -40,11 +40,47 @@ impl EventStore {
     pub(crate) fn read_issue_refs(&self) -> Result<IssueRefs, StoreError> {
         let mut tips = BTreeMap::new();
         let mut states = BTreeMap::new();
+        let mut names = BTreeSet::new();
         for reference in self.repo.references_glob("refs/forge/issues/*")? {
             let reference = reference?;
-            let Some(name) = reference.name() else {
-                continue;
-            };
+            if let Some(name) = reference.name() {
+                names.insert(name.to_owned());
+            }
+        }
+        // libgit2's reference and name iterators skip malformed loose refs.
+        // Discover their names separately; Git still owns every target read.
+        let loose = self.repo.commondir().join("refs/forge/issues");
+        match std::fs::read_dir(&loose) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry.map_err(|e| {
+                        StoreError::InvalidState(format!("cannot enumerate refs/forge/issues: {e}"))
+                    })?;
+                    let name = entry.file_name();
+                    if let Some(suffix) = name.to_str().filter(|s| {
+                        matches!(s.as_bytes().first(), Some(b'1'..=b'9'))
+                            && s.bytes().all(|b| b.is_ascii_digit())
+                            && s.parse::<u64>().is_ok()
+                    }) {
+                        let kind = entry.file_type().map_err(|e| {
+                            StoreError::InvalidState(format!(
+                                "cannot read refs/forge/issues/{suffix}: {e}"
+                            ))
+                        })?;
+                        if !kind.is_dir() {
+                            names.insert(format!("refs/forge/issues/{suffix}"));
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(StoreError::InvalidState(format!(
+                    "cannot enumerate refs/forge/issues: {e}"
+                )));
+            }
+        }
+        for name in names {
             let Some(id) = name
                 .strip_prefix("refs/forge/issues/")
                 .filter(|s| {
@@ -55,6 +91,10 @@ impl EventStore {
             else {
                 continue;
             };
+            let reference = self
+                .repo
+                .find_reference(&name)
+                .map_err(|e| StoreError::InvalidState(format!("cannot read {name}: {e}")))?;
             let tip = reference
                 .target()
                 .ok_or_else(|| StoreError::InvalidState(format!("symbolic issue ref {name}")))?;

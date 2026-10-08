@@ -297,7 +297,7 @@ fn fold_all<T>(
     select: fn(&crate::event::FoldState) -> T,
 ) -> Result<Vec<T>, String> {
     let mut states = Vec::new();
-    for n in 1..store.counter_next().ok().unwrap_or(1) {
+    for n in 1..store.counter_next().map_err(|e| e.to_string())? {
         let r = head_ref(n);
         if !crate::cli::store_has_ref(store, &r) {
             continue;

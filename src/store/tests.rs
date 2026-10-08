@@ -96,7 +96,7 @@ fn parse_counter_next_reads_and_rejects() {
 }
 
 #[test]
-fn counter_json_accepts_spacing_and_full_u64_range() {
+fn counter_json_accepts_spacing_and_signed_event_range() {
     for content in [
         r#"{"v": 1, "next": 3}"#,
         "\r\n{\t\"next\" \r:\n 3, \"v\" : 1 }\t",
@@ -104,8 +104,8 @@ fn counter_json_accepts_spacing_and_full_u64_range() {
         assert_eq!(parse_counter_next(content).unwrap(), 3, "{content}");
     }
     assert_eq!(
-        parse_counter_next(r#"{"v":1,"next":18446744073709551615}"#).unwrap(),
-        u64::MAX
+        parse_counter_next(r#"{"v":1,"next":9223372036854775807}"#).unwrap(),
+        i64::MAX as u64
     );
 }
 
@@ -120,6 +120,9 @@ fn counter_json_rejects_malformed_documents_and_non_u64_values() {
         r#"{"v":1,"next":"3"}"#,
         r#"{"v":1,"next":true}"#,
         r#"{"v":1,"next":null}"#,
+        r#"{"v":1,"next":0}"#,
+        r#"{"v":1,"next":9223372036854775808}"#,
+        r#"{"v":1,"next":18446744073709551615}"#,
         r#"{"v":1,"next":18446744073709551616}"#,
         r#"{"v":1,"nested":{"next":3}}"#,
         r#"[{"v":1,"next":3}]"#,

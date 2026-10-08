@@ -915,7 +915,13 @@ fn issue_apply_accepts_standard_json_counter_spacing() {
 
 #[test]
 fn issue_new_and_apply_reject_spaced_exhausted_counters_without_changing_refs() {
-    for next in [u64::MAX, i64::MAX as u64, i64::MAX as u64 - 1] {
+    for next in [
+        u64::MAX,
+        i64::MAX as u64 + 1,
+        i64::MAX as u64,
+        i64::MAX as u64 - 1,
+        0,
+    ] {
         let dir = tmpdir("issue-counter-exhausted");
         init_repo(&dir);
         assert_eq!(forge(&dir, &["issue", "new", "Existing issue"]).0, 0);
@@ -951,13 +957,17 @@ fn issue_new_and_apply_reject_spaced_exhausted_counters_without_changing_refs() 
                 "--json",
             ],
         ];
-        if next >= i64::MAX as u64 {
+        if next >= i64::MAX as u64 || next == 0 {
             commands.push(vec!["issue", "new", "Exhausted"]);
         }
         for args in commands {
             let (code, out, err) = forge(&dir, &args);
             assert_eq!(code, 1, "{next}: {args:?}: {err}");
-            assert!(err.contains("counter exhausted"), "{next}: {err}");
+            if next > i64::MAX as u64 || next == 0 {
+                assert!(err.contains("refs/forge/meta/counter"), "{next}: {err}");
+            } else {
+                assert!(err.contains("counter exhausted"), "{next}: {err}");
+            }
             assert!(out.is_empty(), "exhausted batch reported success: {out}");
             assert_eq!(git_out(&dir, &refs), before, "{next}: changed refs");
         }
@@ -966,43 +976,110 @@ fn issue_new_and_apply_reject_spaced_exhausted_counters_without_changing_refs() 
 
 #[test]
 fn pr_create_rejects_spaced_exhausted_counter_without_changing_refs() {
-    let dir = tmpdir("pr-counter-exhausted");
-    init_repo(&dir);
-    assert_eq!(git_out(&dir, &["checkout", "-q", "-b", "main"]).0, 0);
-    assert_eq!(
-        git_out(&dir, &["commit", "--allow-empty", "-q", "-m", "base"]).0,
-        0
-    );
-    assert_eq!(git_out(&dir, &["checkout", "-q", "-b", "feature"]).0, 0);
-    assert_eq!(
-        git_out(&dir, &["commit", "--allow-empty", "-q", "-m", "feature"]).0,
-        0
-    );
-    publish_json(
-        &dir,
-        "refs/forge/meta/counter",
-        "counter.json",
-        r#"{"v": 1, "next": 18446744073709551615}"#,
-    );
-    let refs = ["for-each-ref", "--format=%(refname) %(objectname)"];
-    let before = git_out(&dir, &refs);
-    assert_eq!(before.0, 0);
-    let (code, out, err) = forge(
-        &dir,
-        &[
-            "pr",
-            "create",
-            "--source",
-            "feature",
-            "--base",
-            "main",
-            "Exhausted",
-        ],
-    );
-    assert_eq!(code, 1, "expected clean exhaustion error: {err}");
-    assert!(err.contains("counter exhausted"), "{err}");
-    assert!(out.is_empty(), "failed create reported success: {out}");
-    assert_eq!(git_out(&dir, &refs), before, "exhaustion changed refs");
+    for next in [i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX, 0] {
+        let dir = tmpdir("pr-counter-exhausted");
+        init_repo(&dir);
+        assert_eq!(git_out(&dir, &["checkout", "-q", "-b", "main"]).0, 0);
+        assert_eq!(
+            git_out(&dir, &["commit", "--allow-empty", "-q", "-m", "base"]).0,
+            0
+        );
+        assert_eq!(git_out(&dir, &["checkout", "-q", "-b", "feature"]).0, 0);
+        assert_eq!(
+            git_out(&dir, &["commit", "--allow-empty", "-q", "-m", "feature"]).0,
+            0
+        );
+        publish_json(
+            &dir,
+            "refs/forge/meta/counter",
+            "counter.json",
+            &format!(r#"{{"v": 1, "next": {next}}}"#),
+        );
+        let refs = ["for-each-ref", "--format=%(refname) %(objectname)"];
+        let before = git_out(&dir, &refs);
+        assert_eq!(before.0, 0);
+        let (code, out, err) = forge(
+            &dir,
+            &[
+                "pr",
+                "create",
+                "--source",
+                "feature",
+                "--base",
+                "main",
+                "Exhausted",
+            ],
+        );
+        assert_eq!(code, 1, "expected clean exhaustion error: {err}");
+        if next == i64::MAX as u64 {
+            assert!(err.contains("counter exhausted"), "{err}");
+        } else {
+            assert!(err.contains("refs/forge/meta/counter"), "{next}: {err}");
+        }
+        assert!(out.is_empty(), "failed create reported success: {out}");
+        assert_eq!(git_out(&dir, &refs), before, "exhaustion changed refs");
+    }
+}
+
+#[test]
+fn pr_list_rejects_invalid_counters_with_ref_name() {
+    for next in [i64::MAX as u64 + 1, 0] {
+        let dir = tmpdir("pr-list-invalid-counter");
+        init_repo(&dir);
+        assert_eq!(git_out(&dir, &["checkout", "-q", "-b", "main"]).0, 0);
+        assert_eq!(
+            git_out(&dir, &["commit", "--allow-empty", "-q", "-m", "base"]).0,
+            0
+        );
+        assert_eq!(git_out(&dir, &["checkout", "-q", "-b", "feature"]).0, 0);
+        assert_eq!(
+            git_out(&dir, &["commit", "--allow-empty", "-q", "-m", "feature"]).0,
+            0
+        );
+        assert_eq!(
+            forge(
+                &dir,
+                &[
+                    "pr",
+                    "create",
+                    "--source",
+                    "feature",
+                    "--base",
+                    "main",
+                    "Existing PR"
+                ]
+            )
+            .0,
+            0
+        );
+        for args in [vec!["pr", "list"], vec!["pr", "list", "--json"]] {
+            let (code, out, err) = forge(&dir, &args);
+            assert_eq!(code, 0, "healthy list failed: {err}");
+            assert!(out.contains("Existing PR"), "missing healthy PR: {out}");
+        }
+        assert_eq!(
+            git_out(&dir, &["update-ref", "-d", "refs/forge/meta/counter"]).0,
+            0
+        );
+        publish_json(
+            &dir,
+            "refs/forge/meta/counter",
+            "counter.json",
+            &format!(r#"{{"v": 1, "next": {next}}}"#),
+        );
+        for args in [vec!["pr", "list"], vec!["pr", "list", "--json"]] {
+            let (code, out, err) = forge(&dir, &args);
+            assert_eq!(
+                code, 1,
+                "invalid counter silently hid PR ({next}, {args:?}): {out}"
+            );
+            assert!(
+                err.contains("refs/forge/meta/counter"),
+                "missing counter ref: {err}"
+            );
+            assert!(out.is_empty(), "partial PR list: {out}");
+        }
+    }
 }
 
 #[test]
@@ -1072,6 +1149,8 @@ fn issue_list_and_show_ignore_noncanonical_refs() {
             "event.json",
             "not JSON",
         );
+        let loose = dir.join(format!(".git/refs/forge/issues/{suffix}"));
+        std::fs::write(&loose, "garbage\n").unwrap();
         for args in [
             vec!["issue", "list"],
             vec!["issue", "list", "--json"],
@@ -1093,6 +1172,65 @@ fn issue_list_and_show_ignore_noncanonical_refs() {
                 assert_eq!(issue["title"], "Healthy issue");
             } else {
                 assert!(out.contains("#1 Healthy issue"), "{suffix}: {out}");
+            }
+        }
+    }
+}
+
+#[test]
+fn issue_list_and_show_reject_broken_loose_refs_with_ref_name() {
+    for contents in ["garbage\n", "1111111111111111111111111111111111111111\n"] {
+        for storage in ["loose", "packed-shadow", "linked-worktree"] {
+            let dir = tmpdir("broken-loose-issue-ref");
+            init_repo(&dir);
+            assert_eq!(forge(&dir, &["issue", "new", "Healthy issue"]).0, 0);
+            let mut invoking_dir = dir.clone();
+            if storage != "loose" {
+                assert_eq!(forge(&dir, &["issue", "new", "Second issue"]).0, 0);
+                assert_eq!(git_out(&dir, &["pack-refs", "--all", "--prune"]).0, 0);
+            }
+            if storage == "linked-worktree" {
+                assert_eq!(
+                    git_out(&dir, &["commit", "--allow-empty", "-q", "-m", "base"]).0,
+                    0
+                );
+                invoking_dir = dir.join("linked");
+                assert_eq!(
+                    git_out(
+                        &dir,
+                        &[
+                            "worktree",
+                            "add",
+                            "--detach",
+                            invoking_dir.to_str().unwrap()
+                        ]
+                    )
+                    .0,
+                    0
+                );
+            }
+            let broken = dir.join(".git/refs/forge/issues/2");
+            std::fs::create_dir_all(broken.parent().unwrap()).unwrap();
+            std::fs::write(&broken, contents).unwrap();
+            for args in [
+                vec!["issue", "list"],
+                vec!["issue", "list", "--json"],
+                vec!["issue", "show", "1"],
+                vec!["issue", "show", "1", "--json"],
+                vec!["issue", "show", "2"],
+                vec!["issue", "show", "2", "--json"],
+            ] {
+                let (code, out, err) = forge(&invoking_dir, &args);
+                assert_eq!(
+                    code, 1,
+                    "broken loose ref silently skipped ({storage}, {contents:?}, {args:?}): {out}"
+                );
+                assert!(
+                    err.contains("refs/forge/issues/2"),
+                    "missing ref name: {err}"
+                );
+                assert!(out.is_empty(), "partial display: {out}");
+                assert_eq!(std::fs::read_to_string(&broken).unwrap(), contents);
             }
         }
     }

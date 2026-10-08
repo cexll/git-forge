@@ -11,41 +11,49 @@ It also skipped existing eventless Issue refs.
 
 ## Decision
 
-Parse the entire counter document with `serde_json` and read `next` as `u64`.
+Parse the entire counter document with `serde_json` and require `next` in
+`1..=i64::MAX`, matching the event model's supported integer range.
 This dependency is confined to the store. The existing std-only event parser
 already accepts JSON whitespace and remains the event reader. Neither writer
 changes its compact serialization.
 
 Share actual Issue-ref enumeration between graph snapshots and Issue display.
-Keep reads through Git ref APIs, numeric ordering, and snapshot counter/CAS
-bracketing. Ignore noncanonical suffixes before resolving targets: an Issue ref
-uses positive decimal digits, without signs or leading zeros, fitting `u64`.
-Propagate unreadable canonical-chain errors with the ref name in list/show.
+Keep target reads through Git ref APIs, numeric ordering, and snapshot counter/CAS
+bracketing. Supplement Git enumeration with immediate loose entries in the common
+Git directory: libgit2's reference and name iterators both skip malformed loose
+refs. Deduplicate discovered names and resolve canonical names explicitly.
+Ignore noncanonical suffixes before resolving targets: an Issue ref uses positive
+decimal digits, without signs or leading zeros, fitting `u64`. Propagate lookup
+and chain errors with the ref name in list/show, including corrupt loose refs
+shadowing packed refs and commands invoked in linked worktrees.
 Issue display rejects chains without a usable creation for the ref's Issue id.
 Graph snapshots retain eventless allocation tips for CAS validation.
-PR listing retains its existing behavior.
+PR listing propagates counter errors instead of treating an invalid counter as
+an empty PR range. Its counter-bounded enumeration otherwise remains unchanged.
 
 Check counter increments before writing or publishing allocation state.
-`allocate_id` and PR creation reject `u64::MAX` with a clean store error.
-Issue new/apply preserve their existing `i64::MAX` advanced-counter bound.
+All allocation paths reject `i64::MAX` with a clean exhaustion error.
+Counters outside the supported range fail with an error naming the counter ref.
 An exhausted allocation or batch leaves all refs unchanged.
 
 ## Alternatives considered
 
-- Reuse the core JSON parser for counters: its signed `i64` representation would
-  narrow the existing counter's unsigned `u64` range.
+- Reuse the core JSON parser for counters: avoid changing the pure event model
+  for this store-only read and validation boundary.
 - Widen the core JSON representation or replace the event parser: unnecessary
   public-model and pure-core changes for this counter-read defect.
 - Trim whitespace after the substring: still accepts malformed documents and
   does not structurally identify the top-level `next` field.
 - Continue scanning ids below the counter: a missing or stale counter can hide
   an existing Issue ref, including an unreadable one.
+- Use libgit2's name iterator alone: it also resolves loose refs and silently
+  skips malformed ones. Loose-name discovery is required to report corruption.
 
 ## Consequences
 
 Older spaced counters work with both `issue new` and `issue apply`. Spaced event
 JSON remains readable. Issue lists and graph snapshots fail on unreadable
 canonical refs with diagnostic context. Missing and unrelated refs are harmless.
-Counter parsing rejects malformed JSON and non-`u64` values. Exhaustion returns
-an error rather than panicking or wrapping, and publishes no partial batch.
+Counter parsing rejects malformed JSON and values outside `1..=i64::MAX`.
+Exhaustion returns an error rather than panicking or wrapping, with no partial batch.
 No migration or source-ref rewrite is needed.
