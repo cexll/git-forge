@@ -159,8 +159,9 @@ strategy conflicts. Hook and process failures without unmerged entries remain
 `E_INTERNAL`.
 
 The CLI preserves typed CAS failures as `E_CONFLICT` with `retryable: true`.
-Other failures are not automatically retryable. Detailed base-movement,
-prepare-conflict, and CI-diagnostic payloads are separate command contracts.
+Other failures are not automatically retryable. Detailed base-movement and
+CI-diagnostic payloads are separate command contracts; the prepare-conflict
+payload is below.
 
 Canonical local branch names that are absent return `E_NOT_FOUND` with the
 supplied branch argument as `input`. Malformed or noncanonical branch inputs
@@ -182,6 +183,39 @@ remain `E_INTERNAL`; missing-reference classification requires an exact named
 update operation with a nonzero expected OID.
 Preparation returns `E_PREPARE_CONFLICT` when a failed strategy leaves an
 unmerged index, subject to the hook limitation documented beside the code list.
+
+#### Prepare conflict
+
+`pr prepare <n> --strategy merge|squash|rebase` reads the unmerged index
+entries of the temporary worktree before cleanup. When at least one exists,
+the command fails with `E_PREPARE_CONFLICT`. The message is:
+
+```text
+PR #<n> cannot be prepared with strategy <s>: source <source> conflicts with base '<base_ref>' at <base> in <k> path(s): <p1>, <p2>, ...; merge '<base_ref>' into the source branch '<source_ref>', resolve the conflicts, then run `git forge pr update <n>` or create a replacement PR; worktree cleaned up, no ref changes made
+```
+
+- The message lists at most 20 paths, then ` (and <m> more)`.
+- Paths are in index order, one per path, whatever the conflict kind
+  (content, add/add, modify/delete, rename/delete, or a hook that writes
+  unmerged entries).
+- Git's own diagnostic text is not forwarded: it names commands
+  (`git rebase --continue`) that do not apply to the removed worktree.
+- The final clause is the unchanged cleanup outcome. When worktree removal
+  fails, it names the leftover worktree instead.
+- `input` is the PR id, `retryable` is `false`, and `hint` is
+  ``Merge the base branch into the source branch, resolve the conflicts, then run `git forge pr update <n>` or create a replacement PR.``
+- `data` keys, in order: `pr` (number), `strategy`, `base` (the base tip the
+  candidate was built on), `source` (the snapshot source commit), and `paths`
+  (every conflicted path, without the 20-path limit).
+
+```json
+{"error":{"code":"E_PREPARE_CONFLICT","message":"PR #1 cannot be prepared with strategy merge: ...","input":"1","hint":"Merge the base branch into the source branch, resolve the conflicts, then run `git forge pr update 1` or create a replacement PR.","retryable":false,"data":{"pr":1,"strategy":"merge","base":"<40-hex>","source":"<40-hex>","paths":["shared.txt"]}}}
+```
+
+The `ff` strategy has no conflict path: a source that does not sit on the
+base tip fails the fast-forward precondition before a worktree exists. A
+failure without unmerged entries keeps its `git <s> failed: <cause>` message
+and `E_INTERNAL`. `pr merge` strategy execution is not part of this contract.
 
 Missing required positionals return usage errors, never panics. In particular,
 `pr show` and `pr diff` use `usage: git forge pr <verb> <n> [--json]`.

@@ -628,6 +628,13 @@ pub(crate) fn cleanup_failed_worktree(
     kind: &str,
     cause: String,
 ) -> String {
+    let outcome = cleanup_after_failure(repo_dir, tmp, kind);
+    format!("git {kind} failed: {cause}; {outcome}")
+}
+
+/// The cleanup half of [`cleanup_failed_worktree`]: returns the cleanup
+/// outcome clause that ends every strategy-failure message.
+fn cleanup_after_failure(repo_dir: &Path, tmp: &Path, kind: &str) -> String {
     match kind {
         // Squash failure: `git merge --squash` stages without a MERGE_HEAD,
         // so `merge --abort` cannot reset. Reset the detached worktree back to
@@ -662,8 +669,8 @@ pub(crate) fn cleanup_failed_worktree(
             // Release the sibling lock so the suffix stays reusable.
             let _ = std::fs::remove_file(tmp.with_extension("lock"));
             return format!(
-                "git {kind} failed: {cause}; temp worktree removal failed and the \
-                 worktree is left at \"{}\" ({err_rm}) — unlock and remove it manually",
+                "temp worktree removal failed and the worktree is left at \"{}\" \
+                 ({err_rm}) — unlock and remove it manually",
                 tmp.display()
             );
         }
@@ -673,7 +680,7 @@ pub(crate) fn cleanup_failed_worktree(
     // sibling lock — deleting another process's worktree is never safe).
     // AC-005h: verify the disposable directory is actually gone.
     let _ = std::fs::remove_file(tmp.with_extension("lock"));
-    format!("git {kind} failed: {cause}; worktree cleaned up, no ref changes made")
+    "worktree cleaned up, no ref changes made".to_string()
 }
 
 /// `git merge-base --all <a> <b>` count must be exactly 1. Zero covers

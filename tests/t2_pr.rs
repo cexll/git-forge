@@ -5264,6 +5264,20 @@ fn assert_candidate_cli_error(
     input: &str,
     hint: &str,
 ) {
+    assert_candidate_cli_error_data(dir, args, code, message, input, hint, None);
+}
+
+/// [`assert_candidate_cli_error`] plus the command-specific `data` object
+/// (`None` asserts that the error has no `data`).
+fn assert_candidate_cli_error_data(
+    dir: &PathBuf,
+    args: &[&str],
+    code: &str,
+    message: &str,
+    input: &str,
+    hint: &str,
+    data: Option<serde_json::Value>,
+) {
     let (status, stdout, stderr) = forge(dir, args);
     assert_eq!(status, 1);
     assert_eq!(stdout, "");
@@ -5274,12 +5288,43 @@ fn assert_candidate_cli_error(
     assert_eq!(status, 1);
     assert_eq!(stderr, format!("git-forge: {message}"));
     let actual: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(
-        actual,
-        serde_json::json!({"error": {
-            "code": code, "message": message, "input": input,
-            "hint": hint, "retryable": false
-        }})
+    let mut expected = serde_json::json!({"error": {
+        "code": code, "message": message, "input": input,
+        "hint": hint, "retryable": false
+    }});
+    if let Some(data) = data {
+        expected["error"]["data"] = data;
+    }
+    assert_eq!(actual, expected);
+}
+
+/// The prepare-conflict contract for PR #1 of [`candidate_error_fixture`]:
+/// `main` -> source `feature`, conflicting on `paths`.
+fn assert_prepare_conflict_error(dir: &PathBuf, strategy: &str, paths: &[&str]) {
+    let base = ref_oid(dir, "refs/heads/main").unwrap();
+    let source = ref_oid(dir, "refs/heads/feature").unwrap();
+    let count = if paths.len() == 1 {
+        "1 path".to_string()
+    } else {
+        format!("{} paths", paths.len())
+    };
+    assert_candidate_cli_error_data(
+        dir,
+        &["forge", "pr", "prepare", "1", "--strategy", strategy],
+        "E_PREPARE_CONFLICT",
+        &format!(
+            "PR #1 cannot be prepared with strategy {strategy}: source {source} conflicts with \
+             base 'main' at {base} in {count}: {}; merge 'main' into the source branch \
+             'feature', resolve the conflicts, then run `git forge pr update 1` or create a \
+             replacement PR; worktree cleaned up, no ref changes made",
+            paths.join(", ")
+        ),
+        "1",
+        "Merge the base branch into the source branch, resolve the conflicts, then run \
+         `git forge pr update 1` or create a replacement PR.",
+        Some(serde_json::json!({
+            "pr": 1, "strategy": strategy, "base": base, "source": source, "paths": paths
+        })),
     );
 }
 
@@ -5612,14 +5657,7 @@ fn candidate_error_prepare_conflict_is_not_operational_failure() {
         assert_eq!(git(&dir, &["add", "feature.txt"]).0, 0);
         assert_eq!(git(&dir, &["commit", "-q", "-m", "Conflicting base"]).0, 0);
         let head = ref_oid(&dir, "refs/forge/prs/1/head");
-        assert_candidate_cli_error(
-            &dir,
-            &["forge", "pr", "prepare", "1", "--strategy", strategy],
-            "E_PREPARE_CONFLICT",
-            &format!("git {strategy} failed: ; worktree cleaned up, no ref changes made"),
-            "1",
-            "Inspect the repository and the reported failure before retrying.",
-        );
+        assert_prepare_conflict_error(&dir, strategy, &["feature.txt"]);
         assert_eq!(ref_oid(&dir, "refs/forge/prs/1/head"), head);
         assert_eq!(ref_oid(&dir, "refs/forge/prs/1/result"), None);
         assert_eq!(
@@ -5684,14 +5722,7 @@ fn candidate_error_squash_commit_hook_unmerged_index_is_conflict() {
     let base = ref_oid(&dir, "refs/heads/main");
     let source = ref_oid(&dir, "refs/heads/feature");
     let head = ref_oid(&dir, "refs/forge/prs/1/head");
-    assert_candidate_cli_error(
-        &dir,
-        &["forge", "pr", "prepare", "1", "--strategy", "squash"],
-        "E_PREPARE_CONFLICT",
-        "git squash failed: hook failed; worktree cleaned up, no ref changes made",
-        "1",
-        "Inspect the repository and the reported failure before retrying.",
-    );
+    assert_prepare_conflict_error(&dir, "squash", &["feature.txt"]);
     assert!(marker.exists(), "squash commit hook must execute");
     assert_eq!(ref_oid(&dir, "refs/heads/main"), base);
     assert_eq!(ref_oid(&dir, "refs/heads/feature"), source);
@@ -5713,46 +5744,8 @@ fn candidate_error_prepare_rebase_conflict_is_typed() {
     std::fs::write(dir.join("feature.txt"), "base addition\n").unwrap();
     assert_eq!(git(&dir, &["add", "feature.txt"]).0, 0);
     assert_eq!(git(&dir, &["commit", "-q", "-m", "Conflicting base"]).0, 0);
-    let source = ref_oid(&dir, "refs/heads/feature").unwrap();
-    let base = ref_oid(&dir, "refs/heads/main").unwrap();
-    let merge_base = git(&dir, &["merge-base", &source, &base]).1;
-    // Git's rebase diagnostics vary by version; obtain the expected stderr
-    // from the same public Git operation in an independent disposable worktree.
-    let oracle = tmpdir("rebase-stderr-oracle");
-    assert_eq!(
-        git(
-            &dir,
-            &[
-                "worktree",
-                "add",
-                "--detach",
-                oracle.to_str().unwrap(),
-                &source
-            ]
-        )
-        .0,
-        0
-    );
-    let (status, _, cause) = git(&oracle, &["rebase", "--onto", &base, &merge_base]);
-    assert_ne!(status, 0);
-    assert_eq!(git(&oracle, &["rebase", "--abort"]).0, 0);
-    assert_eq!(
-        git(
-            &dir,
-            &["worktree", "remove", "--force", oracle.to_str().unwrap()]
-        )
-        .0,
-        0
-    );
     let head = ref_oid(&dir, "refs/forge/prs/1/head");
-    assert_candidate_cli_error(
-        &dir,
-        &["forge", "pr", "prepare", "1", "--strategy", "rebase"],
-        "E_PREPARE_CONFLICT",
-        &format!("git rebase failed: {cause}; worktree cleaned up, no ref changes made"),
-        "1",
-        "Inspect the repository and the reported failure before retrying.",
-    );
+    assert_prepare_conflict_error(&dir, "rebase", &["feature.txt"]);
     assert_eq!(ref_oid(&dir, "refs/forge/prs/1/head"), head);
     assert_eq!(ref_oid(&dir, "refs/forge/prs/1/result"), None);
     assert_eq!(

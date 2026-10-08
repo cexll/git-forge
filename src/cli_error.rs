@@ -14,8 +14,9 @@ pub struct CliError {
     pub hint: String,
     /// Whether retrying after a fresh read can succeed.
     pub retryable: bool,
-    /// Optional command-specific diagnostics, serialized as the additive `data` field.
-    pub data: Option<Box<crate::event::JsonValue>>,
+    /// Command-specific diagnostics, serialized in order as the additive
+    /// `data` object; empty means the field is absent.
+    pub data: Vec<(&'static str, crate::event::JsonValue)>,
 }
 
 impl CliError {
@@ -33,7 +34,7 @@ impl CliError {
             input: input.into(),
             hint: hint.into(),
             retryable,
-            data: None,
+            data: Vec::new(),
         }
     }
     pub(crate) fn usage(message: impl Into<String>, input: impl Into<String>) -> Self {
@@ -74,9 +75,15 @@ impl CliError {
             escape(&self.hint),
             self.retryable
         );
-        if let Some(data) = &self.data {
-            out.push_str(",\"data\":");
-            out.push_str(&crate::event::json_value(data));
+        if !self.data.is_empty() {
+            let fields = self
+                .data
+                .iter()
+                .map(|(key, value)| format!("{}:{}", escape(key), crate::event::json_value(value)))
+                .collect::<Vec<_>>();
+            out.push_str(",\"data\":{");
+            out.push_str(&fields.join(","));
+            out.push('}');
         }
         out.push_str("}}");
         out
