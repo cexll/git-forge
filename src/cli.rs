@@ -803,8 +803,26 @@ fn cmd_ci_run(args: &[String]) -> Result<String, CliError> {
     // even created, so CI never follows a tracked link to mutable bytes
     // outside the detached worktree. Absent `.forge/ci.sh` -> the pinned
     // `just check` fallback (F-012). For a candidate run the plan comes from
-    // the RESULT commit's tree.
-    let plan = crate::ci::snapshot_ci_plan(store.repo(), run_oid)?;
+    // the RESULT commit's tree. A refused plan records a failed Check with
+    // reason `plan_invalid`.
+    let plan = match crate::ci::snapshot_ci_plan(store.repo(), run_oid) {
+        Ok(plan) => plan,
+        Err(detail) => {
+            let failure = crate::ci::CiFailure::new(crate::ci::CiReason::PlanInvalid, detail);
+            return crate::pr_prepare::record_and_report_ci_check(
+                &store,
+                &head,
+                id,
+                None,
+                generation,
+                live_base,
+                candidate_run.as_ref(),
+                None,
+                &crate::ci::CiRun::not_run(failure),
+                &actor,
+            );
+        }
+    };
 
     // Reserve a unique temp worktree path (sibling lock) so concurrent CI runs
     // on the same repo never collide on the global temp dir.
@@ -886,34 +904,26 @@ fn cmd_ci_run(args: &[String]) -> Result<String, CliError> {
     // F-025: do NOT publish a green Check until cleanup verified succeeded — a
     // passing plan that locks its worktree (so removal fails) must leave a
     // failed/non-green latest Check. A run that exceeded its bounded deadline
-    // (`timed_out`) is ALSO never green, even if the child happened to exit 0
-    // right at the deadline (the group may have been killed / a descendant
-    // escaped), so the merge gate cannot accept it.
-    let status = if run.status == Some(0) && !run.timed_out && leftover.is_none() {
-        "success"
-    } else {
-        "failed"
-    };
+    // is ALSO never green, even if the child happened to exit 0 right at the
+    // deadline (the group may have been killed / a descendant escaped), so the
+    // merge gate cannot accept it.
     let recorded = crate::pr_prepare::record_and_report_ci_check(
         &store,
         &head,
         id,
-        status,
-        plan.label(),
+        Some(plan.label()),
         generation,
         live_base,
         candidate_run.as_ref(),
         leftover,
-        run.status,
-        run.timed_out,
-        run.detail.map(|d| d.to_string()),
+        &run,
         &actor,
     );
     if json {
         // The Check was recorded (record_and_report returns Ok only for a
         // verified-green run); failures fall through to the prose stderr +
         // exit-1 contract, so stdout JSON always describes a recorded Check.
-        return recorded.map(|_| machine::ci_run_json(id, status, plan.label(), generation));
+        return recorded.map(|_| machine::ci_run_json(id, "success", plan.label(), generation));
     }
     recorded
 }
@@ -923,7 +933,7 @@ pub fn run_ci(argv: &[String]) -> Result<String, CliError> {
     let sub = argv.first().map(|s| s.as_str()).unwrap_or("");
     let (json, rest) = machine::json_requested(argv.get(1..).unwrap_or(&[]));
     if help_requested(&rest) && sub == "run" {
-        return help_result(json, &rest[0], "usage: git forge ci run <pr>".into());
+        return help_result(json, &rest[0], crate::ci::ci_run_help());
     }
     match sub {
         "run" => cmd_ci_run(&argv[1..]),

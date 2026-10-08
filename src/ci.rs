@@ -29,19 +29,107 @@ impl CiPlan {
     }
 }
 
-/// Outcome of a bounded CI plan run (F-002/F-015): the exit status (None when
-/// the process could not be spawned, the snapshot plan could not be
-/// materialized, or the plan exceeded the bounded deadline) and whether the
-/// deadline was hit (so a killed group is distinguishable from a spawn
-/// failure).
+/// Why a CI run is not green — exactly one per failed Check, recorded as the
+/// `ci.check` `reason` (spec #33).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CiReason {
+    /// The snapshot plan is missing, not a regular file, or fails validation.
+    PlanInvalid,
+    /// The plan could not be started (materialization I/O, no trusted `just`,
+    /// output pipe, or spawn failure).
+    SpawnFailed,
+    /// The plan exceeded the bounded deadline (F-002/F-015).
+    Timeout,
+    /// The plan exited with a non-zero status or was terminated by a signal.
+    NonzeroExit,
+    /// The plan's process group or temporary worktree could not be cleaned
+    /// up: a surviving background descendant, an unprovable group probe, a
+    /// failed wait, or a worktree removal that failed (F-015/F-025).
+    CleanupFailed,
+}
+
+impl CiReason {
+    /// The stored and machine-readable reason name.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            CiReason::PlanInvalid => "plan_invalid",
+            CiReason::SpawnFailed => "spawn_failed",
+            CiReason::Timeout => "timeout",
+            CiReason::NonzeroExit => "nonzero_exit",
+            CiReason::CleanupFailed => "cleanup_failed",
+        }
+    }
+}
+
+/// A non-green run: its reason and the human detail shown after the
+/// `failed (<plan>)` prefix (for example `exited with status 1`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CiFailure {
+    pub(crate) reason: CiReason,
+    pub(crate) detail: String,
+}
+
+impl CiFailure {
+    pub(crate) fn new(reason: CiReason, detail: impl Into<String>) -> Self {
+        Self {
+            reason,
+            detail: detail.into(),
+        }
+    }
+}
+
+/// Outcome of a bounded CI plan run (F-002/F-015): `None` failure only when
+/// the plan exited 0 and its process group was proven empty, plus the bounded
+/// tail of the plan's combined stdout/stderr.
 pub(crate) struct CiRun {
-    pub(crate) status: Option<i32>,
-    pub(crate) timed_out: bool,
-    /// Why a non-green run is not green when it is neither a plain non-zero exit
-    /// nor a deadline timeout (F-015): a surviving background descendant or an
-    /// unprovable group probe. Drives the user-facing reason so a
-    /// descendant-survival failure is not mislabeled "timed out".
-    pub(crate) detail: Option<&'static str>,
+    pub(crate) failure: Option<CiFailure>,
+    pub(crate) tail: String,
+}
+
+impl CiRun {
+    /// A run that failed before the plan produced any output.
+    pub(crate) fn not_run(failure: CiFailure) -> Self {
+        Self {
+            failure: Some(failure),
+            tail: String::new(),
+        }
+    }
+}
+
+/// The `E_CI_FAILED` error of a failed Check: `message` plus the reason and
+/// the terminal-safe tail on the human line; `data` carries the exact reason
+/// and tail.
+pub(crate) fn failed_check_error(
+    id: u64,
+    message: String,
+    reason: CiReason,
+    tail: &str,
+    hint: &str,
+) -> crate::cli_error::CliError {
+    let mut message = format!("{message}; reason: {}", reason.as_str());
+    if !tail.is_empty() {
+        message.push_str("; output tail: ");
+        message.push_str(&crate::cli::sanitize_terminal(tail));
+    }
+    let mut error =
+        crate::cli_error::CliError::new("E_CI_FAILED", message, id.to_string(), hint, false);
+    error.data = vec![
+        ("pr", crate::event::JsonValue::Number(id as i64)),
+        ("reason", crate::cli::json_str(reason.as_str())),
+        ("tail", crate::cli::json_str(tail)),
+    ];
+    error
+}
+
+/// `git forge ci run --help`.
+pub(crate) fn ci_run_help() -> String {
+    "usage: git forge ci run <pr> [--json]\n\
+     \x20 Run the PR's CI plan in a temporary worktree and record a CI Check.\n\
+     \x20 A failed run exits 1 with E_CI_FAILED and records one reason\n\
+     \x20 (plan_invalid, spawn_failed, timeout, nonzero_exit, cleanup_failed)\n\
+     \x20 and the last 4 KiB of the plan's combined output; `pr show --json`\n\
+     \x20 shows both."
+        .to_string()
 }
 
 /// Bound and validate the configured CI deadline (F-011): an extreme
@@ -102,40 +190,44 @@ pub(crate) fn snapshot_ci_plan(repo: &git2::Repository, oid: git2::Oid) -> Resul
 /// executed plan is exactly the blob content (F-013): a checkout smudge or
 /// attribute filter that rewrote the file (e.g. a `.gitattributes` filter that
 /// turns `exit 1` into `exit 0`) can no longer replace the plan that runs.
+/// A justfile that fails validation is `plan_invalid`; an I/O failure means
+/// the plan could not be started (`spawn_failed`).
 fn materialize_plan(
     repo: &git2::Repository,
     oid: git2::Oid,
     worktree: &Path,
     plan: &CiPlan,
-) -> Result<(), String> {
+) -> Result<(), CiFailure> {
     let rel: &str = match plan {
         CiPlan::CiSh => ".forge/ci.sh",
         CiPlan::JustCheck(name) => name,
     };
+    let not_started = |detail: String| CiFailure::new(CiReason::SpawnFailed, detail);
     let commit = repo
         .find_commit(oid)
-        .map_err(|_| "cannot read PR snapshot source tree".to_string())?;
+        .map_err(|_| not_started("cannot read PR snapshot source tree".to_string()))?;
     let entry = commit
         .tree()
         .and_then(|t| t.get_path(Path::new(rel)))
-        .map_err(|_| format!("plan file '{rel}' missing from snapshot"))?;
+        .map_err(|_| not_started(format!("plan file '{rel}' missing from snapshot")))?;
     let blob = repo
         .find_blob(entry.id())
-        .map_err(|_| format!("cannot read plan blob '{rel}'"))?;
+        .map_err(|_| not_started(format!("cannot read plan blob '{rel}'")))?;
     let dest = worktree.join(rel);
     if let Some(parent) = dest.parent() {
         std::fs::create_dir_all(parent)
-            .map_err(|e| format!("cannot create plan directory: {e}"))?;
+            .map_err(|e| not_started(format!("cannot create plan directory: {e}")))?;
     }
     if matches!(plan, CiPlan::JustCheck(_)) {
         // F-012/F-013: a `just check` fallback must be a SELF-CONTAINED
         // justfile — `set fallback` and any `import`/`mod` source directive are
         // refused below, so the only source `just --justfile` reads is this
         // single immutable blob (never a checkout-backed smudge/rewritten file).
-        validate::validate_justfile_closure(blob.content(), rel)?;
+        validate::validate_justfile_closure(blob.content(), rel)
+            .map_err(|e| CiFailure::new(CiReason::PlanInvalid, e))?;
     }
-    std::fs::write(&dest, blob.content()).map_err(|e| format!("cannot write plan '{rel}': {e}"))?;
-    Ok(())
+    std::fs::write(&dest, blob.content())
+        .map_err(|e| not_started(format!("cannot write plan '{rel}': {e}")))
 }
 
 /// Reject a `just` source that can escape the immutable snapshot (F-012): a
@@ -164,6 +256,8 @@ fn materialize_plan(
 /// an `import`/`mod`/`set` string argument is quoted — so the header test must
 /// not mistake a quoted colon for header punctuation (F-012).
 mod validate;
+
+mod output;
 
 /// Signal the process group `pgid` (a child that leads its own group) with
 /// `sig` via a DIRECT `kill(2)` syscall (F-024/F-015): no subprocess means no
@@ -362,13 +456,13 @@ fn resolve_just() -> Result<std::path::PathBuf, String> {
 ///
 /// F-013 first materializes the exact immutable blob bytes into the worktree,
 /// so a smudge/attribute filter cannot replace the plan. The plan's
-/// stdout/stderr are redirected to the null device (never buffered in memory),
-/// so a high-volume plan cannot grow git-forge's heap. The wait is bounded
-/// (`timeout`); on expiry (F-015) the WHOLE process group is killed and reaped
-/// (not just the direct child), so a background descendant whose leader exits
-/// cannot survive the deadline. Returns the exit status, whether the deadline
-/// was hit (F-002/F-015), and a `detail` reason for non-green runs that are
-/// neither a plain non-zero exit nor a timeout.
+/// stdout and stderr share one pipe drained by [`output::Capture`], which
+/// keeps only the last 4 KiB, so a high-volume plan cannot grow git-forge's
+/// heap or block on a full pipe. The wait is bounded (`timeout`); on expiry
+/// (F-015) the WHOLE process group is killed and reaped (not just the direct
+/// child), so a background descendant whose leader exits cannot survive the
+/// deadline. Returns the failure (reason + detail) of a non-green run and
+/// the bounded output tail.
 ///
 /// KNOWN LIMITATION: a descendant that creates its own new session/process
 /// group (e.g. a plan that `setsid`s a long-lived job) leaves the original
@@ -377,7 +471,8 @@ fn resolve_just() -> Result<std::path::PathBuf, String> {
 /// deadline and survives the worktree cleanup. Process-group signalling is
 /// containment-only-within-same-group; full containment of a daemonizing plan
 /// requires OS-level isolation (container/chroot), which is out of scope for
-/// this single-user local tool.
+/// this single-user local tool. Such a descendant can also hold the output
+/// pipe open; the tail then holds what was read within a bounded wait.
 ///
 /// Related residual: if the group-KILL itself fails (e.g. EPERM from a
 /// process-quota restriction on the direct `kill(2)` syscall), a same-group
@@ -393,36 +488,46 @@ pub(crate) fn run_ci_plan(
     plan: &CiPlan,
     timeout: Duration,
 ) -> CiRun {
-    use std::os::unix::process::CommandExt as _;
-    if materialize_plan(repo, oid, worktree, plan).is_err() {
-        // A snapshot plan that cannot be materialized is treated like a spawn
-        // failure: record a failed Check and let the cleanup path run.
-        return CiRun {
-            status: None,
-            timed_out: false,
-            detail: None,
-        };
+    let cmd = match plan_command(repo, oid, worktree, plan) {
+        Ok(cmd) => cmd,
+        Err(failure) => return CiRun::not_run(failure),
+    };
+    let (capture, writer) = match output::Capture::start() {
+        Ok(started) => started,
+        Err(e) => return CiRun::not_run(pipe_failure(e)),
+    };
+    let failure = spawn_and_wait(cmd, writer, timeout).err();
+    CiRun {
+        failure,
+        tail: capture.finish(),
     }
+}
+
+fn pipe_failure(e: std::io::Error) -> CiFailure {
+    CiFailure::new(
+        CiReason::SpawnFailed,
+        format!("cannot open the plan output pipe: {e}"),
+    )
+}
+
+/// Materialize the plan and build its hardened command (F-013/F-027).
+fn plan_command(
+    repo: &git2::Repository,
+    oid: git2::Oid,
+    worktree: &Path,
+    plan: &CiPlan,
+) -> Result<std::process::Command, CiFailure> {
+    use std::os::unix::process::CommandExt as _;
+    materialize_plan(repo, oid, worktree, plan)?;
     let (prog, jf_arg): (std::path::PathBuf, Option<std::path::PathBuf>) = match plan {
         CiPlan::CiSh => (std::path::PathBuf::from("/bin/bash"), None),
         CiPlan::JustCheck(name) => {
-            let jf = worktree.join(name);
             // F-027: resolve `just` to a TRUSTED ABSOLUTE path so a caller
             // cannot prepend a `just` shim to `PATH` and fake a green Check.
-            let just = match resolve_just() {
-                Ok(j) => j,
-                Err(_) => {
-                    // `just` is not at a trusted system location: an honest spawn
-                    // failure (recorded as a failed Check), never a
-                    // caller-resolved binary.
-                    return CiRun {
-                        status: None,
-                        timed_out: false,
-                        detail: None,
-                    };
-                }
-            };
-            (just, Some(jf))
+            // `just` not at a trusted location is an honest spawn failure,
+            // never a caller-resolved binary.
+            let just = resolve_just().map_err(|e| CiFailure::new(CiReason::SpawnFailed, e))?;
+            (just, Some(worktree.join(name)))
         }
     };
     let mut cmd = std::process::Command::new(&prog);
@@ -446,8 +551,6 @@ pub(crate) fn run_ci_plan(
     }
     cmd.current_dir(worktree)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
         // F-027: keep `JUST_DRY_RUN` forced off so a caller cannot skip a
         // failing recipe; the rest of the caller's env is tightened below.
         .env("JUST_DRY_RUN", "false")
@@ -456,15 +559,35 @@ pub(crate) fn run_ci_plan(
                            // fake the plan — Git location overrides, Bash exported functions, and the
                            // shell control vars — so the plan necessarily runs against the snapshot.
     tighten_ci_env(&mut cmd);
-    let mut child = match cmd.spawn() {
-        Ok(c) => c,
-        Err(_) => {
-            return CiRun {
-                status: None,
-                timed_out: false,
-                detail: None,
-            };
-        }
+    Ok(cmd)
+}
+
+/// Spawn `cmd` with stdout and stderr on the capture pipe, then wait for it
+/// under the bounded deadline.
+fn spawn_and_wait(
+    mut cmd: std::process::Command,
+    writer: std::io::PipeWriter,
+    timeout: Duration,
+) -> Result<(), CiFailure> {
+    let stderr = writer.try_clone().map_err(pipe_failure)?;
+    cmd.stdout(writer).stderr(stderr);
+    let spawned = cmd.spawn();
+    // Close the parent's copies of the pipe writer, so the reader sees end
+    // of file once the plan's process group exits.
+    drop(cmd);
+    let mut child = spawned.map_err(|e| {
+        CiFailure::new(CiReason::SpawnFailed, format!("cannot start the plan: {e}"))
+    })?;
+    wait_group(&mut child, timeout)
+}
+
+/// Wait for the plan's process group under the deadline (F-002/F-015).
+fn wait_group(child: &mut std::process::Child, timeout: Duration) -> Result<(), CiFailure> {
+    let unproven = || {
+        CiFailure::new(
+            CiReason::CleanupFailed,
+            "could not prove the process group is empty",
+        )
     };
     let pgid = child.id() as i32;
     // F-026: never fall back to an unchecked `Instant + _` (which can panic near
@@ -480,26 +603,19 @@ pub(crate) fn run_ci_plan(
                 // F-015: treat leader exit as completion only after proving the
                 // process group is empty — a `sleep 60 & exit 0` plan reaps its
                 // leader but leaves the descendant alive in the group.
-                match pgid_alive(pgid) {
+                return match pgid_alive(pgid) {
                     Ok(true) => {
                         // Descendants are alive: kill the group and FAIL the
                         // run (a survivor that cannot be proven dead must not
                         // be recorded green).
                         let _ = signal_pg(pgid, libc::SIGKILL);
                         let _ = child.wait();
-                        return CiRun {
-                            status: None,
-                            timed_out: false,
-                            detail: Some("left a background process running"),
-                        };
+                        Err(CiFailure::new(
+                            CiReason::CleanupFailed,
+                            "left a background process running",
+                        ))
                     }
-                    Ok(false) => {
-                        return CiRun {
-                            status: st.code(),
-                            timed_out: false,
-                            detail: None,
-                        };
-                    }
+                    Ok(false) => exit_result(st),
                     Err(_) => {
                         // Cannot prove the group is empty — a descendant may
                         // still be alive, so the run is NOT completed. This is
@@ -510,14 +626,10 @@ pub(crate) fn run_ci_plan(
                         // bounded-reap so a descendant is not left running while
                         // the worktree is removed.
                         let _ = signal_pg(pgid, libc::SIGKILL);
-                        let _ = reap_with_grace(&mut child);
-                        return CiRun {
-                            status: None,
-                            timed_out: false,
-                            detail: Some("could not prove the process group is empty"),
-                        };
+                        let _ = reap_with_grace(child);
+                        Err(unproven())
                     }
-                }
+                };
             }
             Ok(None) => {}
             Err(_) => {
@@ -526,34 +638,37 @@ pub(crate) fn run_ci_plan(
                 // signal the whole group then bounded-reap, so a surviving
                 // descendant is not left running while the worktree is removed.
                 let _ = signal_pg(pgid, libc::SIGKILL);
-                let _ = reap_with_grace(&mut child);
-                return CiRun {
-                    status: None,
-                    timed_out: false,
-                    detail: Some("could not prove the process group is empty"),
-                };
+                let _ = reap_with_grace(child);
+                return Err(unproven());
             }
         }
         std::thread::sleep(Duration::from_millis(20));
     }
     // F-015/F-024: kill+reap the COMPLETE process group via a direct `kill(2)`
     // syscall so a background descendant cannot survive the bounded deadline.
-    // The kill RESULT is checked: on failure (e.g. EPERM under a restrictive
-    // process quota) the child may still be running, so the reap is bounded —
-    // an unbounded `child.wait()` on a live child would hang `ci run` and
-    // leave the run unrecorded.
     // The kill RESULT is not a signal of completion either way: even a
     // SUCCESSFUL signal does not prove prompt termination (a child in an
     // uninterruptible kernel wait can remain unreaped), and a FAILED signal
     // (e.g. the user's process quota is exhausted) leaves the child running —
-    // so the reap is bounded in both cases (never hang without a Check).
+    // so the reap is bounded in both cases (never hang without a Check). A
+    // run that hit the deadline is a timeout whatever its exit status.
     let _ = signal_pg(pgid, libc::SIGKILL);
-    let status = reap_with_grace(&mut child);
-    CiRun {
-        status,
-        timed_out: true,
-        detail: None,
-    }
+    let _ = reap_with_grace(child);
+    Err(CiFailure::new(CiReason::Timeout, "timed out"))
+}
+
+/// Map a plan exit status whose process group is proven empty: 0 is green,
+/// anything else — a non-zero code or a terminating signal — is
+/// `nonzero_exit`.
+fn exit_result(status: std::process::ExitStatus) -> Result<(), CiFailure> {
+    use std::os::unix::process::ExitStatusExt as _;
+    let detail = match (status.code(), status.signal()) {
+        (Some(0), _) => return Ok(()),
+        (Some(code), _) => format!("exited with status {code}"),
+        (None, Some(signal)) => format!("terminated by signal {signal}"),
+        (None, None) => "exited without a status".to_string(),
+    };
+    Err(CiFailure::new(CiReason::NonzeroExit, detail))
 }
 
 /// Bound the reap of a child whose group kill failed: poll `try_wait` for a

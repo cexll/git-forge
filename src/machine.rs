@@ -188,13 +188,20 @@ pub(crate) fn issue_list_json(
 
 // ─────────────────────────── pr schemas ───────────────────────────
 
-/// `ci` member of the pr schemas: `{"status":..,"plan":..}` or `null`.
-fn ci_json(status: Option<&str>, plan: Option<&str>) -> String {
-    match status {
+/// `ci` member of the pr schemas: `{"status":..,"plan":..,"reason":..,"tail":..}`
+/// or `null`. `reason` and `tail` are `null` unless the latest Check failed
+/// with a recorded reason; a recorded empty tail stays `""`.
+fn ci_json(state: &crate::event::PrState) -> String {
+    match state.ci_status.as_deref() {
         Some(s) => format!(
-            "{{\"status\":{},\"plan\":{}}}",
+            "{{\"status\":{},\"plan\":{},\"reason\":{},\"tail\":{}}}",
             json_escape(s),
-            opt_str(plan),
+            opt_str(state.ci_plan.as_deref()),
+            opt_str(state.ci_reason.as_deref()),
+            state
+                .ci_tail
+                .as_deref()
+                .map_or_else(|| "null".to_string(), json_escape),
         ),
         None => "null".to_string(),
     }
@@ -233,7 +240,7 @@ pub(crate) fn pr_json(state: &crate::event::PrState) -> String {
         opt_str(state.decision_role.as_deref()),
         opt_str(state.merge_result.as_deref()),
         opt_str(state.abandoned.as_deref()),
-        ci_json(state.ci_status.as_deref(), state.ci_plan.as_deref()),
+        ci_json(state),
         num(state.generation),
         prepared,
         opt_str(state.creator_role.as_deref()),

@@ -296,3 +296,148 @@ fn refuses_script_after_backslash_terminated_single_quoted_arg() {
         "a benign attribute list with a backslash-terminated single-quoted arg must be allowed"
     );
 }
+
+// ── #38 CI failure reason and bounded output tail ──
+
+use super::output::{bounded_tail, Capture, TAIL_BYTES};
+use super::{exit_result, failed_check_error, CiFailure, CiReason};
+
+#[test]
+fn bounded_tail_keeps_short_output_exactly() {
+    assert_eq!(bounded_tail(b""), "");
+    assert_eq!(bounded_tail(b"ok\n"), "ok\n");
+    let exact = "a".repeat(4096);
+    assert_eq!(bounded_tail(exact.as_bytes()), exact);
+}
+
+#[test]
+fn bounded_tail_cuts_to_the_last_4096_bytes() {
+    let output = format!("X{}", "a".repeat(4096));
+    assert_eq!(bounded_tail(output.as_bytes()), "a".repeat(4096));
+    let numbered: String = (0..2000).map(|i| format!("{i:04}\n")).collect();
+    assert_eq!(
+        bounded_tail(numbered.as_bytes()),
+        &numbered[numbered.len() - 4096..]
+    );
+}
+
+#[test]
+fn bounded_tail_drops_a_character_split_by_the_cut() {
+    // 2-, 3- and 4-byte characters whose first byte falls just before the cut.
+    for ch in ["é", "中", "🚀"] {
+        let output = format!("{}{}", ch.repeat(3000), "z");
+        let tail = bounded_tail(output.as_bytes());
+        assert!(tail.len() <= TAIL_BYTES, "{ch}: {}", tail.len());
+        assert!(!tail.contains('\u{fffd}'), "{ch}: split sequence decoded");
+        assert!(output.ends_with(&tail), "{ch}: tail is a suffix");
+        assert!(
+            tail.len() > TAIL_BYTES - ch.len(),
+            "{ch}: only the split char dropped"
+        );
+    }
+}
+
+#[test]
+fn bounded_tail_replaces_invalid_bytes_within_the_bound() {
+    assert_eq!(bounded_tail(b"\x80\xff ok\n"), "\u{fffd}\u{fffd} ok\n");
+    // Invalid bytes are not continuation bytes of a cut character: 0xFF is
+    // never dropped as a partial sequence, it decodes to U+FFFD.
+    let flood = vec![0xFFu8; 5000];
+    let tail = bounded_tail(&flood);
+    assert_eq!(tail, "\u{fffd}".repeat(1365));
+    assert!(tail.len() <= TAIL_BYTES);
+    // Control bytes stay exact; the terminal escapes them separately.
+    assert_eq!(bounded_tail(b"\x1b[31m\x00\n"), "\u{1b}[31m\u{0}\n");
+}
+
+/// F-016: the capture keeps at most TAIL_BYTES + 1 bytes in memory however
+/// much the plan writes, and its tail equals the tail of the whole output.
+#[test]
+fn capture_memory_stays_bounded_while_draining() {
+    use std::io::Write as _;
+    let (capture, mut writer) = Capture::start().unwrap();
+    let mut all = Vec::new();
+    for i in 0..1024u32 {
+        let chunk: Vec<u8> = (0..1024u32).map(|j| ((i * 7 + j) % 251) as u8).collect();
+        writer.write_all(&chunk).unwrap();
+        all.extend_from_slice(&chunk);
+        assert!(
+            capture.kept_len() <= TAIL_BYTES + 1,
+            "kept {}",
+            capture.kept_len()
+        );
+    }
+    drop(writer);
+    assert_eq!(capture.finish(), bounded_tail(&all));
+}
+
+#[test]
+fn exit_status_maps_to_nonzero_exit_or_green() {
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::ExitStatus;
+    assert_eq!(exit_result(ExitStatus::from_raw(0)), Ok(()));
+    assert_eq!(
+        exit_result(ExitStatus::from_raw(3 << 8)),
+        Err(CiFailure::new(
+            CiReason::NonzeroExit,
+            "exited with status 3"
+        ))
+    );
+    assert_eq!(
+        exit_result(ExitStatus::from_raw(9)),
+        Err(CiFailure::new(
+            CiReason::NonzeroExit,
+            "terminated by signal 9"
+        ))
+    );
+}
+
+#[test]
+fn reason_names_are_the_wire_values() {
+    let names: Vec<&str> = [
+        CiReason::PlanInvalid,
+        CiReason::SpawnFailed,
+        CiReason::Timeout,
+        CiReason::NonzeroExit,
+        CiReason::CleanupFailed,
+    ]
+    .into_iter()
+    .map(CiReason::as_str)
+    .collect();
+    assert_eq!(
+        names,
+        [
+            "plan_invalid",
+            "spawn_failed",
+            "timeout",
+            "nonzero_exit",
+            "cleanup_failed"
+        ]
+    );
+}
+
+#[test]
+fn failed_check_error_escapes_terminal_text_and_keeps_data_exact() {
+    let error = failed_check_error(
+        4,
+        "CI run for PR #4 failed (.forge/ci.sh): exited with status 1".into(),
+        CiReason::NonzeroExit,
+        "a\u{1b}[2J\nb",
+        "hint",
+    );
+    assert_eq!(error.code, "E_CI_FAILED");
+    assert_eq!(
+        error.message,
+        "CI run for PR #4 failed (.forge/ci.sh): exited with status 1; reason: nonzero_exit; \
+         output tail: a\\x1b[2J\\x0ab"
+    );
+    assert_eq!(
+        error.to_json(),
+        "{\"error\":{\"code\":\"E_CI_FAILED\",\"message\":\"CI run for PR #4 failed \
+         (.forge/ci.sh): exited with status 1; reason: nonzero_exit; output tail: \
+         a\\\\x1b[2J\\\\x0ab\",\"input\":\"4\",\"hint\":\"hint\",\"retryable\":false,\
+         \"data\":{\"pr\":4,\"reason\":\"nonzero_exit\",\"tail\":\"a\\u001b[2J\\nb\"}}}"
+    );
+    let empty = failed_check_error(4, "m".into(), CiReason::PlanInvalid, "", "hint");
+    assert_eq!(empty.message, "m; reason: plan_invalid");
+}

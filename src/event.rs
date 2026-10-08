@@ -401,6 +401,13 @@ pub struct PrState {
     pub ci_base_head: Option<String>,
     /// Timestamp of the latest CI Check.
     pub ci_ts: Option<String>,
+    /// Why the latest CI Check failed (`plan_invalid`, `spawn_failed`,
+    /// `timeout`, `nonzero_exit`, `cleanup_failed`); `None` for a green or
+    /// pending Check and for Checks recorded before the field existed.
+    pub ci_reason: Option<String>,
+    /// Last 4 KiB of the failed run's combined output (`None` as for
+    /// `ci_reason`).
+    pub ci_tail: Option<String>,
     /// The latest `pr.prepared` candidate (last-wins), if any. `None` when no
     /// prepare has run (unmoved-base legacy path). Merge of a moved base
     /// requires a candidate; the gate cross-checks its generation and
@@ -544,6 +551,8 @@ impl PrState {
                 self.ci_strategy = str_field(&event.body, "strategy");
                 self.ci_result_commit = str_field(&event.body, "result_commit");
                 self.ci_result_tree = str_field(&event.body, "result_tree");
+                self.ci_reason = str_field(&event.body, "reason");
+                self.ci_tail = str_field(&event.body, "tail");
             }
             _ => {}
         }

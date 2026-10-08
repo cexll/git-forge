@@ -230,7 +230,7 @@ pub(crate) fn verify_result_ci(
         &plan,
         crate::ci::ci_timeout(std::env::var("GIT_FORGE_CI_TIMEOUT").ok().as_deref()),
     );
-    if run.status == Some(0) && !run.timed_out {
+    if run.failure.is_none() {
         Ok(())
     } else {
         Err(format!(
