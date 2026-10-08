@@ -35,6 +35,7 @@ impl JsonValue {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventKind {
     IssueCreated,
+    IssueUpdated,
     IssueComment,
     IssueClose,
     IssueReopen,
@@ -52,6 +53,7 @@ impl EventKind {
     pub fn as_str(self) -> &'static str {
         match self {
             EventKind::IssueCreated => "issue.created",
+            EventKind::IssueUpdated => "issue.updated",
             EventKind::IssueComment => "issue.comment",
             EventKind::IssueClose => "issue.close",
             EventKind::IssueReopen => "issue.reopen",
@@ -73,6 +75,7 @@ impl std::str::FromStr for EventKind {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         Ok(match s {
             "issue.created" => Self::IssueCreated,
+            "issue.updated" => Self::IssueUpdated,
             "issue.comment" => Self::IssueComment,
             "issue.close" => Self::IssueClose,
             "issue.reopen" => Self::IssueReopen,
@@ -305,6 +308,9 @@ pub struct IssueState {
     pub id: u64,
     pub title: Option<String>,
     pub description: Option<String>,
+    pub key: Option<String>,
+    pub parent: Option<u64>,
+    pub blocked_by: Vec<u64>,
     pub labels: Vec<String>,
     pub comments: Vec<String>,
     pub open: bool,
@@ -430,11 +436,12 @@ pub struct PrState {
     pub decision_role: Option<String>,
 }
 
+fn str_field(body: &HashMap<String, JsonValue>, key: &str) -> Option<String> {
+    body.get(key).and_then(JsonValue::as_str).map(String::from)
+}
+
 impl PrState {
     fn apply(&mut self, event: &Event) {
-        let str_field = |m: &HashMap<String, JsonValue>, key: &str| {
-            m.get(key).and_then(JsonValue::as_str).map(String::from)
-        };
         match event.kind {
             EventKind::PrCreated => {
                 self.title = str_field(&event.body, "title");
@@ -577,7 +584,28 @@ pub fn fold(events: &[Event]) -> FoldState {
                             .and_then(JsonValue::as_str)
                             .map(String::from);
                         state.issue.labels = labels_from(&event.body);
+                        state.issue.key = str_field(&event.body, "key");
+                        state.issue.parent = event.body.get("parent").and_then(JsonValue::as_u64);
+                        state.issue.blocked_by = issue_blockers_from(&event.body);
                         state.issue.open = true;
+                    }
+                    EventKind::IssueUpdated => {
+                        if event.body.contains_key("title") {
+                            state.issue.title = str_field(&event.body, "title");
+                        }
+                        if event.body.contains_key("description") {
+                            state.issue.description = str_field(&event.body, "description");
+                        }
+                        if event.body.contains_key("labels") {
+                            state.issue.labels = labels_from(&event.body);
+                        }
+                        if event.body.contains_key("parent") {
+                            state.issue.parent =
+                                event.body.get("parent").and_then(JsonValue::as_u64);
+                        }
+                        if event.body.contains_key("blocked_by") {
+                            state.issue.blocked_by = issue_blockers_from(&event.body);
+                        }
                     }
                     EventKind::IssueComment => {
                         if let Some(body) = event.body.get("body").and_then(JsonValue::as_str) {
@@ -618,6 +646,13 @@ fn labels_from(body: &HashMap<String, JsonValue>) -> Vec<String> {
             .filter_map(JsonValue::as_str)
             .map(String::from)
             .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn issue_blockers_from(body: &HashMap<String, JsonValue>) -> Vec<u64> {
+    match body.get("blocked_by") {
+        Some(JsonValue::Array(items)) => items.iter().filter_map(JsonValue::as_u64).collect(),
         _ => Vec::new(),
     }
 }
@@ -937,7 +972,7 @@ impl<'a> Parser<'a> {
     }
 }
 
-fn parse_json_value(input: &str) -> Option<JsonValue> {
+pub(crate) fn parse_json_value(input: &str) -> Option<JsonValue> {
     let mut parser = Parser::new(input);
     let value = parser.parse_value()?;
     parser.skip_ws();

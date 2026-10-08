@@ -24,6 +24,7 @@ fn event(kind: EventKind, entity: &str, id: u64, actor: &str, body: &[(&str, Jso
 fn serializes_all_l1_kinds() {
     for kind in [
         EventKind::IssueCreated,
+        EventKind::IssueUpdated,
         EventKind::IssueComment,
         EventKind::IssueClose,
         EventKind::IssueReopen,
@@ -128,6 +129,108 @@ fn folds_issue_and_pr_fields() {
     assert_eq!(state.pr.id, 3);
     assert_eq!(state.pr.base_head.as_deref(), Some("b"));
     assert_eq!(state.pr.merge_base.as_deref(), Some("m"));
+}
+
+#[test]
+fn legacy_issue_logs_default_graph_fields() {
+    let wire = r#"{"v":1,"id":"11111111-1111-4111-8111-111111111111","kind":"issue.created","entity":"issue","entity_id":7,"ts":"2026-10-08T00:00:00Z","actor":"a@x","body":{"title":"Legacy","description":"Body"}}"#;
+    let created = Event::from_json(wire).expect("legacy schema v1 remains readable");
+    let issue = fold(&[created]).issue;
+    assert_eq!(issue.title.as_deref(), Some("Legacy"));
+    assert_eq!(issue.description.as_deref(), Some("Body"));
+    assert_eq!(issue.key, None);
+    assert_eq!(issue.parent, None);
+    assert!(issue.blocked_by.is_empty());
+    assert!(issue.open);
+}
+
+#[test]
+fn issue_updates_preserve_omitted_fields_and_clear_explicit_fields() {
+    let created = event(
+        EventKind::IssueCreated,
+        "issue",
+        7,
+        "a@x",
+        &[
+            ("title", JsonValue::String("Ticket".into())),
+            ("description", JsonValue::String("Body".into())),
+            ("key", JsonValue::String("ticket".into())),
+            ("parent", JsonValue::Number(1)),
+            ("blocked_by", JsonValue::Array(vec![JsonValue::Number(2)])),
+            (
+                "labels",
+                JsonValue::Array(vec![JsonValue::String("ready".into())]),
+            ),
+        ],
+    );
+    let close = event(EventKind::IssueClose, "issue", 7, "a@x", &[]);
+    let update_wire = r#"{"v":1,"id":"22222222-2222-4222-8222-222222222222","kind":"issue.updated","entity":"issue","entity_id":7,"ts":"2026-10-08T00:00:01Z","actor":"a@x","body":{"title":"Changed"}}"#;
+    let updated = Event::from_json(update_wire).expect("issue.updated parses");
+    let issue = fold(&[created.clone(), close.clone(), updated.clone()]).issue;
+    assert_eq!(issue.title.as_deref(), Some("Changed"));
+    assert_eq!(issue.description.as_deref(), Some("Body"));
+    assert_eq!(issue.key.as_deref(), Some("ticket"));
+    assert_eq!(issue.parent, Some(1));
+    assert_eq!(issue.blocked_by, vec![2]);
+    assert_eq!(issue.labels, vec!["ready"]);
+    assert!(!issue.open);
+    let clear = event(
+        updated.kind,
+        "issue",
+        7,
+        "a@x",
+        &[
+            ("description", JsonValue::Null),
+            ("parent", JsonValue::Null),
+            ("labels", JsonValue::Array(vec![])),
+            ("blocked_by", JsonValue::Array(vec![])),
+            ("key", JsonValue::String("must-not-change".into())),
+        ],
+    );
+    let issue = fold(&[created, close, updated, clear]).issue;
+    assert_eq!(issue.title.as_deref(), Some("Changed"));
+    assert_eq!(issue.key.as_deref(), Some("ticket"));
+    assert_eq!(issue.description, None);
+    assert_eq!(issue.parent, None);
+    assert!(issue.labels.is_empty());
+    assert!(issue.blocked_by.is_empty());
+    assert!(!issue.open);
+}
+
+#[test]
+fn issue_updates_replace_present_graph_fields() {
+    let created = event(
+        EventKind::IssueCreated,
+        "issue",
+        7,
+        "a@x",
+        &[("title", JsonValue::String("Ticket".into()))],
+    );
+    let updated = event(
+        "issue.updated".parse().expect("update wire kind"),
+        "issue",
+        7,
+        "a@x",
+        &[
+            ("description", JsonValue::String("New body".into())),
+            (
+                "labels",
+                JsonValue::Array(vec![JsonValue::String("ready".into())]),
+            ),
+            ("parent", JsonValue::Number(1)),
+            (
+                "blocked_by",
+                JsonValue::Array(vec![JsonValue::Number(2), JsonValue::Number(3)]),
+            ),
+        ],
+    );
+    let issue = fold(&[created, updated]).issue;
+    assert_eq!(issue.title.as_deref(), Some("Ticket"));
+    assert_eq!(issue.description.as_deref(), Some("New body"));
+    assert_eq!(issue.labels, vec!["ready"]);
+    assert_eq!(issue.parent, Some(1));
+    assert_eq!(issue.blocked_by, vec![2, 3]);
+    assert!(issue.open);
 }
 
 #[test]
@@ -269,4 +372,36 @@ fn control_chars_are_escaped_in_wire_json() {
     );
     let back = Event::from_json(&json).expect("control chars must round-trip");
     assert_eq!(back.body, e.body);
+}
+
+#[test]
+fn issue_new_graph_options_reject_missing_invalid_and_duplicate_parent() {
+    for args in [
+        vec!["new", "Ticket", "--parent"],
+        vec!["new", "Ticket", "--blocked-by"],
+        vec!["new", "Ticket", "--parent", "not-an-id"],
+        vec!["new", "Ticket", "--blocked-by", "not-an-id"],
+        vec!["new", "Ticket", "--parent", "1", "--parent", "2"],
+    ] {
+        let args: Vec<_> = args.into_iter().map(String::from).collect();
+        assert!(
+            git_forge::issue::run_issue(&args).is_err(),
+            "args: {args:?}"
+        );
+    }
+}
+
+#[test]
+fn issue_graph_help_describes_apply_and_filter_options() {
+    for (subcommand, required) in [
+        ("apply", vec!["<dir|file>", "--dry-run", "--json"]),
+        ("new", vec!["--parent", "--blocked-by"]),
+        ("list", vec!["--parent", "--state open|closed|all"]),
+    ] {
+        let help = git_forge::issue::run_issue(&[subcommand.into(), "--help".into()])
+            .expect("help needs no repository");
+        for flag in required {
+            assert!(help.contains(flag), "missing {flag} in {help}");
+        }
+    }
 }

@@ -71,6 +71,7 @@ fn from_json_rejects_malformed_shapes() {
 fn event_kind_string_roundtrip_all_kinds() {
     for kind in [
         EventKind::IssueCreated,
+        EventKind::IssueUpdated,
         EventKind::IssueComment,
         EventKind::IssueClose,
         EventKind::IssueReopen,
