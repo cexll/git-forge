@@ -24,7 +24,7 @@
 
 ### Storage
 
-**Forge Ref** — a git ref under `refs/forge/` that stores entity event chains and related metadata. Ref content may be packed by git; must be discovered via git ref APIs, not filesystem paths. _Avoid_: branch, metadata ref.
+**Forge Ref** — a git ref under `refs/forge/` that stores entity event chains and related metadata. Ref content may be packed by git; read targets through Git ref APIs. Issue-name discovery also checks loose entries in the common Git directory because libgit2 omits malformed loose refs. _Avoid_: branch, metadata ref.
 
 **Local Index** — a local, rebuildable cache (initially SQLite) derived from Forge Refs, providing query/search. It is not authoritative. _Avoid_: database, primary store.
 

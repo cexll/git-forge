@@ -1,7 +1,13 @@
 //! Snapshot-bound issue graph transactions; no ref changes before final CAS.
 use super::*;
 use crate::event::{fold, IssueState};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+
+pub(crate) struct IssueRefs {
+    pub tips: BTreeMap<u64, Oid>,
+    pub states: BTreeMap<u64, IssueState>,
+    pub created: BTreeSet<u64>,
+}
 
 pub(crate) struct IssueSnapshot {
     pub counter_tip: Option<Oid>,
@@ -19,27 +25,7 @@ impl EventStore {
             };
             #[cfg(test)]
             tests::after_counter_read(self);
-            let mut tips = BTreeMap::new();
-            let mut states = BTreeMap::new();
-            for reference in self.repo.references_glob("refs/forge/issues/*")? {
-                let reference = reference?;
-                let name = reference
-                    .name()
-                    .ok_or_else(|| StoreError::InvalidState("non-UTF-8 issue ref".into()))?;
-                let id: u64 = name
-                    .strip_prefix("refs/forge/issues/")
-                    .and_then(|s| s.parse().ok())
-                    .filter(|id| *id > 0)
-                    .ok_or_else(|| StoreError::InvalidState(format!("invalid issue ref {name}")))?;
-                let tip = reference.target().ok_or_else(|| {
-                    StoreError::InvalidState(format!("symbolic issue ref {name}"))
-                })?;
-                tips.insert(id, tip);
-                let events = self.chain_events_from_tip(tip)?;
-                if !events.is_empty() {
-                    states.insert(id, fold(&events).issue);
-                }
-            }
+            let IssueRefs { tips, states, .. } = self.read_issue_refs()?;
             // Allocations publish the counter and new Issue together. Reject a
             // graph read that crossed an allocation before checking id collisions.
             if self.current_tip(COUNTER_REF)? != counter_tip {
@@ -53,6 +39,90 @@ impl EventStore {
             });
         }
         Err(StoreError::CasConflict)
+    }
+
+    pub(crate) fn read_issue_refs(&self) -> Result<IssueRefs, StoreError> {
+        let mut tips = BTreeMap::new();
+        let mut states = BTreeMap::new();
+        let mut created = BTreeSet::new();
+        let mut names = BTreeSet::new();
+        for reference in self.repo.references_glob("refs/forge/issues/*")? {
+            let reference = reference?;
+            if let Some(name) = reference.name() {
+                names.insert(name.to_owned());
+            }
+        }
+        // libgit2's reference and name iterators skip malformed loose refs.
+        // Discover their names separately; Git still owns every target read.
+        let loose = self.repo.commondir().join("refs/forge/issues");
+        match std::fs::read_dir(&loose) {
+            Ok(entries) => {
+                for entry in entries {
+                    let entry = entry.map_err(|e| {
+                        StoreError::InvalidState(format!("cannot enumerate refs/forge/issues: {e}"))
+                    })?;
+                    let name = entry.file_name();
+                    if let Some(suffix) = name.to_str().filter(|s| {
+                        matches!(s.as_bytes().first(), Some(b'1'..=b'9'))
+                            && s.bytes().all(|b| b.is_ascii_digit())
+                            && s.parse::<u64>().is_ok()
+                    }) {
+                        let kind = entry.file_type().map_err(|e| {
+                            StoreError::InvalidState(format!(
+                                "cannot read refs/forge/issues/{suffix}: {e}"
+                            ))
+                        })?;
+                        if !kind.is_dir() {
+                            names.insert(format!("refs/forge/issues/{suffix}"));
+                        }
+                    }
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(StoreError::InvalidState(format!(
+                    "cannot enumerate refs/forge/issues: {e}"
+                )));
+            }
+        }
+        for name in names {
+            let Some(id) = name
+                .strip_prefix("refs/forge/issues/")
+                .filter(|s| {
+                    matches!(s.as_bytes().first(), Some(b'1'..=b'9'))
+                        && s.bytes().all(|b| b.is_ascii_digit())
+                })
+                .and_then(|s| s.parse::<u64>().ok())
+            else {
+                continue;
+            };
+            let reference = self
+                .repo
+                .find_reference(&name)
+                .map_err(|e| StoreError::InvalidState(format!("cannot read {name}: {e}")))?;
+            let tip = reference
+                .target()
+                .ok_or_else(|| StoreError::InvalidState(format!("symbolic issue ref {name}")))?;
+            let events = self
+                .chain_events_from_tip(tip)
+                .map_err(|e| StoreError::InvalidState(format!("cannot read {name}: {e}")))?;
+            tips.insert(id, tip);
+            if events.iter().any(|event| {
+                event.entity == "issue"
+                    && event.kind == EventKind::IssueCreated
+                    && event.entity_id == id
+            }) {
+                created.insert(id);
+            }
+            if !events.is_empty() {
+                states.insert(id, fold(&events).issue);
+            }
+        }
+        Ok(IssueRefs {
+            tips,
+            states,
+            created,
+        })
     }
 }
 impl BoundEventStore {

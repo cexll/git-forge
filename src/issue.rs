@@ -170,17 +170,20 @@ fn cmd_show(store: &EventStore, args: &[String]) -> Result<String, String> {
     )?;
     let id = parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
     let r = crate::store::issue_ref(id);
-    if !store_has_ref(store, &r) {
-        return Err(format!("issue #{id} does not exist"));
+    match store.repo().find_reference(&r) {
+        Ok(_) => {}
+        Err(e) if e.code() == git2::ErrorCode::NotFound => {
+            return Err(format!("issue #{id} does not exist"));
+        }
+        Err(e) => return Err(format!("cannot read {r}: {e}")),
     }
-    let chain = store.read_chain(&r).map_err(|e| e.to_string())?;
-    if chain.is_empty() {
-        return Err(format!("issue #{id} has no events"));
-    }
-    let state = crate::event::fold(&chain).issue;
     let all = machine::fold_all_issues(store)?;
+    let state = all
+        .iter()
+        .find(|state| state.id == id)
+        .ok_or_else(|| format!("issue #{id} does not exist"))?;
     if json {
-        return Ok(machine::issue_json(&state, &all));
+        return Ok(machine::issue_json(state, &all));
     }
     let mut out = format!(
         "#{} {} — {}\n",
