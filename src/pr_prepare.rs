@@ -446,6 +446,10 @@ fn prepare_conflict_error(conflict: &PrepareConflict<'_>) -> CliError {
         paths,
         cleanup,
     } = *conflict;
+    // Paths and branch names come from repository content; escape control
+    // characters in the human message only (`data` keeps the exact paths).
+    let base_ref = crate::cli::sanitize_terminal(base_ref);
+    let source_ref = crate::cli::sanitize_terminal(source_ref);
     let count = match paths.len() {
         1 => "1 path".to_string(),
         n => format!("{n} paths"),
@@ -453,7 +457,7 @@ fn prepare_conflict_error(conflict: &PrepareConflict<'_>) -> CliError {
     let mut shown = paths
         .iter()
         .take(MESSAGE_PATH_LIMIT)
-        .map(String::as_str)
+        .map(|path| crate::cli::sanitize_terminal(path))
         .collect::<Vec<_>>()
         .join(", ");
     if paths.len() > MESSAGE_PATH_LIMIT {

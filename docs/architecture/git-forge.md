@@ -195,9 +195,13 @@ PR #<n> cannot be prepared with strategy <s>: source <source> conflicts with bas
 ```
 
 - The message lists at most 20 paths, then ` (and <m> more)`.
-- Paths are in index order, one per path, whatever the conflict kind
-  (content, add/add, modify/delete, rename/delete, or a hook that writes
-  unmerged entries).
+- Paths are the unmerged (stage 1-3) index entries, one per exact path
+  byte sequence, in index order, whatever the conflict kind (content,
+  add/add, modify/delete, rename/delete, or a hook that writes unmerged
+  entries). Paths that differ only in case stay distinct under
+  `core.ignorecase`.
+- The message escapes control characters (`\x0a` for a newline) in paths
+  and branch names; `data.paths` keeps the exact paths.
 - Git's own diagnostic text is not forwarded: it names commands
   (`git rebase --continue`) that do not apply to the removed worktree.
 - The final clause is the unchanged cleanup outcome. When worktree removal

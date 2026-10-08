@@ -178,8 +178,26 @@ fn unmerged_index_hook(repo: &Repo) -> String {
     )
 }
 
+/// A hook that adds three unmerged stages for each of `paths` (exact bytes,
+/// NUL-terminated records) and then fails.
+fn unmerged_paths_hook(repo: &Repo, paths: &[&str]) -> String {
+    let blob = repo.git(&["rev-parse", "main:shared.txt"]);
+    let blob = blob.as_str();
+    let records: String = paths
+        .iter()
+        .flat_map(|path| (1..=3).map(move |stage| format!("100644 {blob} {stage}\t{path}\0")))
+        .collect();
+    let file = repo.0.join(".git/unmerged-records");
+    std::fs::write(&file, records).unwrap();
+    format!(
+        "#!/bin/sh\ngit update-index -z --index-info < '{}' || exit 99\necho 'hook failed' >&2\nexit 1\n",
+        file.display()
+    )
+}
+
 /// The independently stated prepare-conflict contract (spec #33 default
 /// "Prepare conflict output").
+/// `paths` are the paths as the message displays them.
 fn expected_message(strategy: &str, base: &str, source: &str, paths: &[String]) -> String {
     let shown = paths
         .iter()
@@ -209,6 +227,12 @@ const HINT: &str = "Merge the base branch into the source branch, resolve the co
                     then run `git forge pr update <n>` or create a replacement PR.";
 
 fn assert_prepare_conflict(repo: &Repo, strategy: &str, paths: &[String]) {
+    assert_prepare_conflict_shown(repo, strategy, paths, paths);
+}
+
+/// [`assert_prepare_conflict`] where the human message displays `shown`
+/// while `data.paths` keeps the exact `paths`.
+fn assert_prepare_conflict_shown(repo: &Repo, strategy: &str, paths: &[String], shown: &[String]) {
     let base = repo.ref_oid("refs/heads/main").unwrap();
     let source = repo.ref_oid("refs/heads/feature").unwrap();
     let protected = [
@@ -218,7 +242,7 @@ fn assert_prepare_conflict(repo: &Repo, strategy: &str, paths: &[String]) {
         "refs/forge/prs/1/result",
     ];
     let before = protected.map(|name| repo.ref_oid(name));
-    let message = expected_message(strategy, &base, &source, paths);
+    let message = expected_message(strategy, &base, &source, shown);
     let args = ["forge", "pr", "prepare", "1", "--strategy", strategy];
 
     let (code, stdout, stderr) = repo.forge(&args);
@@ -312,6 +336,34 @@ fn prepare_conflict_from_squash_hook_unmerged_index() {
     let repo = conflict_fixture(Divergence::CleanWithHook);
     repo.install_hook("pre-commit", &unmerged_index_hook(&repo));
     assert_prepare_conflict(&repo, "squash", &strings(&["shared.txt"]));
+}
+
+/// Under `core.ignorecase=true` the index compares paths case-insensitively;
+/// unmerged `A.txt` and `a.txt` are still two conflicted paths.
+#[test]
+fn prepare_conflict_keeps_case_distinct_paths() {
+    let repo = conflict_fixture(Divergence::CleanWithHook);
+    repo.git(&["config", "core.ignorecase", "true"]);
+    repo.install_hook(
+        "pre-commit",
+        &unmerged_paths_hook(&repo, &["A.txt", "a.txt"]),
+    );
+    assert_prepare_conflict(&repo, "squash", &strings(&["A.txt", "a.txt"]));
+}
+
+/// Control bytes in a conflicted path are escaped in the human message only;
+/// `data.paths` keeps the exact path.
+#[test]
+fn prepare_conflict_escapes_control_bytes_in_message() {
+    let repo = conflict_fixture(Divergence::CleanWithHook);
+    let path = "evil\nline\u{8}.txt";
+    repo.install_hook("pre-commit", &unmerged_paths_hook(&repo, &[path]));
+    assert_prepare_conflict_shown(
+        &repo,
+        "squash",
+        &strings(&[path]),
+        &strings(&["evil\\x0aline\\x08.txt"]),
+    );
 }
 
 /// ff has no conflict path: a diverged base fails the fast-forward

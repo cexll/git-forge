@@ -38,21 +38,23 @@ impl StrategyFailure {
     }
 }
 
-/// Paths of the unmerged entries in the worktree's index, in index (path)
-/// order. libgit2 groups the stages of one path into one conflict, which
-/// names its path in whichever stage exists (ours, theirs, ancestor);
-/// non-UTF-8 bytes are replaced. An unreadable index yields no paths, so
-/// the failure stays operational.
+/// Paths of the unmerged entries (stage 1-3) in the worktree's index, one per
+/// exact path byte sequence, in index order of first appearance. Raw entries
+/// are grouped here rather than through libgit2's conflict iterator, which
+/// groups stages with the index's path comparison and so folds `A.txt` and
+/// `a.txt` together under `core.ignorecase`. Non-UTF-8 bytes are replaced. An
+/// unreadable index yields no paths, so the failure stays operational.
 fn conflicted_paths(worktree: &Path) -> Vec<String> {
+    /// Stage bits of `git_index_entry.flags` (`GIT_INDEX_ENTRY_STAGEMASK`).
+    const STAGE_MASK: u16 = 0x3000;
     let Ok(index) = git2::Repository::open(worktree).and_then(|repo| repo.index()) else {
         return Vec::new();
     };
-    let Ok(conflicts) = index.conflicts() else {
-        return Vec::new();
-    };
-    conflicts
-        .filter_map(Result::ok)
-        .filter_map(|conflict| conflict.our.or(conflict.their).or(conflict.ancestor))
+    let mut seen = std::collections::HashSet::new();
+    index
+        .iter()
+        .filter(|entry| entry.flags & STAGE_MASK != 0)
+        .filter(|entry| seen.insert(entry.path.clone()))
         .map(|entry| String::from_utf8_lossy(&entry.path).into_owned())
         .collect()
 }
@@ -200,6 +202,37 @@ mod tests {
         // Content (b), modify/delete (d) and add/add (a) conflicts each
         // appear once although they hold two or three index stages.
         assert_eq!(conflicted_paths(&dir), ["a.txt", "b.txt", "d.txt"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn conflicted_paths_keeps_paths_that_differ_only_in_case() {
+        let dir = repo("ignorecase");
+        assert!(git(&dir, &["config", "core.ignorecase", "true"]));
+        let records: String = ["A.txt", "a.txt"]
+            .iter()
+            .flat_map(|path| {
+                (1..=3).map(move |stage| {
+                    format!("100644 e69de29bb2d1d6434b8b29ae775ad8c2e48c5391 {stage}\t{path}\0")
+                })
+            })
+            .collect();
+        let mut child = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(["update-index", "-z", "--index-info"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        use std::io::Write;
+        child
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(records.as_bytes())
+            .unwrap();
+        assert!(child.wait().unwrap().success());
+        assert_eq!(conflicted_paths(&dir), ["A.txt", "a.txt"]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

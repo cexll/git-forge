@@ -13,12 +13,17 @@ resolve the conflict on the ticket branch without rerunning git by hand.
 
 The strategy adapter (`src/git/strategy.rs`) reads the unmerged index
 entries of the temporary worktree before cleanup and returns them with the
-cleanup outcome. The classification is unchanged: a failure is a conflict
+cleanup outcome. It walks the raw index entries with a nonzero stage and
+groups them by exact path bytes. libgit2's conflict iterator groups stages
+with the index path comparison, which is case-insensitive under
+`core.ignorecase` and would fold `A.txt` and `a.txt` into one path. The classification is unchanged: a failure is a conflict
 exactly when the index has an unmerged entry.
 
 `pr prepare` (`src/pr_prepare.rs`) builds the `E_PREPARE_CONFLICT` error from
 structured parts: PR id, strategy, base ref and tip, source commit, up to 20
-conflicted paths, the remedy, and the cleanup outcome. The JSON error adds
+conflicted paths, the remedy, and the cleanup outcome. Paths and branch
+names in the message pass through `sanitize_terminal`, so a path with a
+newline or control byte cannot inject terminal output. The JSON error adds
 `data` with `pr`, `strategy`, `base`, `source`, and every conflicted path.
 `CliError.data` is an ordered field list, so the keys render in a fixed
 order. The exact text is in the wire contract (`docs/architecture/git-forge.md`,
