@@ -603,6 +603,35 @@ fn build_merge_event(spec: &MergeFinalizeSpec<'_>) -> Event {
     Event::new(EventKind::PrMerge, "pr", spec.id, spec.actor, merge_body)
 }
 
+/// A finalized merge: the PR is terminal and `merge_commit` is the new base
+/// tip. `recycle` holds the `--recycle-worktree` outcome when one was run.
+#[derive(Debug, PartialEq)]
+pub(crate) struct MergeOutcome {
+    pub id: u64,
+    pub base_ref: String,
+    pub strategy: String,
+    pub generation: u64,
+    pub merge_commit: String,
+    pub recycle: Option<String>,
+}
+
+impl MergeOutcome {
+    fn merged_line(&self) -> String {
+        format!(
+            "merged PR #{} into {} ({})",
+            self.id, self.base_ref, self.merge_commit
+        )
+    }
+
+    /// The human success line: the merged line, then the recycle outcome.
+    pub(crate) fn prose(&self) -> String {
+        match &self.recycle {
+            Some(recycle) => format!("{}; {recycle}", self.merged_line()),
+            None => self.merged_line(),
+        }
+    }
+}
+
 /// The #4 recycle epilogue, extracted from `run_finalize` (clippy
 /// too_many_lines): after base refresh (#3) and finalization, run the
 /// source-worktree recycle when `--recycle-worktree` was passed (recycle is
@@ -612,13 +641,18 @@ fn build_merge_event(spec: &MergeFinalizeSpec<'_>) -> Event {
 fn finish_merge_output(
     store: &BoundEventStore,
     spec: &MergeFinalizeSpec<'_>,
-) -> Result<String, String> {
-    let merged = format!(
-        "merged PR #{} into {} ({})",
-        spec.id, spec.base_ref, spec.result_commit
-    );
+) -> Result<MergeOutcome, String> {
+    let mut outcome = MergeOutcome {
+        id: spec.id,
+        base_ref: spec.base_ref.to_string(),
+        strategy: spec.strategy.to_string(),
+        generation: spec.generation,
+        merge_commit: spec.result_commit.to_string(),
+        recycle: None,
+    };
+    let merged = outcome.merged_line();
     let Some((target, force)) = spec.recycle else {
-        return Ok(merged);
+        return Ok(outcome);
     };
     let source_ref = spec
         .source_ref
@@ -637,7 +671,10 @@ fn finish_merge_output(
         spec.strategy,
         force,
     ) {
-        Ok(outcome) => Ok(format!("{merged}; {outcome}")),
+        Ok(recycle) => {
+            outcome.recycle = Some(recycle);
+            Ok(outcome)
+        }
         // CR-01 (code review): a recycle epilogue failure (phase-2 refused-dirty,
         // partial-leftover) does NOT undo the merge — the PR is terminal. Keep the
         // merged line in the error so the adapter can classify the outcome (its
@@ -929,4 +966,29 @@ fn maybe_run_test_issue_barrier(attempt: u32) -> Result<(), String> {
 #[cfg(debug_assertions)]
 fn maybe_run_test_retry_barrier() -> Result<(), String> {
     run_test_barrier("GIT_FORGE_TEST_MERGE_RETRY_BARRIER")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MergeOutcome;
+
+    /// The human success line stays byte-identical to the pre-JSON output:
+    /// the merged line, then `; <recycle outcome>` when a recycle ran.
+    #[test]
+    fn merge_outcome_prose_keeps_the_human_success_line() {
+        let mut outcome = MergeOutcome {
+            id: 7,
+            base_ref: "main".into(),
+            strategy: "squash".into(),
+            generation: 2,
+            merge_commit: "0123abcd".into(),
+            recycle: None,
+        };
+        assert_eq!(outcome.prose(), "merged PR #7 into main (0123abcd)");
+        outcome.recycle = Some("recycle outcome: removed".into());
+        assert_eq!(
+            outcome.prose(),
+            "merged PR #7 into main (0123abcd); recycle outcome: removed"
+        );
+    }
 }

@@ -1,0 +1,368 @@
+//! JSON success results for commands that accept `--json`, at the built CLI
+//! boundary. Each test parses stdout independently with `serde_json` and checks
+//! the exact key set, so an extra, missing, or misnamed field fails.
+use std::path::PathBuf;
+use std::process::{Command, Output};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+static NEXT_REPO: AtomicU64 = AtomicU64::new(0);
+
+struct Repo(PathBuf);
+impl Repo {
+    fn new() -> Self {
+        let path = std::env::temp_dir().join(format!(
+            "gf-json-results-{}-{}",
+            std::process::id(),
+            NEXT_REPO.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&path).unwrap();
+        let repo = Self(path);
+        repo.git(&["init", "-q"]);
+        repo.git(&["config", "user.name", "Test"]);
+        repo.git(&["config", "user.email", "test@example.com"]);
+        repo
+    }
+    /// A path beside the repository, so a linked worktree there leaves the
+    /// base worktree clean.
+    fn worktree_path(&self) -> PathBuf {
+        PathBuf::from(format!("{}-wt", self.0.display()))
+    }
+    fn git(&self, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&self.0)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+    fn run(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_git-forge"))
+            .args(args)
+            .current_dir(&self.0)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_FORGE_ROLE")
+            .output()
+            .unwrap()
+    }
+    fn ok(&self, args: &[&str]) -> String {
+        let output = self.run(args);
+        assert!(
+            output.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap()
+    }
+    fn commit_file(&self, name: &str, content: &str) {
+        let path = self.0.join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+        self.git(&["add", name]);
+        self.git(&["commit", "-q", "-m", name]);
+    }
+    fn rev(&self, name: &str) -> String {
+        self.git(&["rev-parse", name])
+    }
+    /// One open Issue, #1.
+    fn issue(&self) {
+        self.ok(&["issue", "new", "an issue"]);
+    }
+    /// `main` with a base commit and `feature` with one commit plus a passing
+    /// CI plan; PR #1 from `feature` into `main`.
+    fn pr(&self) {
+        self.commit_file("base.txt", "base\n");
+        self.git(&["branch", "-M", "main"]);
+        self.git(&["checkout", "-q", "-b", "feature"]);
+        self.commit_file("feature.txt", "feature\n");
+        self.commit_file(".forge/ci.sh", "#!/bin/sh\nexit 0\n");
+        self.git(&["checkout", "-q", "main"]);
+        self.ok(&[
+            "pr", "create", "--source", "feature", "--base", "main", "a PR",
+        ]);
+    }
+}
+impl Drop for Repo {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+        let _ = std::fs::remove_dir_all(self.worktree_path());
+    }
+}
+
+/// Exit 0, empty stderr, one stdout line that parses as a JSON object whose
+/// keys are exactly `keys` (in sorted order, as `serde_json` maps them).
+fn json_result(output: &Output, keys: &[&str]) -> serde_json::Map<String, serde_json::Value> {
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+    assert_eq!(stdout.lines().count(), 1, "one JSON document: {stdout}");
+    let document: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let object = document.as_object().expect("JSON object").clone();
+    let mut expected: Vec<&str> = keys.to_vec();
+    expected.sort_unstable();
+    assert_eq!(
+        object.keys().map(String::as_str).collect::<Vec<_>>(),
+        expected
+    );
+    object
+}
+
+/// The tip commit of a forge ref: the event commit a mutation appended.
+fn tip(repo: &Repo, reference: &str) -> serde_json::Value {
+    serde_json::Value::String(repo.rev(reference))
+}
+
+#[test]
+fn issue_close_and_reopen_print_id_state_and_event() {
+    let repo = Repo::new();
+    repo.issue();
+    let closed = json_result(
+        &repo.run(&["issue", "close", "1", "--json"]),
+        &["id", "state", "event"],
+    );
+    assert_eq!(closed["id"], 1);
+    assert_eq!(closed["state"], "closed");
+    assert_eq!(closed["event"], tip(&repo, "refs/forge/issues/1"));
+    let reopened = json_result(
+        &repo.run(&["issue", "reopen", "--json", "1"]),
+        &["id", "state", "event"],
+    );
+    assert_eq!(reopened["id"], 1);
+    assert_eq!(reopened["state"], "open");
+    assert_eq!(reopened["event"], tip(&repo, "refs/forge/issues/1"));
+}
+
+#[test]
+fn issue_comment_reports_the_resulting_state_of_the_issue() {
+    let repo = Repo::new();
+    repo.issue();
+    repo.ok(&["issue", "close", "1"]);
+    let result = json_result(
+        &repo.run(&["issue", "comment", "1", "--json", "a", "note"]),
+        &["id", "state", "event"],
+    );
+    assert_eq!(result["id"], 1);
+    assert_eq!(result["state"], "closed");
+    assert_eq!(result["event"], tip(&repo, "refs/forge/issues/1"));
+    let shown: serde_json::Value =
+        serde_json::from_str(&repo.ok(&["issue", "show", "1", "--json"])).unwrap();
+    assert_eq!(shown["comments"], serde_json::json!(["a note"]));
+}
+
+#[test]
+fn pr_comment_prints_id_state_and_event() {
+    let repo = Repo::new();
+    repo.pr();
+    let result = json_result(
+        &repo.run(&["pr", "comment", "1", "looks", "good", "--json"]),
+        &["id", "state", "event"],
+    );
+    assert_eq!(result["id"], 1);
+    assert_eq!(result["state"], "open");
+    assert_eq!(result["event"], tip(&repo, "refs/forge/prs/1/head"));
+}
+
+#[test]
+fn pr_abandon_prints_abandoned_state_reason_and_event() {
+    let repo = Repo::new();
+    repo.pr();
+    let result = json_result(
+        &repo.run(&["pr", "abandon", "--json", "1", "--reason", "superseded"]),
+        &["id", "state", "reason", "event"],
+    );
+    assert_eq!(result["id"], 1);
+    assert_eq!(result["state"], "abandoned");
+    assert_eq!(result["reason"], "superseded");
+    assert_eq!(result["event"], tip(&repo, "refs/forge/prs/1/head"));
+}
+
+#[test]
+fn pr_review_prints_decision_generation_candidate_and_event() {
+    let repo = Repo::new();
+    repo.pr();
+    let keys = [
+        "id",
+        "state",
+        "decision",
+        "generation",
+        "candidate",
+        "event",
+    ];
+    let rejected = json_result(
+        &repo.run(&["pr", "review", "1", "--reject", "--json"]),
+        &keys,
+    );
+    assert_eq!(rejected["id"], 1);
+    assert_eq!(rejected["state"], "open");
+    assert_eq!(rejected["decision"], "reject");
+    assert_eq!(rejected["generation"], 0);
+    assert_eq!(rejected["candidate"], serde_json::Value::Null);
+    assert_eq!(rejected["event"], tip(&repo, "refs/forge/prs/1/head"));
+    repo.ok(&["pr", "prepare", "1", "--strategy", "merge"]);
+    let approved = json_result(
+        &repo.run(&["pr", "review", "--json", "1", "--approve"]),
+        &keys,
+    );
+    assert_eq!(approved["decision"], "approve");
+    assert_eq!(approved["candidate"], tip(&repo, "refs/forge/prs/1/result"));
+    assert_eq!(approved["event"], tip(&repo, "refs/forge/prs/1/head"));
+}
+
+#[test]
+fn pr_prepare_prints_candidate_identity_and_event() {
+    let repo = Repo::new();
+    repo.pr();
+    let result = json_result(
+        &repo.run(&["pr", "prepare", "1", "--json", "--strategy", "squash"]),
+        &[
+            "id",
+            "state",
+            "strategy",
+            "generation",
+            "candidate",
+            "result_tree",
+            "base_head",
+            "event",
+        ],
+    );
+    assert_eq!(result["id"], 1);
+    assert_eq!(result["state"], "open");
+    assert_eq!(result["strategy"], "squash");
+    assert_eq!(result["generation"], 0);
+    let candidate = repo.rev("refs/forge/prs/1/result");
+    assert_eq!(result["candidate"], candidate.as_str());
+    assert_eq!(
+        result["result_tree"],
+        repo.rev(&format!("{candidate}^{{tree}}")).as_str()
+    );
+    assert_eq!(result["base_head"], tip(&repo, "main"));
+    assert_eq!(result["event"], tip(&repo, "refs/forge/prs/1/head"));
+}
+
+#[test]
+fn pr_update_prints_new_generation_snapshot_and_event() {
+    let repo = Repo::new();
+    repo.pr();
+    repo.git(&["checkout", "-q", "feature"]);
+    repo.commit_file("more.txt", "more\n");
+    repo.git(&["checkout", "-q", "main"]);
+    let result = json_result(
+        &repo.run(&["pr", "update", "--json", "1"]),
+        &[
+            "id",
+            "state",
+            "generation",
+            "source_head",
+            "base_head",
+            "merge_base",
+            "event",
+        ],
+    );
+    assert_eq!(result["id"], 1);
+    assert_eq!(result["state"], "open");
+    assert_eq!(result["generation"], 1);
+    assert_eq!(result["source_head"], tip(&repo, "feature"));
+    assert_eq!(result["base_head"], tip(&repo, "main"));
+    assert_eq!(result["merge_base"], tip(&repo, "main"));
+    assert_eq!(result["event"], tip(&repo, "refs/forge/prs/1/head"));
+}
+
+#[test]
+fn pr_diff_prints_base_head_and_diff_text() {
+    let repo = Repo::new();
+    repo.pr();
+    let plain = repo.ok(&["pr", "diff", "1"]);
+    let result = json_result(
+        &repo.run(&["pr", "diff", "--json", "1"]),
+        &["id", "state", "generation", "base", "head", "diff"],
+    );
+    assert_eq!(result["id"], 1);
+    assert_eq!(result["state"], "open");
+    assert_eq!(result["generation"], 0);
+    assert_eq!(result["base"], tip(&repo, "main"));
+    assert_eq!(result["head"], tip(&repo, "feature"));
+    let diff = result["diff"].as_str().unwrap();
+    assert!(diff.contains("+++ b/feature.txt"), "{diff}");
+    assert_eq!(format!("{diff}\n"), plain);
+}
+
+const MERGE_KEYS: [&str; 7] = [
+    "id",
+    "state",
+    "strategy",
+    "base",
+    "generation",
+    "merge_commit",
+    "recycle",
+];
+
+#[test]
+fn pr_merge_prints_merged_state_and_merge_commit() {
+    let repo = Repo::new();
+    repo.pr();
+    repo.ok(&["ci", "run", "1"]);
+    repo.ok(&["pr", "review", "1", "--approve"]);
+    let result = json_result(&repo.run(&["pr", "merge", "1", "--json"]), &MERGE_KEYS);
+    assert_eq!(result["id"], 1);
+    assert_eq!(result["state"], "merged");
+    assert_eq!(result["strategy"], "merge");
+    assert_eq!(result["base"], "main");
+    assert_eq!(result["generation"], 0);
+    assert_eq!(result["merge_commit"], tip(&repo, "main"));
+    assert_eq!(result["recycle"], serde_json::Value::Null);
+    let shown: serde_json::Value =
+        serde_json::from_str(&repo.ok(&["pr", "show", "1", "--json"])).unwrap();
+    assert_eq!(shown["merged"], result["merge_commit"]);
+}
+
+#[test]
+fn pr_merge_of_a_prepared_candidate_reports_the_recycle_outcome() {
+    let repo = Repo::new();
+    repo.pr();
+    repo.ok(&["pr", "prepare", "1", "--strategy", "squash"]);
+    let candidate = repo.rev("refs/forge/prs/1/result");
+    repo.ok(&["ci", "run", "1"]);
+    repo.ok(&["pr", "review", "1", "--approve"]);
+    let worktree = repo.worktree_path();
+    repo.git(&[
+        "worktree",
+        "add",
+        "-q",
+        worktree.to_str().unwrap(),
+        "feature",
+    ]);
+    let result = json_result(
+        &repo.run(&[
+            "pr",
+            "merge",
+            "1",
+            "--squash",
+            "--recycle-worktree",
+            worktree.to_str().unwrap(),
+            "--json",
+        ]),
+        &MERGE_KEYS,
+    );
+    assert_eq!(result["state"], "merged");
+    assert_eq!(result["strategy"], "squash");
+    assert_eq!(result["merge_commit"], candidate.as_str());
+    assert_eq!(result["merge_commit"], tip(&repo, "main"));
+    let recycle = result["recycle"].as_str().unwrap();
+    assert!(
+        recycle.starts_with("recycle outcome: removed; branch-kept(feature"),
+        "{recycle}"
+    );
+    assert!(!worktree.exists());
+}

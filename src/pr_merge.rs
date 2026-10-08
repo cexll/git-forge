@@ -15,7 +15,7 @@ use crate::store::EventStore;
 pub(crate) fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String, CliError> {
     // Same strict guard as `pr show`: one positional, no options — any
     // dash-leading leftover is a usage error naming the flag (VAL-202).
-    let (_, args) = crate::machine::json_requested(args);
+    let (json, args) = crate::machine::json_requested(args);
     let (id_arg, rest) = args
         .split_first()
         .ok_or_else(|| CliError::usage("usage: git forge pr diff <n> [--json]", ""))?;
@@ -93,6 +93,14 @@ pub(crate) fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String,
         })
         .into());
     }
+    if json {
+        return Ok(crate::machine::pr_diff_json(
+            &state,
+            &base_oid.to_string(),
+            &source_oid.to_string(),
+            &out,
+        ));
+    }
     Ok(out)
 }
 
@@ -108,7 +116,14 @@ pub(crate) fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String,
 // the sole lib/src function over the 150-line clippy::too_many_lines threshold.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String, CliError> {
-    let (_, args) = crate::machine::json_requested(args);
+    let (json, args) = crate::machine::json_requested(args);
+    let render = |outcome: crate::merge_state::MergeOutcome| {
+        if json {
+            crate::machine::pr_merge_json(&outcome)
+        } else {
+            outcome.prose()
+        }
+    };
     let mut id_arg = None;
     let mut strategy: Option<&str> = None; // merge | squash | rebase
     let mut recycle: Option<String> = None;
@@ -461,7 +476,8 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
             },
             &mut no_lock,
             &prepared_tmp,
-        );
+        )
+        .map(render);
     }
 
     // Repo-specific temp worktree path: hash the canonical workdir so parallel
@@ -729,6 +745,7 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
         &mut lock_handle,
         &tmp,
     )
+    .map(render)
 }
 
 /// `git forge pr update <n>` — re-pin the PR to the source branch tip as a
@@ -741,6 +758,7 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
 /// that already IS the snapshot source_head (nothing to update).
 pub(crate) fn cmd_pr_update(args: &[String]) -> Result<String, CliError> {
     const USAGE: &str = "usage: git forge pr update <n>";
+    let (json, args) = crate::machine::json_requested(args);
     if args.len() != 1 {
         // Name the offending token so a rejected flag is diagnosable
         // (unknown flag keeps exit-1, VAL-202).
@@ -825,7 +843,7 @@ pub(crate) fn cmd_pr_update(args: &[String]) -> Result<String, CliError> {
     let new_merge_base = crate::git::require_single_merge_base(store.repo(), new_base, new_source)?;
     let (store, actor) = crate::identity::open_mutation_store()?;
     let generation = state.generation + 1;
-    store
+    let event = store
         .update_pr(
             id,
             old_source,
@@ -838,6 +856,16 @@ pub(crate) fn cmd_pr_update(args: &[String]) -> Result<String, CliError> {
             &actor,
         )
         .map_err(CliError::from)?;
+    if json {
+        return Ok(crate::machine::pr_update_json(
+            id,
+            generation,
+            &new_source.to_string(),
+            &new_base.to_string(),
+            &new_merge_base.to_string(),
+            &event.to_string(),
+        ));
+    }
     Ok(format!(
         "PR #{id} updated to snapshot generation {generation} \
          (source {source_ref} -> {new_source})"
@@ -846,7 +874,7 @@ pub(crate) fn cmd_pr_update(args: &[String]) -> Result<String, CliError> {
 
 pub(crate) fn pr_merge_help() -> String {
     "usage: git forge pr merge [<n>] [--merge|--squash|--rebase|--ff]\n\
-     \x20                   [--recycle-worktree <path>] [--force]\n\
+     \x20                   [--recycle-worktree <path>] [--force] [--json]\n\
      \x20 default / --merge: merge commit (--no-ff --no-edit)\n\
      \x20 --squash: single squashed commit\n\
      \x20 --rebase: replay source onto base (linear history)\n\

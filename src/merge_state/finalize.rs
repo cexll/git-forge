@@ -2,6 +2,7 @@
 use super::{
     build_merge_event, cleanup_pending_result, finalize_pr_merge, finish_merge_output,
     refresh_base_worktrees, stage_issue_close, validate_merge_gate_at, MergeFinalizeSpec,
+    MergeOutcome,
 };
 #[cfg(debug_assertions)]
 use super::{maybe_run_issue_stage_barrier, maybe_run_test_retry_barrier};
@@ -37,7 +38,7 @@ pub(crate) fn run_finalize(
     spec: MergeFinalizeSpec<'_>,
     lock_handle: &mut Option<std::fs::File>,
     tmp: &std::path::Path,
-) -> Result<String, CliError> {
+) -> Result<MergeOutcome, CliError> {
     let merge_event = build_merge_event(&spec);
     // Single `issue.close` event constructed ONCE (F-009 analogue): every
     // finalize attempt re-parents the SAME event to the then-current issue

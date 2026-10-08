@@ -168,8 +168,8 @@ remain `E_INVALID`. An invalid configured role returns `E_INVALID` and names
 the rejected role in `input`. Version usage failures retain the offending
 flag or positional in `input`.
 
-Merge and prepare accept the bare `--json` selector for failures without
-changing their human success output. Prepared-candidate currentness, strategy
+Merge and prepare print their JSON success results (below) under `--json`;
+without it their human success output is unchanged. Prepared-candidate currentness, strategy
 binding, and gate validation precede merge-base and strategy preconditions for
 every merge strategy. Staleness, mismatched candidate gate inputs, and missing
 required candidates return `E_GATE` with the existing candidate remedy.
@@ -185,6 +185,47 @@ unmerged index, subject to the hook limitation documented beside the code list.
 
 Missing required positionals return usage errors, never panics. In particular,
 `pr show` and `pr diff` use `usage: git forge pr <verb> <n> [--json]`.
+
+### CLI Success Results (schema 1)
+
+Every command that accepts the bare `--json` token prints one JSON object or
+array on stdout on success, exit 0, with nothing on stderr. Without `--json`
+the human output is unchanged. There is no common envelope; field order is
+fixed per command.
+
+The existing shapes of `issue new|apply|list|show`, `pr create|list|show`,
+and `ci run` are unchanged; `tests/fixtures/json/` pins them byte for byte.
+
+Mutation results open with `id` (the Issue or PR number) and `state`, the
+entity state after the command: `open|closed` for an Issue and
+`open|merged|abandoned` for a PR. `event` is the commit the command appended
+to the entity chain. Commit ids are full 40-character hex strings.
+
+| Command | Result object (keys in order) |
+|---|---|
+| `issue comment <n> <body>` | `id`, `state`, `event` |
+| `issue close <n>` / `issue reopen <n>` | `id`, `state`, `event` |
+| `pr comment <n> <body>` | `id`, `state`, `event` |
+| `pr review <n> --approve\|--reject` | `id`, `state`, `decision` (`approve\|reject`), `generation` (the snapshot generation the decision binds), `candidate` (bound prepared result commit, or `null`), `event` |
+| `pr update <n>` | `id`, `state`, `generation` (the new generation), `source_head`, `base_head`, `merge_base` (the new snapshot), `event` |
+| `pr prepare <n> --strategy <s>` | `id`, `state`, `strategy`, `generation`, `candidate` (result commit pinned at `refs/forge/prs/<n>/result`), `result_tree`, `base_head` (base tip the candidate was built on), `event` |
+| `pr merge [<n>]` | `id`, `state` (`merged`), `strategy`, `base` (base branch name), `generation`, `merge_commit` (the new base tip), `recycle` (the `--recycle-worktree` outcome line, or `null`) |
+| `pr abandon <n> --reason <text>` | `id`, `state` (`abandoned`), `reason`, `event` |
+| `pr diff <n>` (read only) | `id`, `state`, `generation`, `base`, `head`, `diff` |
+
+In `pr diff`, `base` and `head` are the commits of the current generation's
+snapshot, and `diff` is the exact `git diff base...head` text that the human
+form prints. Unlike `pr show`, `base` here is a commit, not a branch name.
+
+```json
+{"id":3,"state":"open","event":"5f0c..."}
+{"id":3,"state":"open","decision":"approve","generation":1,"candidate":"9ab1...","event":"77de..."}
+{"id":3,"state":"merged","strategy":"squash","base":"main","generation":1,"merge_commit":"9ab1...","recycle":null}
+```
+
+A `pr merge --recycle-worktree` whose recycle step fails after the merge is
+already final still exits 1 with the merged line and the recycle failure in
+the error message; it does not print a success result.
 
 
 ### Ref Layout

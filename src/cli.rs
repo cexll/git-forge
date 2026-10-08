@@ -425,7 +425,7 @@ fn cmd_pr_comment(args: &[String]) -> Result<String, CliError> {
     // Same strict flag/token split as its issue sibling: an unknown option
     // is a clean usage error naming the flag (VAL-202), never a
     // silently-ignored prefix of the comment body.
-    let (_, args) = machine::json_requested(args);
+    let (json, args) = machine::json_requested(args);
     machine::reject_flags(&args, USAGE)?;
     if args.len() < 2 {
         return Err(CliError::usage(USAGE, ""));
@@ -450,7 +450,12 @@ fn cmd_pr_comment(args: &[String]) -> Result<String, CliError> {
         &actor,
         body_obj(&[("body", json_str(&body))]),
     );
-    store.append_event(&r, &ev).map_err(CliError::from)?;
+    let event = store.append_event(&r, &ev).map_err(CliError::from)?;
+    if json {
+        let chain = store.store().read_chain(&r).map_err(CliError::from)?;
+        let state = machine::pr_state_name(&crate::event::fold(&chain).pr);
+        return Ok(machine::event_result_json(id, state, &event.to_string()));
+    }
     Ok(format!("comment added to PR #{id}"))
 }
 
@@ -462,6 +467,7 @@ fn cmd_pr_comment(args: &[String]) -> Result<String, CliError> {
 /// reopened PR is a new entity.
 fn cmd_pr_abandon(args: &[String]) -> Result<String, CliError> {
     const USAGE: &str = "usage: git forge pr abandon <n> --reason <text>";
+    let (json, args) = machine::json_requested(args);
     let id = parse_entity_id(args.first().ok_or_else(|| CliError::usage(USAGE, ""))?)?;
     let mut reason: Option<String> = None;
     let mut i = 1;
@@ -525,7 +531,10 @@ fn cmd_pr_abandon(args: &[String]) -> Result<String, CliError> {
         &actor,
         body_obj(&[("reason", json_str(&reason))]),
     );
-    store.append_event(&r, &ev).map_err(CliError::from)?;
+    let event = store.append_event(&r, &ev).map_err(CliError::from)?;
+    if json {
+        return Ok(machine::pr_abandon_json(id, &reason, &event.to_string()));
+    }
     Ok(format!("PR #{id} abandoned: {reason}"))
 }
 
@@ -578,12 +587,12 @@ fn pr_sub_usage(sub: &str) -> Option<&'static str> {
         "create" => "usage: git forge pr create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]... [--closes <n>]",
         "list" => "usage: git forge pr list",
         "show" => "usage: git forge pr show <n>",
-        "comment" => "usage: git forge pr comment <n> <body>",
-        "review" => "usage: git forge pr review <n> --approve|--reject [--file <f> --line <l> --commit <c>]",
-        "abandon" => "usage: git forge pr abandon <n> --reason <text>",
-        "diff" => "usage: git forge pr diff <n>",
-        "update" => "usage: git forge pr update <n>",
-        "prepare" => "usage: git forge pr prepare <n> --strategy merge|squash|rebase|ff",
+        "comment" => "usage: git forge pr comment <n> <body> [--json]",
+        "review" => "usage: git forge pr review <n> --approve|--reject [--file <f> --line <l> --commit <c>] [--json]",
+        "abandon" => "usage: git forge pr abandon <n> --reason <text> [--json]",
+        "diff" => "usage: git forge pr diff <n> [--json]",
+        "update" => "usage: git forge pr update <n> [--json]",
+        "prepare" => "usage: git forge pr prepare <n> --strategy merge|squash|rebase|ff [--json]",
         _ => return None,
     })
 }
@@ -594,13 +603,13 @@ fn pr_help() -> String {
      \x20 create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]... [--closes <n>]\n\
      \x20 list\n\
      \x20 show <n> [--json]\n\
-     \x20 comment <n> <body>\n\
-     \x20 review <n> --approve|--reject [--file <f> --line <l> --commit <c>]\n\
-     \x20 update <n>\n\
-     \x20 prepare <n> --strategy merge|squash|rebase|ff\n\
-     \x20 diff <n>\n\
-     \x20 merge [<n>] [--merge|--squash|--rebase|--ff]\n\
-     \x20 abandon <n> --reason <text>"
+     \x20 comment <n> <body> [--json]\n\
+     \x20 review <n> --approve|--reject [--file <f> --line <l> --commit <c>] [--json]\n\
+     \x20 update <n> [--json]\n\
+     \x20 prepare <n> --strategy merge|squash|rebase|ff [--json]\n\
+     \x20 diff <n> [--json]\n\
+     \x20 merge [<n>] [--merge|--squash|--rebase|--ff] [--json]\n\
+     \x20 abandon <n> --reason <text> [--json]"
         .to_string()
 }
 

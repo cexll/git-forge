@@ -237,7 +237,7 @@ fn cmd_comment(args: &[String]) -> Result<String, CliError> {
     // Same strict flag/token split as every other issue subcommand: an
     // unknown option is a clean usage error naming the flag (VAL-202),
     // never a silently-ignored prefix of the comment body.
-    let (_, args) = machine::json_requested(args);
+    let (json, args) = machine::json_requested(args);
     // The grammar is `<n> <body>` — positionals ARE the body. Only flag
     // tokens are rejected here (naming the flag, VAL-202); existence and
     // emptiness are checked below, as before.
@@ -264,7 +264,12 @@ fn cmd_comment(args: &[String]) -> Result<String, CliError> {
         &actor,
         body_obj(&[("body", json_str(&body))]),
     );
-    store.append_event(&r, &ev).map_err(CliError::from)?;
+    let event = store.append_event(&r, &ev).map_err(CliError::from)?;
+    if json {
+        let chain = store.store().read_chain(&r).map_err(CliError::from)?;
+        let state = machine::issue_state_name(&crate::event::fold(&chain).issue);
+        return Ok(machine::event_result_json(id, state, &event.to_string()));
+    }
     Ok(format!("comment added to issue #{id}"))
 }
 
@@ -272,7 +277,7 @@ fn cmd_comment(args: &[String]) -> Result<String, CliError> {
 fn cmd_state(kind: EventKind, args: &[String]) -> Result<String, CliError> {
     // One positional, no options: anything dash-leading is a usage error
     // naming the flag (VAL-202).
-    let (_, args) = machine::json_requested(args);
+    let (json, args) = machine::json_requested(args);
     let verb = match kind {
         EventKind::IssueClose => "close",
         EventKind::IssueReopen => "reopen",
@@ -297,12 +302,15 @@ fn cmd_state(kind: EventKind, args: &[String]) -> Result<String, CliError> {
         ));
     }
     let ev = issue_event(kind, id, &actor, HashMap::new());
-    store.append_event(&r, &ev).map_err(CliError::from)?;
-    let verb = match kind {
-        EventKind::IssueClose => "closed",
-        EventKind::IssueReopen => "reopened",
+    let event = store.append_event(&r, &ev).map_err(CliError::from)?;
+    let (verb, state) = match kind {
+        EventKind::IssueClose => ("closed", "closed"),
+        EventKind::IssueReopen => ("reopened", "open"),
         _ => unreachable!(),
     };
+    if json {
+        return Ok(machine::event_result_json(id, state, &event.to_string()));
+    }
     Ok(format!("issue #{id} {verb}"))
 }
 
@@ -348,9 +356,9 @@ fn issue_sub_usage(sub: &str) -> Option<&'static str> {
         "apply" => "usage: git forge issue apply <dir|file> [--dry-run] [--json]",
         "list" => "usage: git forge issue list [--parent <n>] [--state open|closed|all] [--json]",
         "show" => "usage: git forge issue show <n>",
-        "comment" => "usage: git forge issue comment <n> <body>",
-        "close" => "usage: git forge issue close <n>",
-        "reopen" => "usage: git forge issue reopen <n>",
+        "comment" => "usage: git forge issue comment <n> <body> [--json]",
+        "close" => "usage: git forge issue close <n> [--json]",
+        "reopen" => "usage: git forge issue reopen <n> [--json]",
         _ => return None,
     })
 }
@@ -362,8 +370,8 @@ fn issue_help() -> String {
      \x20 apply <dir|file> [--dry-run] [--json]\n\
      \x20 list [--parent <n>] [--state open|closed|all] [--json]\n\
      \x20 show <n> [--json]\n\
-     \x20 comment <n> <body>\n\
-     \x20 close <n>\n\
-     \x20 reopen <n>"
+     \x20 comment <n> <body> [--json]\n\
+     \x20 close <n> [--json]\n\
+     \x20 reopen <n> [--json]"
         .to_string()
 }

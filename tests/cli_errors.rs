@@ -274,12 +274,10 @@ fn every_subcommand_handles_no_arguments() {
                 .strip_prefix("git-forge: ")
                 .unwrap()
                 .to_string();
-            let input = if matches!((namespace, sub), ("pr", "review" | "update" | "abandon")) {
-                "--json"
-            } else {
-                ""
-            };
-            assert_error(&json, "E_USAGE", &message, input, false);
+            // Every subcommand accepts `--json`, so it reports the same
+            // missing-argument usage error as the plain run.
+            assert_eq!(stderr, format!("git-forge: {message}\n"));
+            assert_error(&json, "E_USAGE", &message, "", false);
         }
     }
     assert!(repo.run(&["version"]).status.success());

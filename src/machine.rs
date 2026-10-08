@@ -272,6 +272,153 @@ pub(crate) fn ci_run_json(id: u64, status: &str, plan: &str, generation: u64) ->
     )
 }
 
+// ─────────────────────────── mutation results ───────────────────────────
+
+/// Opening members shared by every mutation result: entity id and the state
+/// the entity is in after the command (`open|closed` for Issues,
+/// `open|merged|abandoned` for PRs).
+fn result_head(id: u64, state: &str) -> String {
+    format!("{{\"id\":{},\"state\":{}", num(id), json_escape(state))
+}
+
+/// Lifecycle state of a folded Issue.
+pub(crate) fn issue_state_name(state: &crate::event::IssueState) -> &'static str {
+    if state.open {
+        "open"
+    } else {
+        "closed"
+    }
+}
+
+/// Lifecycle state of a folded PR: merged and abandoned are terminal.
+pub(crate) fn pr_state_name(state: &crate::event::PrState) -> &'static str {
+    if state.merge_result.is_some() {
+        "merged"
+    } else if state.abandoned.is_some() {
+        "abandoned"
+    } else {
+        "open"
+    }
+}
+
+/// `issue comment|close|reopen --json` and `pr comment --json`: the entity,
+/// its resulting state, and the appended event commit.
+pub(crate) fn event_result_json(id: u64, state: &str, event: &str) -> String {
+    format!(
+        "{},\"event\":{}}}",
+        result_head(id, state),
+        json_escape(event)
+    )
+}
+
+/// `pr abandon --json`: the abandoned PR, its recorded reason and event.
+pub(crate) fn pr_abandon_json(id: u64, reason: &str, event: &str) -> String {
+    format!(
+        "{},\"reason\":{},\"event\":{}}}",
+        result_head(id, "abandoned"),
+        json_escape(reason),
+        json_escape(event)
+    )
+}
+
+/// `pr review --json`: the recorded decision and the generation and prepared
+/// candidate (`null` when none was current) it binds.
+pub(crate) fn pr_review_json(
+    id: u64,
+    state: &str,
+    decision: &str,
+    generation: u64,
+    candidate: Option<&str>,
+    event: &str,
+) -> String {
+    format!(
+        "{},\"decision\":{},\"generation\":{},\"candidate\":{},\"event\":{}}}",
+        result_head(id, state),
+        json_escape(decision),
+        num(generation),
+        opt_str(candidate),
+        json_escape(event)
+    )
+}
+
+/// `pr prepare --json`: the pinned candidate (`candidate` = result commit)
+/// with the generation and live base tip it was materialized against.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn pr_prepare_json(
+    id: u64,
+    state: &str,
+    strategy: &str,
+    generation: u64,
+    candidate: &str,
+    result_tree: &str,
+    base_head: &str,
+    event: &str,
+) -> String {
+    format!(
+        "{},\"strategy\":{},\"generation\":{},\"candidate\":{},\"result_tree\":{},\"base_head\":{},\"event\":{}}}",
+        result_head(id, state),
+        json_escape(strategy),
+        num(generation),
+        json_escape(candidate),
+        json_escape(result_tree),
+        json_escape(base_head),
+        json_escape(event)
+    )
+}
+
+/// `pr update --json`: the new snapshot generation, its pinned commits, and
+/// the appended event.
+pub(crate) fn pr_update_json(
+    id: u64,
+    generation: u64,
+    source_head: &str,
+    base_head: &str,
+    merge_base: &str,
+    event: &str,
+) -> String {
+    format!(
+        "{},\"generation\":{},\"source_head\":{},\"base_head\":{},\"merge_base\":{},\"event\":{}}}",
+        result_head(id, "open"),
+        num(generation),
+        json_escape(source_head),
+        json_escape(base_head),
+        json_escape(merge_base),
+        json_escape(event)
+    )
+}
+
+/// `pr diff --json`: the three-dot diff text between the current
+/// generation's snapshot `base` and `head` commits.
+pub(crate) fn pr_diff_json(
+    state: &crate::event::PrState,
+    base: &str,
+    head: &str,
+    diff: &str,
+) -> String {
+    format!(
+        "{},\"generation\":{},\"base\":{},\"head\":{},\"diff\":{}}}",
+        result_head(state.id, pr_state_name(state)),
+        num(state.generation),
+        json_escape(base),
+        json_escape(head),
+        json_escape(diff)
+    )
+}
+
+/// `pr merge --json`: the merged PR, the strategy and base it merged into,
+/// the snapshot generation, the new base tip, and the recycle outcome or null.
+pub(crate) fn pr_merge_json(outcome: &crate::merge_state::MergeOutcome) -> String {
+    format!(
+        "{},\"strategy\":{},\"base\":{},\"generation\":{},\"merge_commit\":{},\"recycle\":{}}}",
+        result_head(outcome.id, "merged"),
+        json_escape(&outcome.strategy),
+        json_escape(&outcome.base_ref),
+        num(outcome.generation),
+        json_escape(&outcome.merge_commit),
+        opt_str(outcome.recycle.as_deref())
+    )
+}
+
 // ─────────────────────────── version ───────────────────────────
 
 /// `git forge version` — the semver probe the adapter version-gates on
