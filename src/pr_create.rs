@@ -4,7 +4,7 @@ use crate::cli::{help_requested, help_result, parse_entity_id, store_has_ref};
 use crate::cli_error::CliError;
 use crate::identity::open_mutation_store;
 use crate::machine;
-use crate::store::EventStore;
+use crate::store::{EventStore, IdempotencyRequest};
 
 /// Resolve a `--source`/`--base` argument to its canonical bare local branch
 /// name and OID. Accepts `refs/heads/<name>` (full form) and `<name>` (bare
@@ -43,9 +43,9 @@ fn resolve_local_branch(store: &EventStore, arg: &str) -> Result<(String, git2::
     Ok((name.to_string(), oid))
 }
 
-/// `git forge pr create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]... [--closes <n>]`
+/// `git forge pr create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]... [--closes <n>] [--idempotency-key <k>]`
 pub(crate) fn cmd_pr_create(args: &[String]) -> Result<String, CliError> {
-    const USAGE: &str = "usage: git forge pr create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]... [--closes <n>]";
+    const USAGE: &str = "usage: git forge pr create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]... [--closes <n>] [--idempotency-key <k>]";
     // `--json` (#7): the created PR (allocated id, snapshot, pending CI state)
     // as one JSON line — the adapter's id capture.
     let (json, args) = machine::json_requested(args);
@@ -58,6 +58,7 @@ pub(crate) fn cmd_pr_create(args: &[String]) -> Result<String, CliError> {
     let mut body = None;
     let mut labels: Vec<String> = Vec::new();
     let mut closes = None;
+    let mut key = None;
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--" {
@@ -112,6 +113,10 @@ pub(crate) fn cmd_pr_create(args: &[String]) -> Result<String, CliError> {
                 let id = parse_entity_id(&args[i])?;
                 closes = Some(id);
             }
+            crate::idempotency::FLAG => {
+                i += 1;
+                crate::idempotency::set_key(&mut key, args.get(i))?;
+            }
             h @ ("-h" | "--help") => return help_result(json, h, USAGE.into()),
             a if a.starts_with("--") || a.starts_with('-') => {
                 return Err(CliError::usage(format!("unknown option '{a}'"), a));
@@ -137,7 +142,55 @@ pub(crate) fn cmd_pr_create(args: &[String]) -> Result<String, CliError> {
             "",
         ));
     }
+    let description = body.as_deref().filter(|b| !b.is_empty());
+    let request = crate::idempotency::pr_create_request(
+        key.as_deref(),
+        title.trim(),
+        (&source, &base),
+        description,
+        &labels,
+        closes,
+    )?;
+    if let Some(output) = crate::idempotency::replay(request.as_ref(), json)? {
+        return Ok(output);
+    }
 
+    let input = PrCreateInput {
+        source,
+        base,
+        title,
+        description,
+        labels,
+        closes,
+    };
+    publish(&input, request.as_ref(), json)
+}
+
+/// The parsed `pr create` inputs (title untrimmed, as typed).
+struct PrCreateInput<'a> {
+    source: String,
+    base: String,
+    title: String,
+    description: Option<&'a str>,
+    labels: Vec<String>,
+    closes: Option<u64>,
+}
+
+/// Validate the branches and `--closes`, then create the PR in one store
+/// transaction, with `request`'s idempotency record when a key was given.
+fn publish(
+    input: &PrCreateInput<'_>,
+    request: Option<&IdempotencyRequest>,
+    json: bool,
+) -> Result<String, CliError> {
+    let PrCreateInput {
+        title,
+        description,
+        labels,
+        closes,
+        ..
+    } = input;
+    let (description, closes) = (*description, *closes);
     let (store, actor) = open_mutation_store()?;
     // `--closes` must name an EXISTING issue; the check runs BEFORE the
     // allocation inside `create_pr`, so a rejected create consumes no counter
@@ -151,8 +204,8 @@ pub(crate) fn cmd_pr_create(args: &[String]) -> Result<String, CliError> {
             ));
         }
     }
-    let (source, source_oid) = resolve_local_branch(store.store(), &source)?;
-    let (base, base_oid) = resolve_local_branch(store.store(), &base)?;
+    let (source, source_oid) = resolve_local_branch(store.store(), &input.source)?;
+    let (base, base_oid) = resolve_local_branch(store.store(), &input.base)?;
     if source == base {
         return Err(CliError::invalid(
             "source and base branch must differ (no self-PR)",
@@ -165,8 +218,40 @@ pub(crate) fn cmd_pr_create(args: &[String]) -> Result<String, CliError> {
     }
     let merge_base = crate::git::require_single_merge_base(store.repo(), base_oid, source_oid)?;
 
-    let id = store
-        .create_pr(
+    // The pending CI Check marker is published INSIDE `create_pr`'s single
+    // atomic store transaction (F-006), so a failure leaves neither the counter
+    // nor any PR refs changed — no separate append step can strand a durable PR
+    // without its pending marker. No plan executes here (fast + non-destructive);
+    // the plan runs on-demand via `git forge ci run <pr>`. The JSON result
+    // renders from the same values `create_pr` persisted.
+    let render = |id, _| {
+        let state = crate::event::PrState {
+            id,
+            title: Some(title.trim().to_string()),
+            description: description.map(str::to_string),
+            labels: labels.to_vec(),
+            source_ref: Some(source.clone()),
+            base_ref: Some(base.clone()),
+            source_head: Some(source_oid.to_string()),
+            base_head: Some(base_oid.to_string()),
+            merge_base: Some(merge_base.to_string()),
+            closes,
+            ci_status: Some("pending".to_string()),
+            ci_plan: None,
+            ..Default::default()
+        };
+        Ok(crate::store::RecordedResult {
+            id,
+            json: machine::pr_json(&state),
+            text: format!("PR #{id} created: {title} ({source} -> {base})"),
+        })
+    };
+    let claim = request.map(|request| crate::store::Claim {
+        request,
+        render: &render,
+    });
+    let claimed = store
+        .create_pr_claimed(
             title.trim(),
             &source,
             &base,
@@ -174,36 +259,11 @@ pub(crate) fn cmd_pr_create(args: &[String]) -> Result<String, CliError> {
             base_oid,
             merge_base,
             &actor,
-            body.as_deref().filter(|b| !b.is_empty()),
-            &labels,
+            description,
+            labels,
             closes,
+            claim.as_ref(),
         )
         .map_err(CliError::from)?;
-    // The pending CI Check marker is published INSIDE `create_pr`'s single
-    // atomic store transaction (F-006), so a failure leaves neither the counter
-    // nor any PR refs changed — no separate append step can strand a durable PR
-    // without its pending marker. No plan executes here (fast + non-destructive);
-    // the plan runs on-demand via `git forge ci run <pr>`.
-    if json {
-        // The allocated PR number is the id the adapter captures; the rest of
-        // the snapshot renders from the same values `create_pr` persisted.
-        let state = crate::event::PrState {
-            id,
-            title: Some(title.trim().to_string()),
-            description: body.clone().filter(|b| !b.is_empty()),
-            labels: labels.clone(),
-            source_ref: Some(source.clone()),
-            base_ref: Some(base.clone()),
-            source_head: Some(source_oid.to_string()),
-            base_head: Some(base_oid.to_string()),
-            merge_base: Some(merge_base.to_string()),
-            closes,
-            // create_pr publishes the pending marker atomically (above).
-            ci_status: Some("pending".to_string()),
-            ci_plan: None,
-            ..Default::default()
-        };
-        return Ok(machine::pr_json(&state));
-    }
-    Ok(format!("PR #{id} created: {title} ({source} -> {base})"))
+    crate::idempotency::output(request, claimed, json, |id| render(id, git2::Oid::zero()))
 }

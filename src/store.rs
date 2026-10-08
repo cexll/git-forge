@@ -18,7 +18,12 @@ use std::process::Command;
 use git2::{Commit, Error as GitError, Oid, Repository, Signature, TreeBuilder, TreeEntry};
 
 use crate::event::{Event, EventKind, JsonValue};
+mod idempotency;
 mod issue_batch;
+pub(crate) use idempotency::{
+    Claim, Claimed, IdempotencyRecord, IdempotencyRequest, IdempotentCommand, RecordedResult,
+    MAX_KEY_BYTES,
+};
 pub(crate) use issue_batch::{expected_value_rejected, IssueSnapshot};
 
 /// The single mutable counter ref holding the next sequential id.
@@ -793,6 +798,41 @@ impl BoundEventStore {
         labels: &[String],
         closes: Option<u64>,
     ) -> Result<u64, StoreError> {
+        self.create_pr_claimed(
+            title,
+            source_ref,
+            base_ref,
+            source_oid,
+            base_oid,
+            merge_base,
+            actor,
+            description,
+            labels,
+            closes,
+            None,
+        )?
+        .written()
+    }
+
+    /// [`Self::create_pr`] that also publishes `claim`'s idempotency record
+    /// in the SAME transaction. When the transaction fails and a record for
+    /// the key exists, the earlier invocation's record is returned instead
+    /// of retrying, so concurrent same-key creates allocate one PR.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_pr_claimed(
+        &self,
+        title: &str,
+        source_ref: &str,
+        base_ref: &str,
+        source_oid: Oid,
+        base_oid: Oid,
+        merge_base: Oid,
+        actor: &str,
+        description: Option<&str>,
+        labels: &[String],
+        closes: Option<u64>,
+        claim: Option<&Claim<'_>>,
+    ) -> Result<Claimed<u64>, StoreError> {
         for _ in 0..MAX_ALLOC_RETRIES {
             let (counter_tip, counter_new, next, genesis) =
                 match self.inner.current_tip(COUNTER_REF)? {
@@ -858,9 +898,17 @@ impl BoundEventStore {
             for (r, oid) in &plan {
                 lines.push(format!("update {r} {oid} {ZERO_OID}"));
             }
+            if let Some(claim) = claim {
+                lines.push(self.claim_line(claim, next, ci_oid)?);
+            }
             match self.inner.run_update_ref_stdin(&lines) {
-                Ok(()) => return Ok(next),
+                Ok(()) => return Ok(Claimed::Written(next)),
                 Err(e) => {
+                    // A same-key record explains the failure before any retry:
+                    // the winner also moved the counter.
+                    if let Some(record) = self.existing_claim(claim)? {
+                        return Ok(Claimed::Existing(record));
+                    }
                     // Counter first: if it moved, a concurrent allocator won →
                     // retry with a fresh id.
                     if self.inner.current_tip(COUNTER_REF)? != counter_tip {

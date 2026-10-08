@@ -30,7 +30,7 @@ fn issue_event(kind: EventKind, id: u64, actor: &str, body: HashMap<String, Json
 
 /// `git forge issue new <title> [description]`
 fn cmd_new(args: &[String]) -> Result<String, CliError> {
-    const USAGE: &str = "usage: git forge issue new <title> [description] [--label <x>]... [--parent <n>] [--blocked-by <n>]... [--json]";
+    const USAGE: &str = "usage: git forge issue new <title> [description] [--label <x>]... [--parent <n>] [--blocked-by <n>]... [--idempotency-key <k>] [--json]";
     // Pure argument validation first — a usage error must not be masked by a
     // later config-open failure (error precedence, F-028). Supports
     // `--label <x>` (repeatable) alongside the positional `<title> [description]`.
@@ -39,6 +39,7 @@ fn cmd_new(args: &[String]) -> Result<String, CliError> {
     let mut parent = None;
     let mut blocked_by = Vec::new();
     let mut positional: Vec<String> = Vec::new();
+    let mut key = None;
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--" {
@@ -75,6 +76,10 @@ fn cmd_new(args: &[String]) -> Result<String, CliError> {
                     blocked_by.push(id);
                 }
             }
+            crate::idempotency::FLAG => {
+                i += 1;
+                crate::idempotency::set_key(&mut key, args.get(i))?;
+            }
             a if a.starts_with('-') => {
                 return Err(CliError::usage(format!("unknown option '{a}'; {USAGE}"), a))
             }
@@ -102,7 +107,19 @@ fn cmd_new(args: &[String]) -> Result<String, CliError> {
         .get(1)
         .map(|d| d.trim().to_string())
         .filter(|d| !d.is_empty());
-    crate::issue_apply::new_issue(title, description, labels, parent, blocked_by, json)
+    let request = crate::idempotency::issue_new_request(
+        key.as_deref(),
+        &title,
+        description.as_deref(),
+        &labels,
+        parent,
+        &blocked_by,
+    )?;
+    if let Some(output) = crate::idempotency::replay(request.as_ref(), json)? {
+        return Ok(output);
+    }
+    let fields = (title, description, labels, parent, blocked_by);
+    crate::issue_apply::new_issue_keyed(fields, json, request.as_ref())
 }
 
 /// `git forge issue list`
@@ -239,6 +256,7 @@ fn cmd_comment(args: &[String]) -> Result<String, CliError> {
     // unknown option is a clean usage error naming the flag (VAL-202),
     // never a silently-ignored prefix of the comment body.
     let (json, args) = machine::json_requested(args);
+    let (key, args) = crate::idempotency::take_key(&args)?;
     // The grammar is `<n> <body>` — positionals ARE the body. Only flag
     // tokens are rejected here (naming the flag, VAL-202); existence and
     // emptiness are checked below, as before.
@@ -250,6 +268,11 @@ fn cmd_comment(args: &[String]) -> Result<String, CliError> {
     let body = args[1..].join(" ").trim().to_string();
     if body.is_empty() {
         return Err(CliError::usage("comment body must be non-empty", ""));
+    }
+    let kind = crate::store::IdempotentCommand::IssueComment;
+    let request = crate::idempotency::comment_request(kind, key.as_deref(), id, &body)?;
+    if let Some(output) = crate::idempotency::replay(request.as_ref(), json)? {
+        return Ok(output);
     }
     let (store, actor) = open_mutation_store()?;
     let r = crate::store::issue_ref(id);
@@ -265,6 +288,10 @@ fn cmd_comment(args: &[String]) -> Result<String, CliError> {
         &actor,
         body_obj(&[("body", json_str(&body))]),
     );
+    if let Some(request) = &request {
+        let state = |folded: &crate::event::FoldState| machine::issue_state_name(&folded.issue);
+        return crate::idempotency::append_comment(&store, &r, &ev, request, json, state);
+    }
     let event = store.append_event(&r, &ev).map_err(CliError::from)?;
     if json {
         let state = machine::issue_state_at(store.store(), event)?;
@@ -354,11 +381,11 @@ pub fn run_issue(argv: &[String]) -> Result<String, CliError> {
 
 fn issue_sub_usage(sub: &str) -> Option<&'static str> {
     Some(match sub {
-        "new" => "usage: git forge issue new <title> [description] [--label <x>]... [--parent <n>] [--blocked-by <n>]... [--json]",
+        "new" => "usage: git forge issue new <title> [description] [--label <x>]... [--parent <n>] [--blocked-by <n>]... [--idempotency-key <k>] [--json]",
         "apply" => "usage: git forge issue apply <dir|file> [--dry-run] [--json]",
         "list" => "usage: git forge issue list [--parent <n>] [--state open|closed|all] [--json]",
         "show" => "usage: git forge issue show <n>",
-        "comment" => "usage: git forge issue comment <n> <body> [--json]",
+        "comment" => "usage: git forge issue comment <n> <body> [--idempotency-key <k>] [--json]",
         "close" => "usage: git forge issue close <n> [--json]",
         "reopen" => "usage: git forge issue reopen <n> [--json]",
         _ => return None,
@@ -368,11 +395,11 @@ fn issue_sub_usage(sub: &str) -> Option<&'static str> {
 fn issue_help() -> String {
     "usage: git forge issue <new|apply|list|show|comment|close|reopen> ...\n\
      \nsubcommands:\n\
-     \x20 new <title> [description] [--label <x>]... [--parent <n>] [--blocked-by <n>]... [--json]\n\
+     \x20 new <title> [description] [--label <x>]... [--parent <n>] [--blocked-by <n>]... [--idempotency-key <k>] [--json]\n\
      \x20 apply <dir|file> [--dry-run] [--json]\n\
      \x20 list [--parent <n>] [--state open|closed|all] [--json]\n\
      \x20 show <n> [--json]\n\
-     \x20 comment <n> <body> [--json]\n\
+     \x20 comment <n> <body> [--idempotency-key <k>] [--json]\n\
      \x20 close <n> [--json]\n\
      \x20 reopen <n> [--json]"
         .to_string()

@@ -4,6 +4,7 @@ pub mod cli_error;
 pub mod event;
 pub mod fold;
 pub mod git;
+mod idempotency;
 pub mod identity;
 pub mod issue;
 mod issue_apply;

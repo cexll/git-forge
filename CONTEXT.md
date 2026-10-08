@@ -30,6 +30,8 @@
 
 **Counter Ref** — the Forge Ref `refs/forge/meta/counter` holding the next sequential issue/PR number. _Avoid_: sequence, id store.
 
+**Idempotency Key** — a caller-chosen value passed with `--idempotency-key` to `issue new`, `pr create`, `issue comment` or `pr comment`. Its record (`refs/forge/idempotency/<command>/<hex>`) is published in the same ref transaction as the mutation; a retry with the same key and inputs returns the recorded result, and different inputs are `E_CONFLICT`. Scoped per command kind; never expires. _Avoid_: Issue Key, request id.
+
 **Canonical Remote** — the single authoritative bare remote holding the forge refs; clones fetch/push forge state to it, and a pre-receive hook enforces the Merge Gate against pushes (planned in L2). _Avoid_: upstream, fork.
 
 ### Workflow

@@ -243,6 +243,7 @@ fn cmd_pr_comment(args: &[String]) -> Result<String, CliError> {
     // is a clean usage error naming the flag (VAL-202), never a
     // silently-ignored prefix of the comment body.
     let (json, args) = machine::json_requested(args);
+    let (key, args) = crate::idempotency::take_key(&args)?;
     machine::reject_flags(&args, USAGE)?;
     if args.len() < 2 {
         return Err(CliError::usage(USAGE, ""));
@@ -251,6 +252,11 @@ fn cmd_pr_comment(args: &[String]) -> Result<String, CliError> {
     let body = args[1..].join(" ").trim().to_string();
     if body.is_empty() {
         return Err(CliError::usage("comment body must be non-empty", ""));
+    }
+    let kind = crate::store::IdempotentCommand::PrComment;
+    let request = crate::idempotency::comment_request(kind, key.as_deref(), id, &body)?;
+    if let Some(output) = crate::idempotency::replay(request.as_ref(), json)? {
+        return Ok(output);
     }
     let (store, actor) = open_mutation_store()?;
     let r = crate::store::pr_head_ref(id);
@@ -267,6 +273,10 @@ fn cmd_pr_comment(args: &[String]) -> Result<String, CliError> {
         &actor,
         body_obj(&[("body", json_str(&body))]),
     );
+    if let Some(request) = &request {
+        let state = |folded: &crate::event::FoldState| machine::pr_state_name(&folded.pr);
+        return crate::idempotency::append_comment(&store, &r, &ev, request, json, state);
+    }
     let event = store.append_event(&r, &ev).map_err(CliError::from)?;
     if json {
         let state = machine::pr_state_at(store.store(), event)?;
@@ -406,10 +416,10 @@ pub fn run_pr(argv: &[String]) -> Result<String, CliError> {
 
 fn pr_sub_usage(sub: &str) -> Option<&'static str> {
     Some(match sub {
-        "create" => "usage: git forge pr create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]... [--closes <n>]",
+        "create" => "usage: git forge pr create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]... [--closes <n>] [--idempotency-key <k>]",
         "list" => "usage: git forge pr list",
         "show" => "usage: git forge pr show <n>",
-        "comment" => "usage: git forge pr comment <n> <body> [--json]",
+        "comment" => "usage: git forge pr comment <n> <body> [--idempotency-key <k>] [--json]",
         "review" => "usage: git forge pr review <n> --approve|--reject [--file <f> --line <l> --commit <c>] [--json]",
         "abandon" => "usage: git forge pr abandon <n> --reason <text> [--json]",
         "diff" => "usage: git forge pr diff <n> [--json]",
@@ -422,10 +432,10 @@ fn pr_sub_usage(sub: &str) -> Option<&'static str> {
 fn pr_help() -> String {
     "usage: git forge pr <create|list|show|comment|review|update|prepare|diff|merge|abandon> ...\n\
      \nsubcommands:\n\
-     \x20 create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]... [--closes <n>]\n\
+     \x20 create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]... [--closes <n>] [--idempotency-key <k>]\n\
      \x20 list\n\
      \x20 show <n> [--json]\n\
-     \x20 comment <n> <body> [--json]\n\
+     \x20 comment <n> <body> [--idempotency-key <k>] [--json]\n\
      \x20 review <n> --approve|--reject [--file <f> --line <l> --commit <c>] [--json]\n\
      \x20 update <n> [--json]\n\
      \x20 prepare <n> --strategy merge|squash|rebase|ff [--json]\n\
