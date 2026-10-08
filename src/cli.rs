@@ -57,11 +57,6 @@ pub(crate) fn json_help_refused(token: &str) -> CliError {
     )
 }
 
-/// True when `argv` carries the bare `--json` output selector.
-pub(crate) fn json_flag(argv: &[String]) -> bool {
-    argv.iter().any(|arg| arg == "--json")
-}
-
 pub(crate) fn json_str(value: &str) -> JsonValue {
     JsonValue::String(value.to_string())
 }
@@ -316,15 +311,16 @@ fn cmd_pr_create(args: &[String]) -> Result<String, CliError> {
 }
 
 /// `git forge pr show <n>`
-fn cmd_pr_show(store: &EventStore, args: &[String]) -> Result<String, CliError> {
+fn cmd_pr_show(args: &[String]) -> Result<String, CliError> {
     let (json, args) = machine::json_requested(args);
     let (id_arg, rest) = args
         .split_first()
         .ok_or_else(|| CliError::usage("usage: git forge pr show <n> [--json]", ""))?;
     machine::reject_leftover_flags(rest, "usage: git forge pr show <n>")?;
     let id = parse_entity_id(id_arg)?;
+    let store = open_store()?;
     let r = crate::store::pr_head_ref(id);
-    if !store_has_ref(store, &r) {
+    if !store_has_ref(&store, &r) {
         return Err(CliError::not_found(
             format!("PR #{id} does not exist"),
             id_arg,
@@ -421,10 +417,10 @@ fn cmd_pr_show(store: &EventStore, args: &[String]) -> Result<String, CliError> 
 }
 
 /// `git forge pr list`
-fn cmd_pr_list(store: &EventStore, args: &[String]) -> Result<String, CliError> {
+fn cmd_pr_list(args: &[String]) -> Result<String, CliError> {
     let (json, args) = machine::json_requested(args);
     machine::reject_leftover_flags(&args, "usage: git forge pr list")?;
-    let states = machine::fold_all_prs(store)?;
+    let states = machine::fold_all_prs(&open_store()?)?;
     if json {
         return Ok(machine::pr_list_json(&states));
     }
@@ -475,8 +471,7 @@ fn cmd_pr_comment(args: &[String]) -> Result<String, CliError> {
     );
     let event = store.append_event(&r, &ev).map_err(CliError::from)?;
     if json {
-        let chain = store.read_chain_at(event).map_err(CliError::from)?;
-        let state = machine::pr_state_name(&crate::event::fold(&chain).pr);
+        let state = machine::pr_state_at(store.store(), event)?;
         return Ok(machine::event_result_json(id, state, &event.to_string()));
     }
     Ok(format!("comment added to PR #{id}"))
@@ -556,7 +551,13 @@ fn cmd_pr_abandon(args: &[String]) -> Result<String, CliError> {
     );
     let event = store.append_event(&r, &ev).map_err(CliError::from)?;
     if json {
-        return Ok(machine::pr_abandon_json(id, &reason, &event.to_string()));
+        let state = machine::pr_state_at(store.store(), event)?;
+        return Ok(machine::pr_abandon_json(
+            id,
+            state,
+            &reason,
+            &event.to_string(),
+        ));
     }
     Ok(format!("PR #{id} abandoned: {reason}"))
 }
@@ -564,25 +565,25 @@ fn cmd_pr_abandon(args: &[String]) -> Result<String, CliError> {
 /// Dispatch a `git forge pr` subcommand. `argv` excludes the `pr` token.
 pub fn run_pr(argv: &[String]) -> Result<String, CliError> {
     let sub = argv.first().map(|s| s.as_str()).unwrap_or("");
-    let json = json_flag(argv);
-    if help_requested(argv.get(1..).unwrap_or(&[])) {
+    let (json, rest) = machine::json_requested(argv.get(1..).unwrap_or(&[]));
+    if help_requested(&rest) {
         let usage = match sub {
             "merge" => Some(crate::pr_merge::pr_merge_help()),
             "prepare" => Some(crate::pr_prepare::pr_prepare_help()),
             _ => pr_sub_usage(sub).map(String::from),
         };
         if let Some(usage) = usage {
-            return help_result(json, &argv[1], usage);
+            return help_result(json, &rest[0], usage);
         }
     }
     match sub {
         "create" => cmd_pr_create(&argv[1..]),
-        "list" => cmd_pr_list(&open_store()?, &argv[1..]),
+        "list" => cmd_pr_list(&argv[1..]),
         "show" => {
             if argv[1..].iter().all(|arg| arg == "--json") {
                 return Err(CliError::usage("usage: git forge pr show <n> [--json]", ""));
             }
-            cmd_pr_show(&open_store()?, &argv[1..])
+            cmd_pr_show(&argv[1..])
         }
         "comment" => cmd_pr_comment(&argv[1..]),
         "review" => crate::pr_review::cmd_pr_review(&argv[1..]),
@@ -592,9 +593,9 @@ pub fn run_pr(argv: &[String]) -> Result<String, CliError> {
             if argv[1..].iter().all(|arg| arg == "--json") {
                 return Err(CliError::usage("usage: git forge pr diff <n> [--json]", ""));
             }
-            crate::pr_merge::cmd_pr_diff(&open_store()?, &argv[1..])
+            crate::pr_merge::cmd_pr_diff(&argv[1..])
         }
-        "merge" => crate::pr_merge::cmd_pr_merge(open_store()?, &argv[1..]),
+        "merge" => crate::pr_merge::cmd_pr_merge(&argv[1..]),
         "abandon" => cmd_pr_abandon(&argv[1..]),
         "help" | "-h" | "--help" => help_result(json, sub, pr_help()),
         "" => Ok(pr_help()),
@@ -920,9 +921,9 @@ fn cmd_ci_run(args: &[String]) -> Result<String, CliError> {
 /// Dispatch a `git forge ci` subcommand. `argv` excludes the `ci` token.
 pub fn run_ci(argv: &[String]) -> Result<String, CliError> {
     let sub = argv.first().map(|s| s.as_str()).unwrap_or("");
-    let json = json_flag(argv);
-    if help_requested(argv.get(1..).unwrap_or(&[])) && sub == "run" {
-        return help_result(json, &argv[1], "usage: git forge ci run <pr>".into());
+    let (json, rest) = machine::json_requested(argv.get(1..).unwrap_or(&[]));
+    if help_requested(&rest) && sub == "run" {
+        return help_result(json, &rest[0], "usage: git forge ci run <pr>".into());
     }
     match sub {
         "run" => cmd_ci_run(&argv[1..]),

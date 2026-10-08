@@ -91,6 +91,12 @@ pub(crate) fn resolve_identity() -> Result<(git2::Signature<'static>, String), C
     // open): an invalid GIT_FORGE_ROLE is a clean CLI error that resolves
     // nothing and writes nothing.
     resolve_role()?;
+    // Test-only write barrier (wire contract § Test-only write barrier):
+    // every mutation resolves its identity after its read-only snapshot and
+    // before its first forge write, so a test can park the command here and
+    // append a concurrent event. Debug builds only; inert when unset.
+    #[cfg(debug_assertions)]
+    crate::merge_state::run_test_barrier("GIT_FORGE_TEST_WRITE_BARRIER")?;
     let signature = match (&name, &email) {
         (Some(n), Some(e)) => match git2::Signature::now(n, e) {
             Ok(s) => s,

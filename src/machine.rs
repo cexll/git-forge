@@ -301,6 +301,23 @@ pub(crate) fn pr_state_name(state: &crate::event::PrState) -> &'static str {
     }
 }
 
+/// Lifecycle state of the Issue folded as of `event`, the event commit a
+/// mutation appended. An append can re-parent onto a newer tip, so the state
+/// read before the append can be stale; this is the state the write produced.
+pub(crate) fn issue_state_at(
+    store: &EventStore,
+    event: git2::Oid,
+) -> Result<&'static str, CliError> {
+    let chain = store.read_chain_at(event).map_err(CliError::from)?;
+    Ok(issue_state_name(&fold(&chain).issue))
+}
+
+/// Lifecycle state of the PR folded as of `event` (see [`issue_state_at`]).
+pub(crate) fn pr_state_at(store: &EventStore, event: git2::Oid) -> Result<&'static str, CliError> {
+    let chain = store.read_chain_at(event).map_err(CliError::from)?;
+    Ok(pr_state_name(&fold(&chain).pr))
+}
+
 /// `issue comment|close|reopen --json` and `pr comment --json`: the entity,
 /// its resulting state, and the appended event commit.
 pub(crate) fn event_result_json(id: u64, state: &str, event: &str) -> String {
@@ -311,11 +328,12 @@ pub(crate) fn event_result_json(id: u64, state: &str, event: &str) -> String {
     )
 }
 
-/// `pr abandon --json`: the abandoned PR, its recorded reason and event.
-pub(crate) fn pr_abandon_json(id: u64, reason: &str, event: &str) -> String {
+/// `pr abandon --json`: the PR, its state after the abandon event (`merged`
+/// when a merge landed first), the recorded reason and the event.
+pub(crate) fn pr_abandon_json(id: u64, state: &str, reason: &str, event: &str) -> String {
     format!(
         "{},\"reason\":{},\"event\":{}}}",
-        result_head(id, "abandoned"),
+        result_head(id, state),
         json_escape(reason),
         json_escape(event)
     )
@@ -370,6 +388,7 @@ pub(crate) fn pr_prepare_json(
 /// the appended event.
 pub(crate) fn pr_update_json(
     id: u64,
+    state: &str,
     generation: u64,
     source_head: &str,
     base_head: &str,
@@ -378,7 +397,7 @@ pub(crate) fn pr_update_json(
 ) -> String {
     format!(
         "{},\"generation\":{},\"source_head\":{},\"base_head\":{},\"merge_base\":{},\"event\":{}}}",
-        result_head(id, "open"),
+        result_head(id, state),
         num(generation),
         json_escape(source_head),
         json_escape(base_head),
@@ -410,7 +429,7 @@ pub(crate) fn pr_diff_json(
 pub(crate) fn pr_merge_json(outcome: &crate::merge_state::MergeOutcome) -> String {
     format!(
         "{},\"strategy\":{},\"base\":{},\"generation\":{},\"merge_commit\":{},\"recycle\":{}}}",
-        result_head(outcome.id, "merged"),
+        result_head(outcome.id, outcome.state),
         json_escape(&outcome.strategy),
         json_escape(&outcome.base_ref),
         num(outcome.generation),

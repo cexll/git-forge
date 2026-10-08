@@ -7,13 +7,12 @@
 use crate::cli_error::CliError;
 
 use crate::cli::{
-    body_obj, help_requested, help_result, json_flag, json_str, open_store, parse_entity_id,
+    body_obj, help_requested, help_result, json_str, open_store, parse_entity_id,
     sanitize_terminal, store_has_ref,
 };
 use crate::event::{Event, EventKind, JsonValue};
 use crate::identity::open_mutation_store;
 use crate::machine;
-use crate::store::EventStore;
 use std::collections::HashMap;
 
 /// Build an `issue.*` event for `store`.
@@ -107,7 +106,7 @@ fn cmd_new(args: &[String]) -> Result<String, CliError> {
 }
 
 /// `git forge issue list`
-fn cmd_list(store: &EventStore, args: &[String]) -> Result<String, CliError> {
+fn cmd_list(args: &[String]) -> Result<String, CliError> {
     const USAGE: &str =
         "usage: git forge issue list [--parent <n>] [--state open|closed|all] [--json]";
     let (json, args) = machine::json_requested(args);
@@ -141,7 +140,8 @@ fn cmd_list(store: &EventStore, args: &[String]) -> Result<String, CliError> {
         }
         i += 1;
     }
-    let all = machine::fold_all_issues(store)?;
+    let store = open_store()?;
+    let all = machine::fold_all_issues(&store)?;
     let states: Vec<_> = all
         .iter()
         .filter(|state| {
@@ -172,7 +172,7 @@ fn cmd_list(store: &EventStore, args: &[String]) -> Result<String, CliError> {
 }
 
 /// `git forge issue show <n>`
-fn cmd_show(store: &EventStore, args: &[String]) -> Result<String, CliError> {
+fn cmd_show(args: &[String]) -> Result<String, CliError> {
     let (json, args) = machine::json_requested(args);
     machine::reject_leftover_flags(
         args.get(1..).unwrap_or(&[]),
@@ -182,8 +182,9 @@ fn cmd_show(store: &EventStore, args: &[String]) -> Result<String, CliError> {
         args.first()
             .ok_or_else(|| CliError::usage("usage: git forge issue show <n> [--json]", ""))?,
     )?;
+    let store = open_store()?;
     let r = crate::store::issue_ref(id);
-    if !store_has_ref(store, &r) {
+    if !store_has_ref(&store, &r) {
         return Err(CliError::not_found(
             format!("issue #{id} does not exist"),
             id.to_string(),
@@ -194,7 +195,7 @@ fn cmd_show(store: &EventStore, args: &[String]) -> Result<String, CliError> {
         return Err((format!("issue #{id} has no events")).into());
     }
     let state = crate::event::fold(&chain).issue;
-    let all = machine::fold_all_issues(store)?;
+    let all = machine::fold_all_issues(&store)?;
     if json {
         return Ok(machine::issue_json(&state, &all));
     }
@@ -266,8 +267,7 @@ fn cmd_comment(args: &[String]) -> Result<String, CliError> {
     );
     let event = store.append_event(&r, &ev).map_err(CliError::from)?;
     if json {
-        let chain = store.read_chain_at(event).map_err(CliError::from)?;
-        let state = machine::issue_state_name(&crate::event::fold(&chain).issue);
+        let state = machine::issue_state_at(store.store(), event)?;
         return Ok(machine::event_result_json(id, state, &event.to_string()));
     }
     Ok(format!("comment added to issue #{id}"))
@@ -303,12 +303,13 @@ fn cmd_state(kind: EventKind, args: &[String]) -> Result<String, CliError> {
     }
     let ev = issue_event(kind, id, &actor, HashMap::new());
     let event = store.append_event(&r, &ev).map_err(CliError::from)?;
-    let (verb, state) = match kind {
-        EventKind::IssueClose => ("closed", "closed"),
-        EventKind::IssueReopen => ("reopened", "open"),
+    let verb = match kind {
+        EventKind::IssueClose => "closed",
+        EventKind::IssueReopen => "reopened",
         _ => unreachable!(),
     };
     if json {
+        let state = machine::issue_state_at(store.store(), event)?;
         return Ok(machine::event_result_json(id, state, &event.to_string()));
     }
     Ok(format!("issue #{id} {verb}"))
@@ -319,10 +320,10 @@ pub fn run_issue(argv: &[String]) -> Result<String, CliError> {
     let sub = argv.first().map(|s| s.as_str()).unwrap_or("");
     // Subcommand-level `-h`/`--help` is answered HERE, before any store open,
     // so help works outside a git repository (same as the namespace helps).
-    let json = json_flag(argv);
-    if help_requested(argv.get(1..).unwrap_or(&[])) {
+    let (json, rest) = machine::json_requested(argv.get(1..).unwrap_or(&[]));
+    if help_requested(&rest) {
         if let Some(usage) = issue_sub_usage(sub) {
-            return help_result(json, &argv[1], usage.into());
+            return help_result(json, &rest[0], usage.into());
         }
     }
     match sub {
@@ -331,8 +332,8 @@ pub fn run_issue(argv: &[String]) -> Result<String, CliError> {
             error.message = sanitize_terminal(&error.message);
             error
         }),
-        "list" => cmd_list(&open_store()?, &argv[1..]),
-        "show" => cmd_show(&open_store()?, &argv[1..]),
+        "list" => cmd_list(&argv[1..]),
+        "show" => cmd_show(&argv[1..]),
         "comment" => cmd_comment(&argv[1..]),
         "close" | "reopen" => {
             let kind = if sub == "close" {

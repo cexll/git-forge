@@ -225,7 +225,7 @@ pub(crate) fn cmd_pr_prepare(args: &[String]) -> Result<String, CliError> {
     if json {
         return Ok(crate::machine::pr_prepare_json(
             id,
-            crate::machine::pr_state_name(&state),
+            crate::machine::pr_state_at(store.store(), event)?,
             &strategy,
             generation,
             &result_commit.to_string(),

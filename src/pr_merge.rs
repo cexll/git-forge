@@ -9,10 +9,9 @@
 use crate::cli_error::CliError;
 
 use crate::identity::{bind_identity, resolve_identity};
-use crate::store::EventStore;
 
 /// `git forge pr diff <n>` — three-dot diff from the immutable snapshot refs.
-pub(crate) fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String, CliError> {
+pub(crate) fn cmd_pr_diff(args: &[String]) -> Result<String, CliError> {
     // Same strict guard as `pr show`: one positional, no options — any
     // dash-leading leftover is a usage error naming the flag (VAL-202).
     let (json, args) = crate::machine::json_requested(args);
@@ -21,6 +20,7 @@ pub(crate) fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String,
         .ok_or_else(|| CliError::usage("usage: git forge pr diff <n> [--json]", ""))?;
     crate::machine::reject_leftover_flags(rest, "usage: git forge pr diff <n>")?;
     let id = crate::cli::parse_entity_id(id_arg)?;
+    let store = &crate::cli::open_store()?;
     let head = crate::store::pr_head_ref(id);
     if !crate::cli::store_has_ref(store, &head) {
         return Err(CliError::not_found(
@@ -115,7 +115,7 @@ pub(crate) fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String,
 // Baseline exemption (removal trigger in constraints.yaml baseline.lint_allow):
 // the sole lib/src function over the 150-line clippy::too_many_lines threshold.
 #[allow(clippy::too_many_lines)]
-pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String, CliError> {
+pub(crate) fn cmd_pr_merge(args: &[String]) -> Result<String, CliError> {
     let (json, args) = crate::machine::json_requested(args);
     let render = |outcome: crate::merge_state::MergeOutcome| {
         if json {
@@ -212,6 +212,7 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
             "",
         )
     })?)?;
+    let store = crate::cli::open_store()?;
     let head = crate::store::pr_head_ref(id);
     // Bind the gate decision to the EXACT PR-head OID it validated (F-007):
     // the completion transaction CASes the head chain from OID `gate_head`,
@@ -859,6 +860,7 @@ pub(crate) fn cmd_pr_update(args: &[String]) -> Result<String, CliError> {
     if json {
         return Ok(crate::machine::pr_update_json(
             id,
+            crate::machine::pr_state_at(store.store(), event)?,
             generation,
             &new_source.to_string(),
             &new_base.to_string(),

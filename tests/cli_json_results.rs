@@ -373,6 +373,82 @@ fn pr_merge_of_a_prepared_candidate_reports_the_recycle_outcome() {
 #[test]
 fn json_with_help_is_a_usage_error_for_every_json_command() {
     let repo = Repo::new();
+    for args in json_help_cases() {
+        let output = repo.run(&args);
+        assert_json_usage_error(&args, &output);
+    }
+    // Nothing was written: no forge refs exist.
+    assert_eq!(repo.git(&["for-each-ref", "refs/forge"]), "");
+    // A literal `--help` after `--` is data, not a help request.
+    let created = json_result(
+        &repo.run(&["issue", "new", "--json", "--", "--help"]),
+        &[
+            "id",
+            "title",
+            "description",
+            "labels",
+            "open",
+            "comments",
+            "key",
+            "parent",
+            "blocked_by",
+            "children",
+            "blocked",
+        ],
+    );
+    assert_eq!(created["title"], "--help");
+}
+
+/// The same help table outside any git repository: a help request under
+/// `--json` is decided from the arguments alone, before the repository is
+/// opened, so it is `E_USAGE` (never "not a git repository") and nothing is
+/// created in the directory.
+#[test]
+fn json_with_help_is_a_usage_error_outside_a_repository() {
+    let dir = std::env::temp_dir().join(format!(
+        "gf-json-nonrepo-{}-{}",
+        std::process::id(),
+        NEXT_REPO.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    for args in json_help_cases() {
+        let output = Command::new(env!("CARGO_BIN_EXE_git-forge"))
+            .args(&args)
+            .current_dir(&dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_FORGE_ROLE")
+            .output()
+            .unwrap();
+        assert_json_usage_error(&args, &output);
+    }
+    let entries: Vec<_> = std::fs::read_dir(&dir).unwrap().collect();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(entries.is_empty(), "nothing written: {entries:?}");
+}
+
+/// Exit 1 with one `E_USAGE` JSON error document on stdout whose message is
+/// the stderr line.
+fn assert_json_usage_error(args: &[&str], output: &Output) {
+    assert_eq!(output.status.code(), Some(1), "{args:?}");
+    let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+    assert_eq!(stdout.lines().count(), 1, "{args:?}: {stdout}");
+    let document: serde_json::Value =
+        serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{args:?}: {e}: {stdout}"));
+    assert_eq!(document["error"]["code"], "E_USAGE", "{args:?}: {stdout}");
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!(
+            "git-forge: {}\n",
+            document["error"]["message"].as_str().unwrap()
+        )
+    );
+}
+
+/// Every command that accepts `--json`, with the help flag before and after
+/// `--json` (directly after the subcommand and after its positionals), plus
+/// the namespace help words.
+fn json_help_cases() -> Vec<Vec<&'static str>> {
     let commands: &[&[&str]] = &[
         &["issue", "new"],
         &["issue", "apply"],
@@ -417,42 +493,7 @@ fn json_with_help_is_a_usage_error_for_every_json_command() {
     ] {
         cases.push(namespace_help);
     }
-    for args in cases {
-        let output = repo.run(&args);
-        assert_eq!(output.status.code(), Some(1), "{args:?}");
-        let stdout = String::from_utf8(output.stdout).unwrap();
-        assert_eq!(stdout.lines().count(), 1, "{args:?}: {stdout}");
-        let document: serde_json::Value =
-            serde_json::from_str(&stdout).unwrap_or_else(|e| panic!("{args:?}: {e}: {stdout}"));
-        assert_eq!(document["error"]["code"], "E_USAGE", "{args:?}");
-        assert_eq!(
-            String::from_utf8_lossy(&output.stderr),
-            format!(
-                "git-forge: {}\n",
-                document["error"]["message"].as_str().unwrap()
-            )
-        );
-    }
-    // Nothing was written: no forge refs exist.
-    assert_eq!(repo.git(&["for-each-ref", "refs/forge"]), "");
-    // A literal `--help` after `--` is data, not a help request.
-    let created = json_result(
-        &repo.run(&["issue", "new", "--json", "--", "--help"]),
-        &[
-            "id",
-            "title",
-            "description",
-            "labels",
-            "open",
-            "comments",
-            "key",
-            "parent",
-            "blocked_by",
-            "children",
-            "blocked",
-        ],
-    );
-    assert_eq!(created["title"], "--help");
+    cases
 }
 
 /// Names of every ref under `refs/forge` plus the branch heads, so two
@@ -608,4 +649,178 @@ fn help_tokens_consumed_as_option_values_are_data_under_json() {
         "git-forge: unknown strategy '--help'; use --strategy merge|squash|rebase|ff\n"
     );
     assert_eq!(ref_names(&repo), before);
+}
+
+/// Run `args` with the test-only write barrier set: the command parks after
+/// its read-only snapshot and before its first forge write, `concurrent`
+/// writes to the repository, then the command resumes. If the command never
+/// parks, `concurrent` still runs after it, so a result that was not derived
+/// at the command's own appended event shows the pre-write state.
+fn run_with_concurrent_write(repo: &Repo, args: &[&str], concurrent: fn(&Repo)) -> Output {
+    let barrier = PathBuf::from(format!("{}-barrier", repo.0.display()));
+    let mut child = Command::new(env!("CARGO_BIN_EXE_git-forge"))
+        .args(args)
+        .current_dir(&repo.0)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_FORGE_ROLE")
+        .env("GIT_FORGE_TEST_WRITE_BARRIER", &barrier)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let parked = loop {
+        if barrier.join("ready").exists() {
+            break true;
+        }
+        if child.try_wait().unwrap().is_some() {
+            break false;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "{args:?} never reached the write barrier"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    };
+    concurrent(repo);
+    if parked {
+        std::fs::write(barrier.join("release"), "release").unwrap();
+    }
+    let output = child.wait_with_output().unwrap();
+    let _ = std::fs::remove_dir_all(&barrier);
+    output
+}
+
+fn abandon(repo: &Repo) {
+    repo.ok(&["pr", "abandon", "1", "--reason", "concurrent"]);
+}
+
+const REVIEW_KEYS: [&str; 6] = [
+    "id",
+    "state",
+    "decision",
+    "generation",
+    "candidate",
+    "event",
+];
+
+/// `pr review --json` reports the PR state at its own appended event: an
+/// abandon that lands between the review's snapshot read and its append is
+/// folded in, while the captured generation and candidate stay as reviewed.
+#[test]
+fn pr_review_json_state_folds_a_concurrent_abandon() {
+    let repo = Repo::new();
+    repo.pr();
+    repo.ok(&["pr", "prepare", "1", "--strategy", "merge"]);
+    let candidate = tip(&repo, "refs/forge/prs/1/result");
+    let output = run_with_concurrent_write(
+        &repo,
+        &["pr", "review", "1", "--approve", "--json"],
+        abandon,
+    );
+    let result = json_result(&output, &REVIEW_KEYS);
+    assert_eq!(result["state"], "abandoned");
+    assert_eq!(result["generation"], 0);
+    assert_eq!(result["candidate"], candidate);
+    assert_eq!(result["event"], tip(&repo, "refs/forge/prs/1/head"));
+}
+
+/// `pr prepare --json` reports the PR state at its own appended event.
+#[test]
+fn pr_prepare_json_state_folds_a_concurrent_abandon() {
+    let repo = Repo::new();
+    repo.pr();
+    let output = run_with_concurrent_write(
+        &repo,
+        &["pr", "prepare", "1", "--strategy", "merge", "--json"],
+        abandon,
+    );
+    let result = json_result(
+        &output,
+        &[
+            "id",
+            "state",
+            "strategy",
+            "generation",
+            "candidate",
+            "result_tree",
+            "base_head",
+            "event",
+        ],
+    );
+    assert_eq!(result["state"], "abandoned");
+    assert_eq!(result["generation"], 0);
+    assert_eq!(result["candidate"], tip(&repo, "refs/forge/prs/1/result"));
+    assert_eq!(result["event"], tip(&repo, "refs/forge/prs/1/head"));
+}
+
+/// `pr update --json` reports the PR state at its own appended event, not a
+/// fixed `open`.
+#[test]
+fn pr_update_json_state_folds_a_concurrent_abandon() {
+    let repo = Repo::new();
+    repo.pr();
+    repo.git(&["checkout", "-q", "feature"]);
+    repo.commit_file("more.txt", "more\n");
+    repo.git(&["checkout", "-q", "main"]);
+    let output = run_with_concurrent_write(&repo, &["pr", "update", "1", "--json"], abandon);
+    let result = json_result(
+        &output,
+        &[
+            "id",
+            "state",
+            "generation",
+            "source_head",
+            "base_head",
+            "merge_base",
+            "event",
+        ],
+    );
+    assert_eq!(result["state"], "abandoned");
+    assert_eq!(result["generation"], 1);
+    assert_eq!(result["source_head"], tip(&repo, "feature"));
+    assert_eq!(result["event"], tip(&repo, "refs/forge/prs/1/head"));
+}
+
+/// `pr abandon --json` reports the PR state at its own appended event: a
+/// merge that lands between the abandon's terminality check and its append
+/// leaves the PR merged.
+#[test]
+fn pr_abandon_json_state_folds_a_concurrent_merge() {
+    let repo = Repo::new();
+    repo.pr();
+    repo.ok(&["ci", "run", "1"]);
+    repo.ok(&["pr", "review", "1", "--approve"]);
+    let output = run_with_concurrent_write(
+        &repo,
+        &["pr", "abandon", "1", "--reason", "late", "--json"],
+        |repo| {
+            repo.ok(&["pr", "merge", "1"]);
+        },
+    );
+    let result = json_result(&output, &["id", "state", "reason", "event"]);
+    assert_eq!(result["state"], "merged");
+    assert_eq!(result["reason"], "late");
+    assert_eq!(result["event"], tip(&repo, "refs/forge/prs/1/head"));
+}
+
+/// The comment commands report the state at their own appended event.
+#[test]
+fn comment_json_state_folds_a_concurrent_terminal_event() {
+    let repo = Repo::new();
+    repo.pr();
+    let output = run_with_concurrent_write(&repo, &["pr", "comment", "1", "hi", "--json"], abandon);
+    let result = json_result(&output, &["id", "state", "event"]);
+    assert_eq!(result["state"], "abandoned");
+    assert_eq!(result["event"], tip(&repo, "refs/forge/prs/1/head"));
+    let repo = Repo::new();
+    repo.issue();
+    let output =
+        run_with_concurrent_write(&repo, &["issue", "comment", "1", "hi", "--json"], |repo| {
+            repo.ok(&["issue", "close", "1"]);
+        });
+    let result = json_result(&output, &["id", "state", "event"]);
+    assert_eq!(result["state"], "closed");
+    assert_eq!(result["event"], tip(&repo, "refs/forge/issues/1"));
 }

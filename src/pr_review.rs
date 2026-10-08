@@ -151,7 +151,7 @@ pub(crate) fn cmd_pr_review(args: &[String]) -> Result<String, CliError> {
     if json {
         return Ok(crate::machine::pr_review_json(
             id,
-            crate::machine::pr_state_name(&state),
+            crate::machine::pr_state_at(store.store(), event)?,
             &decision,
             state.generation,
             candidate_bind.as_ref().map(|c| c.result_commit.as_str()),

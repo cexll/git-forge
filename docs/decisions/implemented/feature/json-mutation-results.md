@@ -21,9 +21,13 @@ and no `event`. Commands also return the ids they produce or bind:
 
 Each shape has one hand-ordered template in `src/machine.rs`, like the
 existing schema-1 shapes. Results use values the command captured at
-mutation time, not a refold that a concurrent writer could change. `issue comment`
-and `pr comment` compute `state` by folding the chain up to their own appended
-event commit (`read_chain_at`), so a later concurrent append cannot change it.
+mutation time, not a refold that a concurrent writer could change. Every
+mutation result computes `state` by folding the chain up to the event commit
+the command wrote (`read_chain_at`; for `pr merge`, the applied `pr.merge`
+commit). An append can re-parent onto a newer tip, so the state read before
+the append can be stale; the fold at the written event includes a concurrent
+terminal event that landed first, and a later append cannot change it.
+`generation` and `candidate` stay the values captured before the append.
 
 `pr merge` finalization returns a typed `MergeOutcome` instead of a prose
 string. `MergeOutcome::prose` renders the unchanged human line. The JSON
@@ -33,6 +37,10 @@ A help request combined with `--json` fails with `E_USAGE` and writes
 nothing. This follows the spec default for a command without a JSON result.
 Each parser decides what is a help request at its own help arm, and
 `cli::help_result` returns the prose usage or, under `--json`, the error.
+The subcommand dispatchers test the first argument after removing `--json`,
+so `--json --help` and `--help --json` behave the same. Read commands parse
+their arguments before they open the repository, so the decision never
+depends on being inside a repository.
 An option value that equals `-h` or `--help` stays data, as before. Without
 `--json`, `pr prepare` still prints help for any help token. Under `--json`,
 its parser reads `--strategy --help` as a strategy value and rejects it.
