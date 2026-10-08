@@ -6,6 +6,8 @@
 //! file is corrupted, so identity is resolved here through
 //! [`crate::git::config_get_identity`] (a `git config --null --get` child
 //! process) — never through libgit2.
+use crate::cli_error::CliError;
+
 use crate::store::{BoundEventStore, EventStore};
 
 /// The command's resolved role, if any. `None` = no role was configured
@@ -24,17 +26,18 @@ pub(crate) const ROLES: [&str; 3] = ["worker", "reviewer", "orchestrator"];
 /// store open or write, mirroring F-028's no-silent-fallback policy.
 /// OnceLock: the first resolution wins for the process; a mutation command
 /// resolves identity at most once, so this is single-shot in practice.
-fn resolve_role() -> Result<Option<String>, String> {
+fn resolve_role() -> Result<Option<String>, CliError> {
     let raw = std::env::var("GIT_FORGE_ROLE").unwrap_or_default();
     let raw = raw.trim();
     if raw.is_empty() {
         return Ok(COMMAND_ROLE.get_or_init(|| None).clone());
     }
     if !ROLES.contains(&raw) {
-        return Err(format!(
+        return Err((format!(
             "unknown GIT_FORGE_ROLE '{raw}' (expected one of: {})",
             ROLES.join(", ")
-        ));
+        ))
+        .into());
     }
     let role = Some(raw.to_string());
     Ok(COMMAND_ROLE.get_or_init(|| role.clone()).clone())
@@ -73,7 +76,7 @@ pub(crate) fn stamped_event_json(event: &crate::event::Event) -> String {
 /// STAGE A: a config-open parse failure propagates as Err — no silent
 /// fallback, no empty actor. A malformed .git/config surfaces here as a clean
 /// CLI error (git config --get exits 128).
-pub(crate) fn resolve_identity() -> Result<(git2::Signature<'static>, String), String> {
+pub(crate) fn resolve_identity() -> Result<(git2::Signature<'static>, String), CliError> {
     let (name, email) = crate::git::config_get_identity(std::path::Path::new("."))?;
     // Commit signature: configured name+email ONLY when both are usable AND
     // form a valid sig; any failure falls back to the default committer —
@@ -86,11 +89,11 @@ pub(crate) fn resolve_identity() -> Result<(git2::Signature<'static>, String), S
     let signature = match (&name, &email) {
         (Some(n), Some(e)) => match git2::Signature::now(n, e) {
             Ok(s) => s,
-            Err(_) => {
-                git2::Signature::now("git-forge", "forge@localhost").map_err(|e| e.to_string())?
-            }
+            Err(_) => git2::Signature::now("git-forge", "forge@localhost")
+                .map_err(|e| CliError::from(e.to_string()))?,
         },
-        _ => git2::Signature::now("git-forge", "forge@localhost").map_err(|e| e.to_string())?,
+        _ => git2::Signature::now("git-forge", "forge@localhost")
+            .map_err(|e| CliError::from(e.to_string()))?,
     };
     let actor = email.unwrap_or_else(|| "forge@localhost".to_string());
     Ok((signature, actor))
@@ -111,8 +114,8 @@ pub(crate) fn bind_identity(
 /// Open + bind for a MUTATION command. Identity is resolved BEFORE the
 /// libgit2 store is opened, so a malformed .git/config fails here as a clean
 /// CLI error, never as an libgit2 open failure or post-open SIGSEGV.
-pub(crate) fn open_mutation_store() -> Result<(BoundEventStore, String), String> {
+pub(crate) fn open_mutation_store() -> Result<(BoundEventStore, String), CliError> {
     let (signature, actor) = resolve_identity()?;
-    let store = EventStore::open(".").map_err(|e| format!("{e}"))?;
+    let store = EventStore::open(".").map_err(CliError::from)?;
     Ok(bind_identity(store, signature, actor))
 }

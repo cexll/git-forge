@@ -28,13 +28,16 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(err) => {
+            if argv.iter().any(|arg| arg == "--json") {
+                println!("{}", err.to_json());
+            }
             eprintln!("git-forge: {err}");
             ExitCode::FAILURE
         }
     }
 }
 
-fn run_forge(argv: &[String]) -> Result<String, String> {
+fn run_forge(argv: &[String]) -> Result<String, git_forge::cli_error::CliError> {
     match argv.first().map(|s| s.as_str()) {
         // `git forge issue ...` → git runs `git-forge` with argv = ["issue", ...]
         Some("issue") => git_forge::issue::run_issue(&argv[1..]),
@@ -52,12 +55,24 @@ fn run_forge(argv: &[String]) -> Result<String, String> {
             Some("ci") => git_forge::cli::run_ci(&argv[2..]),
             Some("version") => git_forge::machine::cmd_version(&argv[2..]),
             Some("help") | Some("-h") | Some("--help") => Ok(top_help()),
-            Some(other) => Err(format!("unknown forge subcommand '{other}'")),
+            Some(other) => Err(git_forge::cli_error::CliError::new(
+                "E_USAGE",
+                format!("unknown forge subcommand '{other}'"),
+                other,
+                "Run git forge help.",
+                false,
+            )),
             None => Ok(top_help()),
         },
         // `git-forge --help` (verify-cli contract): exit 0 with usage.
         Some("help") | Some("-h") | Some("--help") => Ok(top_help()),
-        Some(other) => Err(format!("unknown command '{other}'")),
+        Some(other) => Err(git_forge::cli_error::CliError::new(
+            "E_USAGE",
+            format!("unknown command '{other}'"),
+            other,
+            "Run git forge help.",
+            false,
+        )),
         None => Ok(top_help()),
     }
 }
@@ -76,7 +91,7 @@ fn top_help() -> String {
         .to_string()
 }
 
-fn run_wrapper(argv: &[String]) -> Result<String, String> {
+fn run_wrapper(argv: &[String]) -> Result<String, git_forge::cli_error::CliError> {
     let invoked_as_pr = std::env::args()
         .next()
         .map(|a| a.rsplit('/').next().unwrap_or(a.as_str()) == "git-pr")

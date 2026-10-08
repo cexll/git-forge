@@ -711,7 +711,7 @@ fn json_object(map: &HashMap<String, JsonValue>) -> String {
     out
 }
 
-fn json_value(value: &JsonValue) -> String {
+pub(crate) fn json_value(value: &JsonValue) -> String {
     match value {
         JsonValue::Null => "null".to_string(),
         JsonValue::Bool(b) => b.to_string(),

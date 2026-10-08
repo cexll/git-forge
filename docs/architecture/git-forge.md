@@ -32,6 +32,8 @@ Must-not-haves (L1): web UI, single-file export, GitHub bridge, accounts/permiss
 | `issue` (commands) | `run_issue` dispatch; issue `cmd_*` handlers | Issue command parsing + human-readable output; apply and new graph publication delegated to `issue_apply`; graph JSON derived from folded states | Shallow: command surface only |
 | `issue_plan` (plans) | strict plan parsing, whole-graph validation, desired-state diff | Minimal frontmatter grammar; repository-wide key mapping and reference resolution; parent/blocking cycle checks | No YAML dependency; shared graph rules for apply and new |
 | `issue_apply` (publication) | `cmd_apply`, `new_issue` | Complete Issue graph snapshot, allocation, event construction and one atomic snapshot/CAS publication via store | Owns orchestration, not a second storage implementation |
+| `cli_error` (failures) | `CliError` | Stable codes, preserved human messages, optional structured data and JSON error rendering; typed storage conversion | CLI-layer boundary; core and store do not import it |
+| `pr_review` (review command) | `cmd_pr_review` | Review argument handling and generation/candidate-bound event publication | CLI-layer owner, extracted to retain the file-size gate |
 | `cli` (entry) | `run_pr`, `run_ci` dispatch; `cmd_pr_diff` (arguments + result handling) | Command parsing; the merge-gate predicate + finalize live in `merge_state`, orchestration in `pr_merge`; `cmd_pr_diff` delegates the subprocess to `git::git_in_ci` | Shallow by design: dispatch only, no direct subprocess spawning (diff goes through the sanitized git adapter) |
 | `sync` (L2) | — | Explicit forge refspec push, additive fetch refspec, per-entity DAG merge convergence | Not built in L1; no `src/sync.rs` yet |
 | `hooks` (L2) | — | Pre-receive/post-receive hooks, refspec validation | Not built in L1; no `src/hooks.rs` yet |
@@ -119,6 +121,44 @@ flowchart LR
 ## Wire Contract
 
 This contract is normative for tickets and tests. Versions: schema version field is `v: 1` in every event; do not parse unversioned events.
+
+### CLI Failure Contract (schema 1)
+
+Every command failure exits 1. Without `--json`, stdout is empty and stderr
+prints `git-forge: <message>`. With a bare `--json` token, stdout contains one
+JSON error object and stderr keeps the same line. This also applies when a
+command rejects `--json` because it has no machine success result.
+
+```json
+{"error":{"code":"E_USAGE","message":"usage: git forge pr show <n> [--json]","input":"","hint":"Run the command with --help and correct its arguments.","retryable":false}}
+```
+
+`code`, `message`, `input`, and `hint` are strings. `retryable` is a boolean.
+`input` identifies the offending argument when known; it is empty for a
+missing argument or a failure without one offending value. `hint` names the
+next action. Consumers must use `code`, not parse the message. Command-specific
+errors may add `data` without changing these fields. Existing success JSON
+keeps its current schema-1 shapes; it has no common envelope.
+
+| Code | Meaning |
+|---|---|
+| `E_USAGE` | Missing or malformed command arguments, or unknown options |
+| `E_NOT_FOUND` | Referenced Issue, PR, or branch does not exist |
+| `E_CONFLICT` | Compare-and-swap conflict, exhausted CAS retries, or stale snapshot; read current state before retrying |
+| `E_BASE_MOVED` | Base movement prevents the requested operation |
+| `E_PREPARE_CONFLICT` | Candidate preparation encounters a merge conflict |
+| `E_GATE` | Merge gate refuses the operation |
+| `E_CI_FAILED` | CI execution or cleanup fails |
+| `E_INVALID` | Domain validation rejects input or repository state |
+| `E_INTERNAL` | Unclassified storage, process, or internal failure |
+
+The CLI preserves typed CAS failures as `E_CONFLICT` with `retryable: true`.
+Other failures are not automatically retryable. Detailed base-movement,
+prepare-conflict, and CI-diagnostic payloads are separate command contracts.
+
+Missing required positionals return usage errors, never panics. In particular,
+`pr show` and `pr diff` use `usage: git forge pr <verb> <n> [--json]`.
+
 
 ### Ref Layout
 

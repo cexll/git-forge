@@ -6,19 +6,27 @@
 //! resolved and bound here via [`crate::identity`] before any forge write
 //! (VAL-115: never read libgit2 config after `Repository::open`).
 
+use crate::cli_error::CliError;
+
 use crate::identity::{bind_identity, resolve_identity};
 use crate::store::EventStore;
 
 /// `git forge pr diff <n>` — three-dot diff from the immutable snapshot refs.
-pub(crate) fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String, String> {
+pub(crate) fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String, CliError> {
     // Same strict guard as `pr show`: one positional, no options — any
     // dash-leading leftover is a usage error naming the flag (VAL-202).
     let (_, args) = crate::machine::json_requested(args);
-    crate::machine::reject_leftover_flags(&args[1..], "usage: git forge pr diff <n>")?;
-    let id = crate::cli::parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
+    let (id_arg, rest) = args
+        .split_first()
+        .ok_or_else(|| CliError::usage("usage: git forge pr diff <n> [--json]", ""))?;
+    crate::machine::reject_leftover_flags(rest, "usage: git forge pr diff <n>")?;
+    let id = crate::cli::parse_entity_id(id_arg)?;
     let head = crate::store::pr_head_ref(id);
     if !crate::cli::store_has_ref(store, &head) {
-        return Err(format!("PR #{id} does not exist"));
+        return Err(CliError::not_found(
+            format!("PR #{id} does not exist"),
+            id.to_string(),
+        ));
     }
     // Resolve from the CURRENT generation's immutable snapshot refs (survive
     // branch deletion + gc): generation 0 uses the L1 `/source`//`/base`
@@ -28,12 +36,12 @@ pub(crate) fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String,
         .repo()
         .find_reference(&head)
         .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
-        .map_err(|_| format!("PR #{id} does not exist"))?;
+        .map_err(|_| CliError::not_found(format!("PR #{id} does not exist"), id.to_string()))?;
     let (anchored, chain) = store
         .read_pr_chain_anchored(id, head_tip)
-        .map_err(|e| e.to_string())?;
+        .map_err(CliError::from)?;
     if !anchored {
-        return Err(format!("PR #{id} head chain is not anchored to PR #{id}"));
+        return Err((format!("PR #{id} head chain is not anchored to PR #{id}")).into());
     }
     let state = crate::event::fold(&chain).pr;
     let source = crate::store::pr_source_ref_for(id, state.generation);
@@ -78,11 +86,12 @@ pub(crate) fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String,
         ],
     );
     if !ok {
-        return Err(if err.is_empty() {
+        return Err((if err.is_empty() {
             "git diff failed".to_string()
         } else {
             err
-        });
+        })
+        .into());
     }
     Ok(out)
 }
@@ -98,7 +107,7 @@ pub(crate) fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String,
 // Baseline exemption (removal trigger in constraints.yaml baseline.lint_allow):
 // the sole lib/src function over the 150-line clippy::too_many_lines threshold.
 #[allow(clippy::too_many_lines)]
-pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String, String> {
+pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String, CliError> {
     let mut id_arg = None;
     let mut strategy: Option<&str> = None; // merge | squash | rebase
     let mut recycle: Option<String> = None;
@@ -110,34 +119,52 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
                 // #4: the next token is the source-worktree path to recycle.
                 i += 1;
                 if i >= args.len() {
-                    return Err("--recycle-worktree requires a worktree path".into());
+                    return Err(CliError::usage(
+                        "--recycle-worktree requires a worktree path",
+                        "",
+                    ));
                 }
                 if recycle.is_some() {
-                    return Err("--recycle-worktree specified more than once".into());
+                    return Err(CliError::usage(
+                        "--recycle-worktree specified more than once",
+                        "",
+                    ));
                 }
                 recycle = Some(args[i].clone());
             }
             "--merge" => {
                 if strategy.is_some() {
-                    return Err("merge strategy flag specified more than once".into());
+                    return Err(CliError::usage(
+                        "merge strategy flag specified more than once",
+                        "",
+                    ));
                 }
                 strategy = Some("merge");
             }
             "--squash" => {
                 if strategy.is_some() {
-                    return Err("merge strategy flag specified more than once".into());
+                    return Err(CliError::usage(
+                        "merge strategy flag specified more than once",
+                        "",
+                    ));
                 }
                 strategy = Some("squash");
             }
             "--rebase" => {
                 if strategy.is_some() {
-                    return Err("merge strategy flag specified more than once".into());
+                    return Err(CliError::usage(
+                        "merge strategy flag specified more than once",
+                        "",
+                    ));
                 }
                 strategy = Some("rebase");
             }
             "--ff" => {
                 if strategy.is_some() {
-                    return Err("merge strategy flag specified more than once".into());
+                    return Err(CliError::usage(
+                        "merge strategy flag specified more than once",
+                        "",
+                    ));
                 }
                 strategy = Some("ff");
             }
@@ -146,14 +173,12 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
                 force = true;
             }
             "-h" | "--help" => return Ok(pr_merge_help()),
-            s if s.starts_with('-') => return Err(format!("unknown option '{s}'")),
+            s if s.starts_with('-') => {
+                return Err(CliError::usage(format!("unknown option '{s}'"), s))
+            }
             s => {
                 if id_arg.is_some() {
-                    return Err(
-                        "usage: git forge pr merge [<n>] [--merge|--squash|--rebase] \
-                                (only one PR id allowed)"
-                            .into(),
-                    );
+                    return Err(CliError::usage("usage: git forge pr merge [<n>] [--merge|--squash|--rebase] (only one PR id allowed)", s));
                 }
                 id_arg = Some(s.to_string());
             }
@@ -161,13 +186,28 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
         i += 1;
     }
     let strategy = strategy.unwrap_or("merge");
-    let id = crate::cli::parse_entity_id(id_arg.as_deref().unwrap_or(""))?;
+    let id = crate::cli::parse_entity_id(id_arg.as_deref().ok_or_else(|| {
+        CliError::usage(
+            if args.is_empty() {
+                "usage: git forge pr merge <n> [--merge|--squash|--rebase|--ff]"
+            } else {
+                "empty entity id"
+            },
+            "",
+        )
+    })?)?;
     let head = crate::store::pr_head_ref(id);
     // Bind the gate decision to the EXACT PR-head OID it validated (F-007):
     // the completion transaction CASes the head chain from OID `gate_head`,
     // never from a freshly reread tip, so a concurrent `ci run` that appends a
     // failed Check during merge execution can neither slip past the gate nor
     // be silently accepted at finalize.
+    if !crate::cli::store_has_ref(&store, &head) {
+        return Err(CliError::not_found(
+            format!("PR #{id} does not exist"),
+            id.to_string(),
+        ));
+    }
     let (state, gate_head) = crate::merge_state::read_merge_gate(&store, id, &head)?;
     let base_ref = state
         .base_ref
@@ -215,12 +255,13 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
     // not the base has moved since the snapshot. A moved base is revalidated,
     // never blanket-refused (supersedes the pre-#2 VAL-103 refusal).
     if strategy == "ff" && exec_merge_base != current_base {
-        return Err(format!(
+        return Err((format!(
             "PR #{id} cannot fast-forward: the source does not sit directly on \
              top of the current base tip of '{base_ref}' (merge_base \
              {exec_merge_base} != base tip {current_base}); use \
              `pr merge --rebase` to replay the source or recreate the PR"
-        ));
+        ))
+        .into());
     }
     // F-002 prepared-candidate routing: the merge of a moved base (or any
     // candidate-pinned PR) binds the PREPARED candidate — result committed
@@ -247,13 +288,14 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
             strategy,
         )?;
     } else if moved {
-        return Err(format!(
+        return Err((format!(
             "PR #{id} base branch '{base_ref}' has moved since the PR snapshot \
              ({current_base} != snapshot {base_oid}); prepare the merge result \
              first: run `git forge pr prepare {id} --strategy {strategy}`, then \
              `git forge ci run {id}` and `git forge pr review {id} --approve`, \
              then merge"
-        ));
+        ))
+        .into());
     } else if state.prepared.is_some() {
         // A STALE prepared candidate (e.g. superseded by `pr update`) still
         // pins `refs/forge/prs/<n>/result`; the legacy path's
@@ -261,14 +303,15 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
         // the re-prepare remedy instead of a confusing mid-merge failure.
         // (A manually-created ref with no prepared event keeps the legacy
         // create-time refusal — that path is unchanged.)
-        return Err(format!(
+        return Err((format!(
             "PR #{id} has a stale prepared candidate (prepared on generation {}, \
              current snapshot generation {}); re-run `git forge pr prepare {id} \
              --strategy {strategy}`, then `git forge ci run {id}` and `git forge pr \
              review {id} --approve`, then merge",
             state.prepared.as_ref().map(|c| c.generation).unwrap_or(0),
             state.generation
-        ));
+        ))
+        .into());
     }
 
     // Temporary worktree, detached at the immutable base OID. worktree
@@ -289,11 +332,12 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
     let base_worktrees = crate::git::base_checked_out_worktrees(&repo_dir, &base_ref)?;
     for wt in &base_worktrees {
         if crate::git::worktree_dirty(wt)? {
-            return Err(format!(
+            return Err((format!(
                 "base branch '{base_ref}' is checked out in a dirty worktree ({}); \
                  commit, stash or clean it (including untracked files) before merging",
                 wt.display()
-            ));
+            ))
+            .into());
         }
     }
     // Recycle pre-validation (#4, phase 1): a refused recycle must leave the
@@ -309,7 +353,7 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
             .ok_or("--recycle-worktree requires a PR with a source branch")?;
         crate::merge_state::validate_recycle_target(&repo_dir, source_ref, target, force)?;
     } else if force {
-        return Err("--force requires --recycle-worktree".into());
+        return Err(CliError::usage("--force requires --recycle-worktree", ""));
     }
     // Resolve the event actor NOW, before any merge side effects (worktree
     // reservation, pending-result ref, execution). Identity resolution is
@@ -339,12 +383,13 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
                 format!("PR #{id} prepared candidate ref missing (refs/forge/prs/{id}/result)")
             })?;
         if pin.to_string() != c.result_commit {
-            return Err(format!(
+            return Err((format!(
                 "PR #{id} prepared candidate ref refs/forge/prs/{id}/result does not \
                  point at the folded candidate ({pin} != {}); re-run \
                  `git forge pr prepare {id} --strategy {strategy}`",
                 c.result_commit
-            ));
+            ))
+            .into());
         }
         let result_commit = c
             .result_commit
@@ -363,11 +408,12 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
             .parse::<git2::Oid>()
             .map_err(|_| "PR prepared candidate base_head invalid".to_string())?;
         if gate_base_oid != current_base {
-            return Err(format!(
+            return Err((format!(
                 "PR #{id} prepared candidate base change during merge ({gate_base_oid} != \
                  current {current_base}); re-run `git forge pr prepare {id} --strategy \
                  {strategy}`"
-            ));
+            ))
+            .into());
         }
         // No temp worktree on the candidate path; pass a unique temp path so
         // the failure-path cleanup's lock-file removal is a no-op on a path
@@ -379,11 +425,12 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
         let mut no_lock: Option<std::fs::File> = None;
         #[cfg(debug_assertions)]
         if let Err(b) = crate::merge_state::maybe_run_test_barrier() {
-            return Err(format!(
+            return Err((format!(
                 "{b} (pending result ref refs/forge/prs/{id}/result left in place)"
-            ));
+            ))
+            .into());
         }
-        return crate::merge_state::run_finalize(
+        return Ok(crate::merge_state::run_finalize(
             &store,
             crate::merge_state::MergeFinalizeSpec {
                 id,
@@ -403,7 +450,7 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
             },
             &mut no_lock,
             &prepared_tmp,
-        );
+        )?);
     }
 
     // Repo-specific temp worktree path: hash the canonical workdir so parallel
@@ -470,7 +517,7 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
         // Release our own lock; the path was never registered to us.
         drop(lock_handle.take());
         let _ = std::fs::remove_file(tmp.with_extension("lock"));
-        return Err(format!("failed to create temporary worktree: {err_wt}"));
+        return Err((format!("failed to create temporary worktree: {err_wt}")).into());
     }
 
     // Release the path lock (drop handle + remove file) so a concurrent
@@ -511,9 +558,9 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
     if let Err(ci_err) =
         crate::merge_state::verify_result_ci(store.repo(), &tmp, source_oid, result_commit)
     {
-        return Err(crate::git::cleanup_failed_worktree(
-            &repo_dir, &tmp, strategy, ci_err,
-        ));
+        return Err(
+            (crate::git::cleanup_failed_worktree(&repo_dir, &tmp, strategy, ci_err)).into(),
+        );
     }
 
     // Keep result_commit reachable across worktree removal (GC could prune the
@@ -544,11 +591,12 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
                 &mut lock_handle,
                 &tmp,
             );
-            return Err(format!(
+            return Err((format!(
                 "test seam: failed to lock temp worktree for removal-failure injection: \
                  {lock_err} (worktree left at {}{pending})",
                 tmp.display()
-            ));
+            ))
+            .into());
         }
     }
     if let Err(err_rm) = crate::git::worktree_remove(&repo_dir, &tmp) {
@@ -562,11 +610,12 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
             &mut lock_handle,
             &tmp,
         );
-        return Err(format!(
+        return Err((format!(
             "merge succeeded but temp worktree removal failed: {err_rm} \
              (worktree left at {}{pending})",
             tmp.display()
-        ));
+        ))
+        .into());
     }
     // `git worktree remove` already removed the directory; do NOT run a
     // recursive delete here (each path is owned by whichever merge holds its
@@ -580,10 +629,11 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
             &mut lock_handle,
             &tmp,
         );
-        return Err(format!(
+        return Err((format!(
             "merge succeeded but temp worktree directory still exists at {}{pending}",
             tmp.display()
-        ));
+        ))
+        .into());
     }
     match crate::git::worktree_list_raw(&repo_dir) {
         (false, _, err_l) => {
@@ -596,9 +646,9 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
                 &mut lock_handle,
                 &tmp,
             );
-            return Err(format!(
+            return Err((format!(
                 "merge succeeded but worktree verification failed (git worktree list: {err_l}){pending}"
-            ));
+            )).into());
         }
         (true, list_l, _) if crate::git::worktree_registered_path(&list_l, &tmp) => {
             // Best-effort: remove the pending result ref; the stale registration
@@ -610,10 +660,11 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
                 &mut lock_handle,
                 &tmp,
             );
-            return Err(format!(
+            return Err((format!(
                 "merge succeeded but temp worktree still registered at {}{pending}",
                 tmp.display()
-            ));
+            ))
+            .into());
         }
         (true, _, _) => {}
     }
@@ -634,13 +685,14 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
             &tmp,
         );
         if !pending.is_empty() {
-            return Err(format!(
+            return Err((format!(
                 "{b} (pending result ref refs/forge/prs/{id}/result left in place)"
-            ));
+            ))
+            .into());
         }
-        return Err(b);
+        return Err((b).into());
     }
-    crate::merge_state::run_finalize(
+    Ok(crate::merge_state::run_finalize(
         &store,
         crate::merge_state::MergeFinalizeSpec {
             id,
@@ -664,7 +716,7 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
         },
         &mut lock_handle,
         &tmp,
-    )
+    )?)
 }
 
 /// `git forge pr update <n>` — re-pin the PR to the source branch tip as a
@@ -675,15 +727,18 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
 /// unknown PR, abandoned (terminal), already merged, base branch moved (the
 /// recreate-or-revalidate remedy stays with #2 live-base), and a branch tip
 /// that already IS the snapshot source_head (nothing to update).
-pub(crate) fn cmd_pr_update(args: &[String]) -> Result<String, String> {
+pub(crate) fn cmd_pr_update(args: &[String]) -> Result<String, CliError> {
     const USAGE: &str = "usage: git forge pr update <n>";
     if args.len() != 1 {
         // Name the offending token so a rejected flag is diagnosable
         // (unknown flag keeps exit-1, VAL-202).
-        return Err(match args.first() {
-            Some(a) if a.starts_with('-') => format!("unknown option '{a}'; {USAGE}"),
-            _ => USAGE.into(),
-        });
+        return Err(CliError::usage(
+            match args.first() {
+                Some(a) if a.starts_with('-') => format!("unknown option '{a}'; {USAGE}"),
+                _ => USAGE.into(),
+            },
+            args.first().map(String::as_str).unwrap_or(""),
+        ));
     }
     let id = crate::cli::parse_entity_id(args.first().map(|s| s.as_str()).unwrap_or(""))?;
     // Read-only refusals first: every terminal/consistency check resolves
@@ -692,15 +747,20 @@ pub(crate) fn cmd_pr_update(args: &[String]) -> Result<String, String> {
     let store = crate::cli::open_store()?;
     let head = crate::store::pr_head_ref(id);
     if !crate::cli::store_has_ref(&store, &head) {
-        return Err(format!("PR #{id} does not exist"));
+        return Err(CliError::not_found(
+            format!("PR #{id} does not exist"),
+            id.to_string(),
+        ));
     }
-    let chain = store.read_chain(&head).map_err(|e| e.to_string())?;
+    let chain = store.read_chain(&head).map_err(CliError::from)?;
     let state = crate::event::fold(&chain).pr;
     if let Some(reason) = &state.abandoned {
-        return Err(format!("PR #{id} is abandoned: {reason}"));
+        return Err(CliError::invalid(format!(
+            "PR #{id} is abandoned: {reason}"
+        )));
     }
     if state.merge_result.is_some() {
-        return Err(format!("PR #{id} is already merged"));
+        return Err(CliError::invalid(format!("PR #{id} is already merged")));
     }
     let source_ref = state
         .source_ref
@@ -735,26 +795,20 @@ pub(crate) fn cmd_pr_update(args: &[String]) -> Result<String, String> {
     // whole point of update); the base branch may NOT — a moved base keeps
     // its recreate remedy (#2 live-base re-validation), so update refuses
     // rather than silently adopting a base the PR was never reviewed against.
-    let resolve_tip = |branch: &str| -> Result<git2::Oid, String> {
+    let resolve_tip = |branch: &str| -> Result<git2::Oid, CliError> {
         store
             .repo()
             .find_reference(&format!("refs/heads/{branch}"))
             .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
-            .map_err(|_| format!("branch '{branch}' does not exist"))
+            .map_err(|_| CliError::not_found(format!("branch '{branch}' does not exist"), branch))
     };
     let new_source = resolve_tip(&source_ref)?;
     let new_base = resolve_tip(&base_ref)?;
     if new_base != old_base {
-        return Err(format!(
-            "base branch '{base_ref}' has moved since PR #{id} was created \
-             ({new_base} != snapshot {old_base}); recreate the PR or merge manually"
-        ));
+        return Err(CliError::new("E_BASE_MOVED", format!("base branch '{base_ref}' has moved since PR #{id} was created ({new_base} != snapshot {old_base}); recreate the PR or merge manually"), &base_ref, "Inspect the current base and PR snapshot before proceeding.", false));
     }
     if new_source == old_source {
-        return Err(format!(
-            "PR #{id} source branch tip is already the snapshot source_head \
-             ({old_source}); nothing to update"
-        ));
+        return Err(CliError::invalid(format!("PR #{id} source branch tip is already the snapshot source_head ({old_source}); nothing to update")));
     }
     let new_merge_base = crate::git::require_single_merge_base(store.repo(), new_base, new_source)?;
     let (store, actor) = crate::identity::open_mutation_store()?;
@@ -771,7 +825,7 @@ pub(crate) fn cmd_pr_update(args: &[String]) -> Result<String, String> {
             generation,
             &actor,
         )
-        .map_err(|e| e.to_string())?;
+        .map_err(CliError::from)?;
     Ok(format!(
         "PR #{id} updated to snapshot generation {generation} \
          (source {source_ref} -> {new_source})"

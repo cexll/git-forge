@@ -7,6 +7,7 @@
 //! The merge gate binds its decision to the EXACT PR-head OID it validated
 //! (F-007); the completion transaction CASes the head chain from that OID.
 
+use crate::cli_error::CliError;
 use git2::Oid;
 use std::collections::HashMap;
 
@@ -24,12 +25,12 @@ pub(crate) fn read_merge_gate(
     store: &EventStore,
     id: u64,
     head_ref: &str,
-) -> Result<(crate::event::PrState, Oid), String> {
+) -> Result<(crate::event::PrState, Oid), CliError> {
     let tip = store
         .repo()
         .find_reference(head_ref)
         .and_then(|r| r.target().ok_or(git2::Error::from_str("no target")))
-        .map_err(|_| format!("PR #{id} does not exist"))?;
+        .map_err(|_| CliError::not_found(format!("PR #{id} does not exist"), id.to_string()))?;
     let state = validate_merge_gate_at(store, id, tip)?;
     Ok((state, tip))
 }
@@ -43,7 +44,7 @@ pub(crate) fn validate_merge_gate_at(
     store: &EventStore,
     id: u64,
     tip: Oid,
-) -> Result<crate::event::PrState, String> {
+) -> Result<crate::event::PrState, CliError> {
     // Chain-anchor / identity validation (F-008): the WHOLE chain folded at
     // `tip` must be anchored by PR #id's authoritative `pr.created` event and
     // every event-bearing commit must belong to entity `pr` / `entity_id` id.
@@ -56,22 +57,22 @@ pub(crate) fn validate_merge_gate_at(
     // events instead of re-walking the whole chain a second time.
     let (anchored, chain) = store
         .read_pr_chain_anchored(id, tip)
-        .map_err(|e| e.to_string())?;
+        .map_err(CliError::from)?;
     if !anchored {
-        return Err(format!(
+        return Err(CliError::invalid(format!(
             "refs/forge/prs/{id}/head points at a tip whose chain is not anchored \
              to PR #{id}"
-        ));
+        )));
     }
     let state = crate::event::fold(&chain).pr;
     // Belt-and-suspenders: now that `pr_chain_anchored_to` guarantees identity,
     // this is only a cross-check against a malformed fold.
     if state.id != id {
-        return Err(format!(
+        return Err(CliError::invalid(format!(
             "refs/forge/prs/{id}/head points at a tip whose chain is anchored to \
              PR #{}, not PR #{id}",
             state.id
-        ));
+        )));
     }
 
     // Abandoned PRs are terminal (pr.abandoned): refuse BEFORE the approve/CI
@@ -80,23 +81,37 @@ pub(crate) fn validate_merge_gate_at(
     // completion transaction CASes from (F-007), so an abandon appended after
     // this gate refuses the finalize via the CAS retry re-validation.
     if let Some(reason) = &state.abandoned {
-        return Err(format!("PR #{id} is abandoned: {reason}"));
+        return Err(CliError::invalid(format!(
+            "PR #{id} is abandoned: {reason}"
+        )));
     }
     // Gate: effective approve required (last reachable pr.review).
     if state.effective_decision.as_deref() != Some("approve") {
-        return Err(format!(
-            "PR #{id} is not approved (effective decision: {})",
-            state.effective_decision.as_deref().unwrap_or("none")
+        return Err(CliError::new(
+            "E_GATE",
+            format!(
+                "PR #{id} is not approved (effective decision: {})",
+                state.effective_decision.as_deref().unwrap_or("none")
+            ),
+            id.to_string(),
+            "Inspect PR review and CI state and satisfy the reported merge gate.",
+            false,
         ));
     }
     // Gate (t1 generation binding): a decision from an OLDER snapshot
     // generation is stale — it authorized content the PR no longer holds.
     // Only a latest-generation approve satisfies the gate.
     if state.decision_generation != state.generation {
-        return Err(format!(
-            "PR #{id} approve is stale (decision on generation {}, current \
+        return Err(CliError::new(
+            "E_GATE",
+            format!(
+                "PR #{id} approve is stale (decision on generation {}, current \
              snapshot generation {}); re-review after `pr update`",
-            state.decision_generation, state.generation
+                state.decision_generation, state.generation
+            ),
+            id.to_string(),
+            "Inspect PR review and CI state and satisfy the reported merge gate.",
+            false,
         ));
     }
     // Gate (t8 #8): an approve from the SAME role that created the PR does
@@ -109,16 +124,22 @@ pub(crate) fn validate_merge_gate_at(
     // different role (or an orchestrator-driven approve) is the remedy.
     if let (Some(created_role), Some(decision_role)) = (&state.creator_role, &state.decision_role) {
         if created_role == decision_role && state.effective_decision.as_deref() == Some("approve") {
-            return Err(format!(
-                "PR #{id} is self-approved: the effective approve was recorded by the \
+            return Err(CliError::new(
+                "E_GATE",
+                format!(
+                    "PR #{id} is self-approved: the effective approve was recorded by the \
                  same role ('{decision_role}') that created the PR; the merge gate requires \
                  an approval from a different role when roles are configured"
+                ),
+                id.to_string(),
+                "Inspect PR review and CI state and satisfy the reported merge gate.",
+                false,
             ));
         }
     }
     // Already merged: a pr.merge event exists → no double merge.
     if state.merge_result.is_some() {
-        return Err(format!("PR #{id} is already merged"));
+        return Err(CliError::invalid(format!("PR #{id} is already merged")));
     }
     // Gate (L2): the latest CI Check must be success (the fold keeps the most
     // recently appended ci.check). A pending/absent/failed Check refuses the
@@ -130,22 +151,40 @@ pub(crate) fn validate_merge_gate_at(
         // longer holds: stale, never satisfies the gate (t1 generation
         // binding).
         Some("success") => {
-            return Err(format!(
-                "PR #{id} is not mergeable: latest CI Check is stale (run on \
+            return Err(CliError::new(
+                "E_GATE",
+                format!(
+                    "PR #{id} is not mergeable: latest CI Check is stale (run on \
                  generation {}, current snapshot generation {}); \
                  run `git forge ci run {id}`",
-                state.ci_generation, state.generation
+                    state.ci_generation, state.generation
+                ),
+                id.to_string(),
+                "Inspect PR review and CI state and satisfy the reported merge gate.",
+                false,
             ));
         }
         Some(status) => {
-            return Err(format!(
-                "PR #{id} is not mergeable: latest CI Check is `{status}` \
+            return Err(CliError::new(
+                "E_GATE",
+                format!(
+                    "PR #{id} is not mergeable: latest CI Check is `{status}` \
                  (expected `success`); run `git forge ci run {id}`"
+                ),
+                id.to_string(),
+                "Inspect PR review and CI state and satisfy the reported merge gate.",
+                false,
             ));
         }
         None => {
-            return Err(format!(
-                "PR #{id} is not mergeable: no CI Check recorded; run `git forge ci run {id}`"
+            return Err(CliError::new(
+                "E_GATE",
+                format!(
+                    "PR #{id} is not mergeable: no CI Check recorded; run `git forge ci run {id}`"
+                ),
+                id.to_string(),
+                "Inspect PR review and CI state and satisfy the reported merge gate.",
+                false,
             ));
         }
     }

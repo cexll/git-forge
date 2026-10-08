@@ -5958,33 +5958,3 @@ fn t7_unknown_flag_still_exits_nonzero() {
     assert_ne!(c, 0, "--json=x is an unknown option, not --json");
     assert!(e.contains("--json=x"), "error must name it: {e}");
 }
-
-/// `ci run --json` is a success-path result surface: a RED run still exits 1
-/// with prose on stderr and prints NO JSON (errors stay prose on stderr for
-/// every command; the adapter classifies red via stderr, as today).
-#[test]
-fn t7_ci_run_json_failure_keeps_prose_error() {
-    let dir = tmpdir("t7cired");
-    init_repo(&dir);
-    let (c, _, e) = gitp(&dir, &["checkout", "-q", "-b", "feature"]);
-    assert_eq!(c, 0, "checkout: {e}");
-    std::fs::create_dir_all(dir.join(".forge")).unwrap();
-    std::fs::write(dir.join(".forge").join("ci.sh"), "#!/bin/bash\nexit 1\n").unwrap();
-    let (c, _, e) = gitp(&dir, &["add", ".forge/ci.sh"]);
-    assert_eq!(c, 0, "add: {e}");
-    let (c, _, e) = gitp(&dir, &["commit", "-q", "-m", "ci plan"]);
-    assert_eq!(c, 0, "commit: {e}");
-    let (c, _, e) = gitp(&dir, &["checkout", "-q", "main"]);
-    assert_eq!(c, 0, "checkout: {e}");
-    let (c, o, _) = forge(
-        &dir,
-        &[
-            "forge", "pr", "create", "--source", "feature", "--base", "main", "P",
-        ],
-    );
-    assert_eq!(c, 0, "{o}");
-    let (c, o, e) = forge_raw(&dir, &["forge", "ci", "run", "1", "--json"]);
-    assert_ne!(c, 0, "red ci run must exit nonzero");
-    assert_eq!(o, "", "no JSON on a red run: {o:?}");
-    assert!(e.contains("failed"), "stderr names the failure: {e}");
-}
