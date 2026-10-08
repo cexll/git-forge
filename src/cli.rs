@@ -242,7 +242,7 @@ fn cmd_pr_comment(args: &[String]) -> Result<String, CliError> {
     // Same strict flag/token split as its issue sibling: an unknown option
     // is a clean usage error naming the flag (VAL-202), never a
     // silently-ignored prefix of the comment body.
-    let (json, args) = machine::json_requested(args);
+    let (json, args) = machine::json_requested_with(args, crate::issue::COMMENT_VALUES);
     let (key, args) = crate::idempotency::take_key(&args)?;
     machine::reject_flags(&args, USAGE)?;
     if args.len() < 2 {
@@ -288,6 +288,9 @@ fn cmd_pr_comment(args: &[String]) -> Result<String, CliError> {
     Ok(format!("comment added to PR #{id}"))
 }
 
+/// Value-taking options of `pr abandon`.
+const ABANDON_VALUES: &[&str] = &["--reason"];
+
 /// `git forge pr abandon <n> --reason <text>` — abandon is terminal: appends a
 /// single `pr.abandoned` event (body `{"reason": <text>}`) to the PR `/head`
 /// chain. Refuses an already-merged PR, a second abandon, and an unknown PR;
@@ -296,7 +299,7 @@ fn cmd_pr_comment(args: &[String]) -> Result<String, CliError> {
 /// reopened PR is a new entity.
 fn cmd_pr_abandon(args: &[String]) -> Result<String, CliError> {
     const USAGE: &str = "usage: git forge pr abandon <n> --reason <text>";
-    let (json, args) = machine::json_requested(args);
+    let (json, args) = machine::json_requested_with(args, ABANDON_VALUES);
     let id = parse_entity_id(args.first().ok_or_else(|| CliError::usage(USAGE, ""))?)?;
     let mut reason: Option<String> = None;
     let mut i = 1;
@@ -376,7 +379,16 @@ fn cmd_pr_abandon(args: &[String]) -> Result<String, CliError> {
 /// Dispatch a `git forge pr` subcommand. `argv` excludes the `pr` token.
 pub fn run_pr(argv: &[String]) -> Result<String, CliError> {
     let sub = argv.first().map(|s| s.as_str()).unwrap_or("");
-    let (json, rest) = machine::json_requested(argv.get(1..).unwrap_or(&[]));
+    let values = match sub {
+        "create" => crate::pr_create::CREATE_VALUES,
+        "comment" => crate::issue::COMMENT_VALUES,
+        "review" => crate::pr_review::REVIEW_VALUES,
+        "abandon" => ABANDON_VALUES,
+        "prepare" => crate::pr_prepare::PREPARE_VALUES,
+        "merge" => crate::pr_merge::MERGE_VALUES,
+        _ => &[],
+    };
+    let (json, rest) = machine::json_requested_with(argv.get(1..).unwrap_or(&[]), values);
     if help_requested(&rest) {
         let usage = match sub {
             "merge" => Some(crate::pr_merge::pr_merge_help()),

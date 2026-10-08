@@ -72,6 +72,9 @@ fn prepare_arguments(args: &[String]) -> Result<(u64, String), CliError> {
 
 /// `git forge pr prepare <n> --strategy <merge|squash|rebase|ff>`
 ///
+/// Value-taking options of `pr prepare`.
+pub(crate) const PREPARE_VALUES: &[&str] = &["--strategy"];
+
 /// Materialize the strategy in a temporary worktree detached at the CURRENT
 /// base tip (or the source snapshot for rebase), against the PR's current
 /// snapshot generation. Appends `pr.prepared` (body: generation, source_head,
@@ -82,7 +85,7 @@ fn prepare_arguments(args: &[String]) -> Result<(u64, String), CliError> {
 /// stdout line and `pr show`'s additive `prepared:` line are the adapter
 /// contract surface.
 pub(crate) fn cmd_pr_prepare(args: &[String]) -> Result<String, CliError> {
-    let (json, args) = crate::machine::json_requested(args);
+    let (json, args) = crate::machine::json_requested_with(args, PREPARE_VALUES);
     // Without `--json` any help token prints help (existing behavior). Under
     // `--json` the parser below decides: a standalone help token is refused,
     // and a `--strategy` value is validated as a strategy.

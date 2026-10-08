@@ -90,6 +90,22 @@ fails with `E_CONFLICT`, `retryable: false` (a retry with the same key cannot
 succeed), the key as `input`, and `data` naming the command, the key and the
 recorded id.
 
+**Option values equal to `--json`.** Keys are opaque, so
+`--idempotency-key --json` must keep the key `--json`. The shared split
+`machine::json_requested` removed every `--json` token before any parser
+ran, which lost such a value for every value-taking option (`--label`,
+`--body`, `--reason` and others). The split now takes the command's
+value-taking options (`json_requested_with`, a `const` beside each parser,
+plus `--` for the two commands with end-of-options). It copies each such
+option and its following token verbatim, so only a standalone `--json`
+requests JSON: the rule #35 set for `-h`/`--help` values. The split records
+its decision (`machine::json_mode`), and `main` uses it to decide whether a
+failure prints a JSON error. Only when no command grammar ran does `main`
+fall back to "any `--json` argument". The table in
+`tests/json_option_values.rs` covers every value-taking option of every
+`--json`-capable command, with and without a standalone `--json`; a new
+value-taking option must be added to its command's list and to the table.
+
 ## Alternatives considered
 
 Writing the key raw into the ref name was rejected: keys may hold `/`,
@@ -103,7 +119,12 @@ add nothing that equality of the blob id does not give. A record check
 inside the retry loop before each transaction was rejected as the only
 guard: the transaction's expected-absence line is the guard by
 construction, and the deterministic race test exercises it. Expiring keys
-was rejected by the spec default (keys never expire).
+was rejected by the spec default (keys never expire). For `--json`
+values, a `--json` arm inside each parser loop was rejected: it would move
+the output-mode decision out of the shared split, change the help ordering
+of every option-taking command, and leave `main` without a decision for
+failures inside the loop; a second scanner of option values was rejected
+for the reason #35 gave for help tokens.
 
 ## Consequences
 

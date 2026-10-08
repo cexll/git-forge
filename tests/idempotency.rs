@@ -870,7 +870,9 @@ fn invalid_key_arguments_are_usage_errors_that_write_nothing() {
             ),
         ];
         for (extra, message, input) in cases {
-            let args = [command, extra, &["--json"]].concat();
+            // The standalone `--json` precedes the key flag: after it,
+            // `--json` would be the key's value.
+            let args = [command, &["--json"], extra].concat();
             let output = repo.run(&args);
             assert_eq!(output.status.code(), Some(1), "{args:?}");
             assert_eq!(

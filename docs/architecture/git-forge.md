@@ -133,6 +133,16 @@ prints `git-forge: <message>`. With a bare `--json` token, stdout contains one
 JSON error object and stderr keeps the same line. This also applies when a
 command rejects `--json` because it has no machine success result.
 
+A bare `--json` is a standalone token: not the value of a value-taking
+option and not after an end-of-options `--` (`issue new`, `pr create`).
+`issue new t --label --json` creates an Issue labeled `--json` and prints
+the human result; `--idempotency-key --json` uses the key `--json`. Each
+command declares its value-taking options to the shared split
+(`machine::json_requested_with`), and the result of that split also decides
+whether a failure prints a JSON error. A failure before any command grammar
+ran (an unknown command or subcommand) prints a JSON error when any argument
+is `--json`.
+
 ```json
 {"error":{"code":"E_USAGE","message":"usage: git forge pr show <n> [--json]","input":"","hint":"Run the command with --help and correct its arguments.","retryable":false}}
 ```

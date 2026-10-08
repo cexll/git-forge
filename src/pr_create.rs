@@ -43,12 +43,24 @@ fn resolve_local_branch(store: &EventStore, arg: &str) -> Result<(String, git2::
     Ok((name.to_string(), oid))
 }
 
+/// Value-taking options of `pr create` (`--` ends options).
+pub(crate) const CREATE_VALUES: &[&str] = &[
+    "--source",
+    "--base",
+    "--body",
+    "--label",
+    "-l",
+    "--closes",
+    crate::idempotency::FLAG,
+    "--",
+];
+
 /// `git forge pr create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]... [--closes <n>] [--idempotency-key <k>]`
 pub(crate) fn cmd_pr_create(args: &[String]) -> Result<String, CliError> {
     const USAGE: &str = "usage: git forge pr create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]... [--closes <n>] [--idempotency-key <k>]";
     // `--json` (#7): the created PR (allocated id, snapshot, pending CI state)
     // as one JSON line — the adapter's id capture.
-    let (json, args) = machine::json_requested(args);
+    let (json, args) = machine::json_requested_with(args, CREATE_VALUES);
     if help_requested(&args) {
         return help_result(json, &args[0], USAGE.into());
     }

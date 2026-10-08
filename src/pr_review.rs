@@ -6,11 +6,14 @@ use crate::cli_error::CliError;
 use crate::event::{Event, EventKind, JsonValue};
 use crate::identity::open_mutation_store;
 
+/// Value-taking options of `pr review`.
+pub(crate) const REVIEW_VALUES: &[&str] = &["--file", "--line", "--commit"];
+
 /// `git forge pr review <n> --approve|--reject [--file <f> --line <l> --commit <c>]`
 pub(crate) fn cmd_pr_review(args: &[String]) -> Result<String, CliError> {
     const USAGE: &str =
         "usage: git forge pr review <n> --approve|--reject [--file <f> --line <l> --commit <c>]";
-    let (json, args) = crate::machine::json_requested(args);
+    let (json, args) = crate::machine::json_requested_with(args, REVIEW_VALUES);
     let args = args.as_slice();
     let id = parse_entity_id(args.first().ok_or_else(|| CliError::usage(USAGE, ""))?)?;
     let mut decision = None;
