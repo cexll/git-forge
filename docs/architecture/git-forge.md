@@ -159,9 +159,9 @@ strategy conflicts. Hook and process failures without unmerged entries remain
 `E_INTERNAL`.
 
 The CLI preserves typed CAS failures as `E_CONFLICT` with `retryable: true`.
-Other failures are not automatically retryable. Detailed base-movement and
-CI-diagnostic payloads are separate command contracts; the prepare-conflict
-payload is below.
+Other failures are not automatically retryable. CI-diagnostic payloads are a
+separate command contract; the prepare-conflict and moved-base payloads are
+below.
 
 Canonical local branch names that are absent return `E_NOT_FOUND` with the
 supplied branch argument as `input`. Malformed or noncanonical branch inputs
@@ -229,6 +229,35 @@ The `ff` strategy has no conflict path: a source that does not sit on the
 base tip fails the fast-forward precondition before a worktree exists. A
 failure without unmerged entries keeps its `git <s> failed: <cause>` message
 and `E_INTERNAL`. `pr merge` strategy execution is not part of this contract.
+
+#### Moved base
+
+`pr update <n>` resolves the live base branch tip. When it differs from the
+snapshot `base_head`, the update is refused before any write with
+`E_BASE_MOVED`. The base can have gained commits, been rewritten, or been
+reset to an ancestor; all three refuse the same way, also when the source
+did not move or an earlier update raised the generation. The message is:
+
+```text
+base branch '<base_ref>' has moved since PR #<n> was created; run git forge pr prepare <n> --strategy <s> to merge the existing snapshot, or create a replacement PR from the updated source with the same --closes and abandon PR #<n>
+```
+
+- `<s>` is printed literally: `pr update` has no strategy to name. Both
+  remedies pass the merge gate; the message never suggests a manual merge.
+- The message escapes control characters in the branch name in `\x9b`
+  style; `input` and `data.base` keep the exact name.
+- `input` is the base branch name, `retryable` is `false`, and `hint` is
+  `Inspect the current base and PR snapshot before proceeding.`
+- `data` keys, in order: `pr` (number), `base` (the base branch name),
+  `snapshot_base` (the snapshot base commit), and `current_base` (the live
+  base tip).
+
+```json
+{"error":{"code":"E_BASE_MOVED","message":"base branch 'main' has moved since PR #1 was created; run git forge pr prepare 1 --strategy <s> to merge the existing snapshot, or create a replacement PR from the updated source with the same --closes and abandon PR #1","input":"main","hint":"Inspect the current base and PR snapshot before proceeding.","retryable":false,"data":{"pr":1,"base":"main","snapshot_base":"<40-hex>","current_base":"<40-hex>"}}}
+```
+
+A deleted base branch is not a moved base: `pr update` keeps its
+`branch '<base_ref>' does not exist` refusal with `E_NOT_FOUND`.
 
 Missing required positionals return usage errors, never panics. In particular,
 `pr show` and `pr diff` use `usage: git forge pr <verb> <n> [--json]`.
