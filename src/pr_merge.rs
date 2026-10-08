@@ -823,9 +823,9 @@ pub(crate) fn cmd_pr_update(args: &[String]) -> Result<String, CliError> {
         .map_err(|_| "PR merge_base invalid".to_string())?
         .ok_or_else(|| "PR has no merge_base".to_string())?;
     // Re-pin to the LIVE branch tips. The source branch may have moved (the
-    // whole point of update); the base branch may NOT — a moved base keeps
-    // its recreate remedy (#2 live-base re-validation), so update refuses
-    // rather than silently adopting a base the PR was never reviewed against.
+    // whole point of update); the base branch may NOT — update refuses a
+    // moved base with the gated remedies (prepare or replace the PR) rather
+    // than silently adopting a base the PR was never reviewed against.
     let resolve_tip = |branch: &str| -> Result<git2::Oid, CliError> {
         store
             .repo()
@@ -836,7 +836,35 @@ pub(crate) fn cmd_pr_update(args: &[String]) -> Result<String, CliError> {
     let new_source = resolve_tip(&source_ref)?;
     let new_base = resolve_tip(&base_ref)?;
     if new_base != old_base {
-        return Err(CliError::new("E_BASE_MOVED", format!("base branch '{base_ref}' has moved since PR #{id} was created ({new_base} != snapshot {old_base}); recreate the PR or merge manually"), &base_ref, "Inspect the current base and PR snapshot before proceeding.", false));
+        // The remedies are the gated ones (spec #33): prepare a candidate
+        // for the existing snapshot, or replace the PR. `<s>` stays literal
+        // because update has no strategy to name.
+        let shown = crate::cli::sanitize_terminal(&base_ref);
+        let mut error = CliError::new(
+            "E_BASE_MOVED",
+            format!(
+                "base branch '{shown}' has moved since PR #{id} was created; run git forge pr \
+                 prepare {id} --strategy <s> to merge the existing snapshot, or create a \
+                 replacement PR from the updated source with the same --closes and abandon \
+                 PR #{id}"
+            ),
+            &base_ref,
+            "Inspect the current base and PR snapshot before proceeding.",
+            false,
+        );
+        error.data = vec![
+            ("pr", crate::event::JsonValue::Number(id as i64)),
+            ("base", crate::event::JsonValue::String(base_ref.clone())),
+            (
+                "snapshot_base",
+                crate::event::JsonValue::String(old_base.to_string()),
+            ),
+            (
+                "current_base",
+                crate::event::JsonValue::String(new_base.to_string()),
+            ),
+        ];
+        return Err(error);
     }
     if new_source == old_source {
         return Err(CliError::invalid(format!("PR #{id} source branch tip is already the snapshot source_head ({old_source}); nothing to update")));
