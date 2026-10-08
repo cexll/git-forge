@@ -479,3 +479,61 @@ fn new_does_not_retry_nonconflict_transaction_failure() {
     assert_eq!(std::fs::read_to_string(attempts).unwrap(), "attempted\n");
     assert_eq!(repo.refs(), "");
 }
+
+#[test]
+fn cycle_diagnostic_names_changed_entry_not_unrelated_first_file() {
+    let repo = Repo::new();
+    let a = repo.plan("a.md", &entry("a", "", ""));
+    repo.ok(&["issue", "apply", path_str(&a)]);
+    let b = repo.plan("b.md", &entry("b", "", ""));
+    repo.ok(&["issue", "apply", path_str(&b)]);
+    std::fs::write(&a, entry("a", "blocked_by: [\"#2\"]\n", "")).unwrap();
+    repo.ok(&["issue", "apply", path_str(&a)]);
+    let dir = repo.0.join("change");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::write(dir.join("0-unrelated.md"), entry("unrelated", "", "")).unwrap();
+    std::fs::write(
+        dir.join("1-offending.md"),
+        entry("b", "blocked_by: [\"#1\"]\n", ""),
+    )
+    .unwrap();
+    let before = repo.refs();
+    let output = repo.run(&["issue", "apply", path_str(&dir)]);
+    assert!(!output.status.success());
+    let error = String::from_utf8(output.stderr).unwrap();
+    assert!(error.contains("1-offending.md: blocked_by:"), "{error}");
+    assert_eq!(repo.refs(), before);
+}
+
+#[test]
+fn cycle_errors_name_changed_edge_not_unchanged_ancestor() {
+    for field in ["parent", "blocked_by"] {
+        let repo = Repo::new();
+        let relation = |id: u64| {
+            if field == "parent" {
+                format!("parent: \"#{id}\"\n")
+            } else {
+                format!("blocked_by: [\"#{id}\"]\n")
+            }
+        };
+        let b = repo.plan("b.md", &entry("b", "", ""));
+        repo.ok(&["issue", "apply", path_str(&b)]);
+        let a = repo.plan("a.md", &entry("a", &relation(1), ""));
+        repo.ok(&["issue", "apply", path_str(&a)]);
+        let c = repo.plan("c.md", &entry("c", &relation(2), ""));
+        repo.ok(&["issue", "apply", path_str(&c)]);
+        let dir = repo.0.join("change");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::write(dir.join("0-unchanged.md"), entry("c", &relation(2), "")).unwrap();
+        std::fs::write(dir.join("1-offending.md"), entry("b", &relation(2), "")).unwrap();
+        let before = repo.refs();
+        let output = repo.run(&["issue", "apply", path_str(&dir)]);
+        assert!(!output.status.success());
+        let error = String::from_utf8(output.stderr).unwrap();
+        assert!(
+            error.contains(&format!("1-offending.md: {field}:")),
+            "{error}"
+        );
+        assert_eq!(repo.refs(), before);
+    }
+}

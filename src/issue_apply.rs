@@ -97,10 +97,25 @@ fn prepare(entries: &[Entry], snapshot: &IssueSnapshot, actor: &str) -> Result<P
         };
         record(&mut plan, state, old, actor);
     }
-    validate_graph(&plan.states).map_err(|(id, field, message)| {
+    let plan_ids: Vec<_> = entries.iter().map(|entry| ids[&entry.key]).collect();
+    validate_graph(&plan.states, &plan_ids).map_err(|(cycle, field, message)| {
+        let implicated = |entry: &&Entry| cycle.contains(&ids[&entry.key]);
+        let changed_edge = |entry: &&Entry| {
+            let id = ids[&entry.key];
+            let desired = &plan.states[&id];
+            snapshot.states.get(&id).is_none_or(|old| {
+                if field == "parent" {
+                    old.parent != desired.parent
+                } else {
+                    old.blocked_by != desired.blocked_by
+                }
+            })
+        };
         entries
             .iter()
-            .find(|e| ids[&e.key] == id)
+            .filter(implicated)
+            .find(changed_edge)
+            .or_else(|| entries.iter().find(implicated))
             .unwrap_or(&entries[0])
             .error(field, &message)
     })?;
@@ -206,31 +221,42 @@ fn record(plan: &mut Plan, state: IssueState, old: Option<&IssueState>, actor: &
 }
 
 /// Validate each graph separately, including edges through existing issues.
-fn validate_graph(states: &BTreeMap<u64, IssueState>) -> Result<(), (u64, &'static str, String)> {
+fn validate_graph(
+    states: &BTreeMap<u64, IssueState>,
+    roots: &[u64],
+) -> Result<(), (Vec<u64>, &'static str, String)> {
     for field in ["parent", "blocked_by"] {
         let mut done = HashSet::new();
-        for start in states.keys().copied() {
+        for start in roots.iter().chain(states.keys()).copied() {
             if done.contains(&start) {
                 continue;
             }
             let mut active = HashSet::new();
+            let mut path = Vec::new();
             let mut stack = vec![(start, false)];
             while let Some((id, leaving)) = stack.pop() {
                 if leaving {
                     active.remove(&id);
+                    path.pop();
                     done.insert(id);
                     continue;
                 }
                 if active.contains(&id) {
-                    return Err((start, field, format!("cycle involving issue #{id}")));
+                    let cycle = path
+                        .iter()
+                        .position(|node| *node == id)
+                        .map(|index| path[index..].to_vec())
+                        .unwrap_or_else(|| vec![id]);
+                    return Err((cycle, field, format!("cycle involving issue #{id}")));
                 }
                 if done.contains(&id) {
                     continue;
                 }
                 let state = states
                     .get(&id)
-                    .ok_or_else(|| (start, field, format!("issue #{id} does not exist")))?;
+                    .ok_or_else(|| (vec![start], field, format!("issue #{id} does not exist")))?;
                 active.insert(id);
+                path.push(id);
                 stack.push((id, true));
                 if field == "parent" {
                     if let Some(parent) = state.parent {
@@ -348,7 +374,8 @@ pub(crate) fn new_issue(
             next,
         };
         record(&mut plan, state.clone(), None, &actor);
-        validate_graph(&plan.states).map_err(|(_, field, e)| format!("issue new: {field}: {e}"))?;
+        validate_graph(&plan.states, &[id])
+            .map_err(|(_, field, e)| format!("issue new: {field}: {e}"))?;
         match store.apply_issue_batch(&snapshot, next, &plan.events) {
             Ok(()) => {}
             Err(crate::store::StoreError::CasConflict) => continue,
