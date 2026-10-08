@@ -21,9 +21,14 @@ exactly when the index has an unmerged entry.
 
 `pr prepare` (`src/pr_prepare.rs`) builds the `E_PREPARE_CONFLICT` error from
 structured parts: PR id, strategy, base ref and tip, source commit, up to 20
-conflicted paths, the remedy, and the cleanup outcome. Paths and branch
-names in the message pass through `sanitize_terminal`, so a path with a
-newline or control byte cannot inject terminal output. The JSON error adds
+conflicted paths, the remedy, and the cleanup outcome. Each path is the
+git-quoted path (`core.quotePath=false`): for example `"bad\200.txt"` for
+the bytes `bad<0x80>.txt` and `"new\nline"` for a path with a newline. The
+same quoted form is used in the message and in `data.paths`. Invalid UTF-8
+bytes are octal escapes, so the encoding is injective; git itself would emit
+them raw with `core.quotePath=false`. Paths and branch names in the message
+also pass through `sanitize_terminal`, so no control byte reaches the
+terminal. The JSON error adds
 `data` with `pr`, `strategy`, `base`, `source`, and every conflicted path.
 `CliError.data` is an ordered field list, so the keys render in a fixed
 order. The exact text is in the wire contract (`docs/architecture/git-forge.md`,
@@ -40,6 +45,10 @@ then run `pr update` or create a replacement PR.
 - Parse `CONFLICT (...)` lines from git's output. The wording varies by git
   version and a hook can write unmerged entries without such a line. The
   index is the authoritative source. Rejected.
+- Lossy UTF-8 (`U+FFFD`) or exact paths in `data.paths`. Lossy decoding
+  maps distinct invalid-byte paths to one string; exact bytes cannot be
+  represented in JSON text. The git-quoted form is injective and familiar
+  from `git status` and `git diff`. Chosen by the orchestrator on #36.
 - Limit `data.paths` to 20 as well. The spec limits only the message; a
   machine consumer needs the complete list. Rejected.
 

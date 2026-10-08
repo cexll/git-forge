@@ -200,8 +200,17 @@ PR #<n> cannot be prepared with strategy <s>: source <source> conflicts with bas
   add/add, modify/delete, rename/delete, or a hook that writes unmerged
   entries). Paths that differ only in case stay distinct under
   `core.ignorecase`.
-- The message escapes control characters (`\x0a` for a newline) in paths
-  and branch names; `data.paths` keeps the exact paths.
+- Each path is the git-quoted path (`core.quotePath=false`, git's
+  `quote_c_style`), in the message and in `data.paths`. Valid UTF-8 without
+  `"`, `\` or a control byte appears as is. Any other path is double-quoted
+  with `\"`, `\\`, `\a \b \t \n \v \f \r`, and `\ooo` octal for every
+  other control byte. Unlike git with `core.quotePath=false`, an invalid
+  UTF-8 byte is also `\ooo` octal, so distinct paths stay distinct. Example:
+  the bytes `new⏎line` become `"new\nline"` and `bad<0x80>.txt` becomes
+  `"bad\200.txt"`.
+- The message also escapes control characters that quoting leaves (C1
+  controls U+0080-U+009F in paths, any control in branch names) in `\x9b`
+  style; `data.paths` keeps the git-quoted path.
 - Git's own diagnostic text is not forwarded: it names commands
   (`git rebase --continue`) that do not apply to the removed worktree.
 - The final clause is the unchanged cleanup outcome. When worktree removal

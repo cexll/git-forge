@@ -5,7 +5,7 @@ use std::path::Path;
 pub(crate) struct StrategyFailure {
     /// `git <kind> failed: <cause>; <cleanup>`: the operational message.
     pub(crate) message: String,
-    /// Paths of the unmerged index entries, one per path; empty when
+    /// Git-quoted paths of the unmerged index entries, one per path; empty when
     /// the failure left no unmerged entry (not a conflict).
     pub(crate) conflict_paths: Vec<String>,
     /// The cleanup outcome clause that ends `message`.
@@ -42,8 +42,9 @@ impl StrategyFailure {
 /// exact path byte sequence, in index order of first appearance. Raw entries
 /// are grouped here rather than through libgit2's conflict iterator, which
 /// groups stages with the index's path comparison and so folds `A.txt` and
-/// `a.txt` together under `core.ignorecase`. Non-UTF-8 bytes are replaced. An
-/// unreadable index yields no paths, so the failure stays operational.
+/// `a.txt` together under `core.ignorecase`. Each path is git-quoted
+/// ([`quote_path`]). An unreadable index yields no paths, so the failure
+/// stays operational.
 fn conflicted_paths(worktree: &Path) -> Vec<String> {
     /// Stage bits of `git_index_entry.flags` (`GIT_INDEX_ENTRY_STAGEMASK`).
     const STAGE_MASK: u16 = 0x3000;
@@ -55,8 +56,54 @@ fn conflicted_paths(worktree: &Path) -> Vec<String> {
         .iter()
         .filter(|entry| entry.flags & STAGE_MASK != 0)
         .filter(|entry| seen.insert(entry.path.clone()))
-        .map(|entry| String::from_utf8_lossy(&entry.path).into_owned())
+        .map(|entry| quote_path(&entry.path))
         .collect()
+}
+
+/// Render a path the way git does with `core.quotePath=false` (git's
+/// `quote_c_style`). Valid UTF-8 without `"`, `\` or a control byte is
+/// returned as is. Any other path is double-quoted with `\"`, `\\`, the C
+/// escapes `\a \b \t \n \v \f \r`, and `\ooo` octal for every other
+/// control byte (including DEL) and every byte of invalid UTF-8. The mapping
+/// is injective, so distinct paths stay distinct.
+fn quote_path(path: &[u8]) -> String {
+    let mut quoted = String::with_capacity(path.len());
+    let mut needs_quotes = false;
+    for chunk in path.utf8_chunks() {
+        for c in chunk.valid().chars() {
+            let escape = match c {
+                '"' => "\\\"",
+                '\\' => "\\\\",
+                '\x07' => "\\a",
+                '\x08' => "\\b",
+                '\t' => "\\t",
+                '\n' => "\\n",
+                '\x0b' => "\\v",
+                '\x0c' => "\\f",
+                '\r' => "\\r",
+                c if c < ' ' || c == '\x7f' => {
+                    needs_quotes = true;
+                    quoted.push_str(&format!("\\{:03o}", c as u32));
+                    continue;
+                }
+                c => {
+                    quoted.push(c);
+                    continue;
+                }
+            };
+            needs_quotes = true;
+            quoted.push_str(escape);
+        }
+        for byte in chunk.invalid() {
+            needs_quotes = true;
+            quoted.push_str(&format!("\\{byte:03o}"));
+        }
+    }
+    if needs_quotes {
+        format!("\"{quoted}\"")
+    } else {
+        quoted
+    }
 }
 
 /// Execute the requested merge strategy inside the temp worktree and return
@@ -234,6 +281,24 @@ mod tests {
         assert!(child.wait().unwrap().success());
         assert_eq!(conflicted_paths(&dir), ["A.txt", "a.txt"]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn quote_path_matches_git_c_style_quoting() {
+        use super::quote_path;
+        assert_eq!(quote_path(b"plain/file.txt"), "plain/file.txt");
+        assert_eq!(
+            quote_path("caf\u{e9}/\u{4e2d}.txt".as_bytes()),
+            "caf\u{e9}/\u{4e2d}.txt"
+        );
+        assert_eq!(quote_path(b"say\"hi\".txt"), "\"say\\\"hi\\\".txt\"");
+        assert_eq!(quote_path(b"back\\slash"), "\"back\\\\slash\"");
+        assert_eq!(
+            quote_path(b"new\nline\x08\x01\x7f"),
+            "\"new\\nline\\b\\001\\177\""
+        );
+        assert_eq!(quote_path(b"bad\x80.txt"), "\"bad\\200.txt\"");
+        assert_ne!(quote_path(b"bad\x80.txt"), quote_path(b"bad\x81.txt"));
     }
 
     #[test]

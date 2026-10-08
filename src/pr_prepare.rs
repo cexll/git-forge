@@ -447,7 +447,8 @@ fn prepare_conflict_error(conflict: &PrepareConflict<'_>) -> CliError {
         cleanup,
     } = *conflict;
     // Paths and branch names come from repository content; escape control
-    // characters in the human message only (`data` keeps the exact paths).
+    // characters in the human message. Git quoting leaves C1 controls
+    // (U+0080-U+009F) in paths unescaped; sanitizing catches them.
     let base_ref = crate::cli::sanitize_terminal(base_ref);
     let source_ref = crate::cli::sanitize_terminal(source_ref);
     let count = match paths.len() {

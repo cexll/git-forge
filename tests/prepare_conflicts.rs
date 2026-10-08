@@ -180,13 +180,16 @@ fn unmerged_index_hook(repo: &Repo) -> String {
 
 /// A hook that adds three unmerged stages for each of `paths` (exact bytes,
 /// NUL-terminated records) and then fails.
-fn unmerged_paths_hook(repo: &Repo, paths: &[&str]) -> String {
+fn unmerged_paths_hook(repo: &Repo, paths: &[&[u8]]) -> String {
     let blob = repo.git(&["rev-parse", "main:shared.txt"]);
-    let blob = blob.as_str();
-    let records: String = paths
-        .iter()
-        .flat_map(|path| (1..=3).map(move |stage| format!("100644 {blob} {stage}\t{path}\0")))
-        .collect();
+    let mut records = Vec::new();
+    for path in paths {
+        for stage in 1..=3 {
+            records.extend_from_slice(format!("100644 {blob} {stage}\t").as_bytes());
+            records.extend_from_slice(path);
+            records.push(0);
+        }
+    }
     let file = repo.0.join(".git/unmerged-records");
     std::fs::write(&file, records).unwrap();
     format!(
@@ -197,7 +200,6 @@ fn unmerged_paths_hook(repo: &Repo, paths: &[&str]) -> String {
 
 /// The independently stated prepare-conflict contract (spec #33 default
 /// "Prepare conflict output").
-/// `paths` are the paths as the message displays them.
 fn expected_message(strategy: &str, base: &str, source: &str, paths: &[String]) -> String {
     let shown = paths
         .iter()
@@ -226,13 +228,9 @@ fn expected_message(strategy: &str, base: &str, source: &str, paths: &[String]) 
 const HINT: &str = "Merge the base branch into the source branch, resolve the conflicts, \
                     then run `git forge pr update <n>` or create a replacement PR.";
 
+/// `paths` are the expected git-quoted paths (core.quotePath=false); the
+/// message and `data.paths` both carry them.
 fn assert_prepare_conflict(repo: &Repo, strategy: &str, paths: &[String]) {
-    assert_prepare_conflict_shown(repo, strategy, paths, paths);
-}
-
-/// [`assert_prepare_conflict`] where the human message displays `shown`
-/// while `data.paths` keeps the exact `paths`.
-fn assert_prepare_conflict_shown(repo: &Repo, strategy: &str, paths: &[String], shown: &[String]) {
     let base = repo.ref_oid("refs/heads/main").unwrap();
     let source = repo.ref_oid("refs/heads/feature").unwrap();
     let protected = [
@@ -242,7 +240,7 @@ fn assert_prepare_conflict_shown(repo: &Repo, strategy: &str, paths: &[String], 
         "refs/forge/prs/1/result",
     ];
     let before = protected.map(|name| repo.ref_oid(name));
-    let message = expected_message(strategy, &base, &source, shown);
+    let message = expected_message(strategy, &base, &source, paths);
     let args = ["forge", "pr", "prepare", "1", "--strategy", strategy];
 
     let (code, stdout, stderr) = repo.forge(&args);
@@ -346,23 +344,36 @@ fn prepare_conflict_keeps_case_distinct_paths() {
     repo.git(&["config", "core.ignorecase", "true"]);
     repo.install_hook(
         "pre-commit",
-        &unmerged_paths_hook(&repo, &["A.txt", "a.txt"]),
+        &unmerged_paths_hook(&repo, &[b"A.txt", b"a.txt"]),
     );
     assert_prepare_conflict(&repo, "squash", &strings(&["A.txt", "a.txt"]));
 }
 
-/// Control bytes in a conflicted path are escaped in the human message only;
-/// `data.paths` keeps the exact path.
+/// A path with control bytes is reported in git's C-style quoted form, in
+/// both the message and `data.paths`, so no raw control byte reaches stderr.
 #[test]
 fn prepare_conflict_escapes_control_bytes_in_message() {
     let repo = conflict_fixture(Divergence::CleanWithHook);
-    let path = "evil\nline\u{8}.txt";
-    repo.install_hook("pre-commit", &unmerged_paths_hook(&repo, &[path]));
-    assert_prepare_conflict_shown(
+    repo.install_hook(
+        "pre-commit",
+        &unmerged_paths_hook(&repo, &[b"evil\nline\x08.txt"]),
+    );
+    assert_prepare_conflict(&repo, "squash", &strings(&["\"evil\\nline\\b.txt\""]));
+}
+
+/// Distinct non-UTF-8 paths stay distinct: each invalid byte is an octal
+/// escape inside a quoted path.
+#[test]
+fn prepare_conflict_keeps_distinct_invalid_utf8_paths() {
+    let repo = conflict_fixture(Divergence::CleanWithHook);
+    repo.install_hook(
+        "pre-commit",
+        &unmerged_paths_hook(&repo, &[b"bad\x80.txt", b"bad\x81.txt"]),
+    );
+    assert_prepare_conflict(
         &repo,
         "squash",
-        &strings(&[path]),
-        &strings(&["evil\\x0aline\\x08.txt"]),
+        &strings(&["\"bad\\200.txt\"", "\"bad\\201.txt\""]),
     );
 }
 
