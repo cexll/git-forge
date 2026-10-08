@@ -298,3 +298,177 @@ fn json_as_an_option_value_is_data_for_every_value_taking_option() {
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+/// `(program, args, message, hint)` for every dispatch-level failure path.
+type DispatchCase = (&'static str, Vec<&'static str>, String, &'static str);
+
+fn dispatch_cases() -> Vec<DispatchCase> {
+    let unknown = |what: &str, token: &str| format!("unknown {what} '{token}'");
+    vec![
+        (
+            "git-forge",
+            vec!["issue", "--json"],
+            unknown("issue subcommand", "--json"),
+            "Run the command with --help and correct its arguments.",
+        ),
+        (
+            "git-forge",
+            vec!["pr", "--json"],
+            unknown("pr subcommand", "--json"),
+            "Run the command with --help and correct its arguments.",
+        ),
+        (
+            "git-forge",
+            vec!["ci", "--json"],
+            unknown("ci subcommand", "--json"),
+            "Run the command with --help and correct its arguments.",
+        ),
+        (
+            "git-forge",
+            vec!["issue", "--json", "bogus"],
+            unknown("issue subcommand", "--json"),
+            "Run the command with --help and correct its arguments.",
+        ),
+        (
+            "git-forge",
+            vec!["issue", "bogus", "--json"],
+            unknown("issue subcommand", "bogus"),
+            "Run the command with --help and correct its arguments.",
+        ),
+        (
+            "git-forge",
+            vec!["pr", "bogus", "--json"],
+            unknown("pr subcommand", "bogus"),
+            "Run the command with --help and correct its arguments.",
+        ),
+        (
+            "git-forge",
+            vec!["ci", "bogus", "--json"],
+            unknown("ci subcommand", "bogus"),
+            "Run the command with --help and correct its arguments.",
+        ),
+        (
+            "git-forge",
+            vec!["--json"],
+            unknown("command", "--json"),
+            "Run git forge help.",
+        ),
+        (
+            "git-forge",
+            vec!["bogus", "--json"],
+            unknown("command", "bogus"),
+            "Run git forge help.",
+        ),
+        (
+            "git-forge",
+            vec!["forge", "--json"],
+            unknown("forge subcommand", "--json"),
+            "Run git forge help.",
+        ),
+        (
+            "git-forge",
+            vec!["forge", "issue", "--json"],
+            unknown("issue subcommand", "--json"),
+            "Run the command with --help and correct its arguments.",
+        ),
+        (
+            "git-forge",
+            vec!["forge", "pr", "--json", "bogus"],
+            unknown("pr subcommand", "--json"),
+            "Run the command with --help and correct its arguments.",
+        ),
+        (
+            "git-forge",
+            vec!["version", "--json"],
+            "unknown option '--json'".into(),
+            "Run the command with --help and correct its arguments.",
+        ),
+        (
+            "git-issue",
+            vec!["--json"],
+            unknown("issue subcommand", "--json"),
+            "Run the command with --help and correct its arguments.",
+        ),
+        (
+            "git-pr",
+            vec!["bogus", "--json"],
+            unknown("pr subcommand", "bogus"),
+            "Run the command with --help and correct its arguments.",
+        ),
+    ]
+}
+
+/// Every dispatch path that fails before or instead of a command grammar
+/// prints the JSON error when a standalone `--json` is present: the
+/// namespace subcommand slot, an unknown subcommand, an unknown command,
+/// the direct `forge` form and the `git-issue`/`git-pr` wrappers. Nothing is
+/// written.
+#[test]
+fn dispatch_errors_with_a_standalone_json_print_the_json_error() {
+    let dir = std::env::temp_dir().join(format!(
+        "gf-json-dispatch-{}-{}",
+        std::process::id(),
+        NEXT_REPO.fetch_add(1, Ordering::Relaxed)
+    ));
+    std::fs::create_dir(&dir).unwrap();
+    let git = |args: &[&str]| {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(&dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .unwrap()
+            .status
+            .success());
+    };
+    git(&["init", "-q"]);
+    let binary = PathBuf::from(env!("CARGO_BIN_EXE_git-forge"));
+    for wrapper in ["git-issue", "git-pr"] {
+        std::os::unix::fs::symlink(&binary, dir.join(wrapper)).unwrap();
+    }
+    let cases = dispatch_cases();
+    let mut failures = Vec::new();
+    for (program, args, message, hint) in &cases {
+        let program = if *program == "git-forge" {
+            binary.clone()
+        } else {
+            dir.join(program)
+        };
+        let output = Command::new(&program)
+            .args(args)
+            .current_dir(&dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_FORGE_ROLE")
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8(output.stdout.clone()).unwrap();
+        let input = message.rsplit('\'').nth(1).unwrap();
+        let expected = serde_json::json!({"error": {
+            "code": "E_USAGE", "message": message, "input": input,
+            "hint": hint, "retryable": false,
+        }});
+        let parsed = serde_json::from_str::<serde_json::Value>(&stdout).ok();
+        if output.status.code() != Some(1)
+            || stderr(&output) != format!("git-forge: {message}\n")
+            || parsed.as_ref() != Some(&expected)
+            || stdout.lines().count() != 1
+        {
+            failures.push(format!(
+                "{} {args:?}: exit {:?}, stdout {stdout:?}, stderr {:?}",
+                program.file_name().unwrap().to_string_lossy(),
+                output.status.code(),
+                stderr(&output)
+            ));
+        }
+    }
+    let refs = Command::new("git")
+        .args(["for-each-ref", "refs/forge/"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    let _ = std::fs::remove_dir_all(&dir);
+    assert!(failures.is_empty(), "{failures:#?}");
+    assert!(refs.stdout.is_empty(), "a dispatch error wrote forge refs");
+}

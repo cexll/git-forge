@@ -41,6 +41,19 @@ pub fn json_mode() -> Option<bool> {
     JSON_MODE.with(std::cell::Cell::get)
 }
 
+/// The namespace dispatcher's split (`issue`, `pr`, `ci`): `argv` is the
+/// namespace's arguments with the subcommand first, `values` the
+/// subcommand's value-taking options (none for an unknown subcommand, so
+/// every `--json` after it is standalone). A `--json` in the subcommand slot
+/// is standalone too: the dispatcher rejects it as an unknown subcommand,
+/// and that error is JSON.
+pub(crate) fn json_requested_by_dispatch(argv: &[String], values: &[&str]) -> (bool, Vec<String>) {
+    let (json, rest) = json_requested_with(argv.get(1..).unwrap_or(&[]), values);
+    let json = json || argv.first().is_some_and(|sub| sub == "--json");
+    JSON_MODE.with(|mode| mode.set(Some(json)));
+    (json, rest)
+}
+
 /// Split standalone `--json` tokens from `args`: whether at least one was
 /// present, plus the remaining arguments in order. `values` names the
 /// command's value-taking options: each such option and the token after it

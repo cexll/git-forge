@@ -388,7 +388,7 @@ pub fn run_pr(argv: &[String]) -> Result<String, CliError> {
         "merge" => crate::pr_merge::MERGE_VALUES,
         _ => &[],
     };
-    let (json, rest) = machine::json_requested_with(argv.get(1..).unwrap_or(&[]), values);
+    let (json, rest) = machine::json_requested_by_dispatch(argv, values);
     if help_requested(&rest) {
         let usage = match sub {
             "merge" => Some(crate::pr_merge::pr_merge_help()),
@@ -744,7 +744,7 @@ fn cmd_ci_run(args: &[String]) -> Result<String, CliError> {
 /// Dispatch a `git forge ci` subcommand. `argv` excludes the `ci` token.
 pub fn run_ci(argv: &[String]) -> Result<String, CliError> {
     let sub = argv.first().map(|s| s.as_str()).unwrap_or("");
-    let (json, rest) = machine::json_requested(argv.get(1..).unwrap_or(&[]));
+    let (json, rest) = machine::json_requested_by_dispatch(argv, &[]);
     if help_requested(&rest) && sub == "run" {
         return help_result(json, &rest[0], "usage: git forge ci run <pr>".into());
     }

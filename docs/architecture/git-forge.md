@@ -32,7 +32,7 @@ Must-not-haves (L1): web UI, single-file export, GitHub bridge, accounts/permiss
 | `issue` (commands) | `run_issue` dispatch; issue `cmd_*` handlers | Issue command parsing + human-readable output; apply and new graph publication delegated to `issue_apply`; graph JSON derived from folded states | Shallow: command surface only |
 | `issue_plan` (plans) | strict plan parsing, whole-graph validation, desired-state diff | Minimal frontmatter grammar; repository-wide key mapping and reference resolution; parent/blocking cycle checks | No YAML dependency; shared graph rules for apply and new |
 | `issue_apply` (publication) | `cmd_apply`, `new_issue_keyed` | Complete Issue graph snapshot, allocation, event construction and one atomic snapshot/CAS publication via store | Owns orchestration, not a second storage implementation |
-| `idempotency` (keys) | `set_key`, `take_key`, `*_request`, `replay`, `output`, `append_comment` | `--idempotency-key` parsing, the canonical inputs per command, replay or `E_CONFLICT`; the record and its atomic publication live in `store/idempotency.rs` | CLI-layer owner of the key contract; one implementation for the four keyed commands |
+| `idempotency` (keys) | `FLAG`, `set_key`, `take_key`, `issue_new_request`/`pr_create_request`/`comment_request`, `replay`, `recheck`, `output`, `comment` | `--idempotency-key` parsing, the canonical inputs per command, replay or `E_CONFLICT` before any write, the record re-read after a failed keyed write (`recheck`), and the keyed comment operation shared by `issue comment` and `pr comment` (`comment`); the record and its atomic publication live in `store/idempotency.rs` | CLI-layer owner of the key contract; one implementation for the four keyed commands |
 | `cli_error` (failures) | `CliError` | Stable codes, preserved human messages, optional structured data and JSON error rendering; typed storage conversion | CLI-layer boundary; core and store do not import it |
 | `pr_create` (create command) | `cmd_pr_create` | Branch resolution and atomic PR creation through `store::create_pr` | CLI-layer owner, extracted to retain the file-size gate |
 | `pr_review` (review command) | `cmd_pr_review` | Review argument handling and generation/candidate-bound event publication | CLI-layer owner, extracted to retain the file-size gate |
@@ -139,9 +139,14 @@ option and not after an end-of-options `--` (`issue new`, `pr create`).
 the human result; `--idempotency-key --json` uses the key `--json`. Each
 command declares its value-taking options to the shared split
 (`machine::json_requested_with`), and the result of that split also decides
-whether a failure prints a JSON error. A failure before any command grammar
-ran (an unknown command or subcommand) prints a JSON error when any argument
-is `--json`.
+whether a failure prints a JSON error. Where the decision is made:
+
+| Path | JSON error when |
+|---|---|
+| Top level (`git-forge <cmd>`), unknown command, `forge <sub>` with an unknown `<sub>`, `version` | any argument is `--json` (no command grammar ran) |
+| Namespace dispatch (`issue`, `pr`, `ci`, the `forge` form and the `git-issue`/`git-pr` wrappers) | the subcommand slot is `--json`, or a standalone `--json` follows the subcommand; an unknown subcommand has no value-taking options, so every `--json` after it is standalone |
+| Namespace help (`help`, `-h`, `--help` as the subcommand, or a leading help token after a known subcommand) | a standalone `--json` follows the subcommand (`E_USAGE`, help has no JSON) |
+| A known subcommand | its own split decides, before its parser reports any usage error |
 
 ```json
 {"error":{"code":"E_USAGE","message":"usage: git forge pr show <n> [--json]","input":"","hint":"Run the command with --help and correct its arguments.","retryable":false}}

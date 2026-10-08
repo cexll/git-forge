@@ -100,8 +100,13 @@ plus `--` for the two commands with end-of-options). It copies each such
 option and its following token verbatim, so only a standalone `--json`
 requests JSON: the rule #35 set for `-h`/`--help` values. The split records
 its decision (`machine::json_mode`), and `main` uses it to decide whether a
-failure prints a JSON error. Only when no command grammar ran does `main`
-fall back to "any `--json` argument". The table in
+failure prints a JSON error. The namespace dispatchers (`issue`, `pr`,
+`ci`) split with `json_requested_by_dispatch`, which also treats a `--json`
+in the subcommand slot as standalone, so `issue --json` is a JSON
+`E_USAGE` (unknown subcommand). Only when no command grammar ran (top
+level, unknown command, `forge` and `version` errors) does `main` fall back
+to "any `--json` argument"; that fallback is never ORed into a grammar's
+decision, which would bring back the option-value and after-`--` cases. The table in
 `tests/json_option_values.rs` covers every value-taking option of every
 `--json`-capable command, with and without a standalone `--json`; a new
 value-taking option must be added to its command's list and to the table.

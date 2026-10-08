@@ -375,8 +375,7 @@ pub fn run_issue(argv: &[String]) -> Result<String, CliError> {
     let sub = argv.first().map(|s| s.as_str()).unwrap_or("");
     // Subcommand-level `-h`/`--help` is answered HERE, before any store open,
     // so help works outside a git repository (same as the namespace helps).
-    let (json, rest) =
-        machine::json_requested_with(argv.get(1..).unwrap_or(&[]), issue_values(sub));
+    let (json, rest) = machine::json_requested_by_dispatch(argv, issue_values(sub));
     if help_requested(&rest) {
         if let Some(usage) = issue_sub_usage(sub) {
             return help_result(json, &rest[0], usage.into());
