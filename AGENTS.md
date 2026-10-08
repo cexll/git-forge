@@ -207,7 +207,7 @@ Before submitting or accepting a review, verify:
 
 ## Critical Paths
 
-White-box review required for changes touching these (L3): `src/store.rs` (git2 ref transactions, counter CAS, immutable snapshot refs) and merge gate/merge execution (`src/merge_state.rs` merge-gate predicate + finalize construction, `src/pr_merge.rs` merge orchestration, merge strategies in `src/git.rs`, temporary worktree handling, pending-result ref). These are irreversible operations — ref writes and merges mutate the repository. Any diff touching a critical path is flagged for human review.
+White-box review required for changes touching these (L3): `src/store.rs` (git2 ref transactions, counter CAS, immutable snapshot refs) and merge gate/merge execution (`src/merge_state.rs` merge-gate predicate + finalize construction, `src/pr_merge.rs` merge orchestration, merge strategies in `src/git.rs`, temporary worktree handling, pending-result ref). These are irreversible operations — ref writes and merges mutate the repository. Any diff touching a critical path gets an independent automated white-box review (a reviewer agent that did not write the change) before merge; human review is not required.
 
 ## Agent Operating Rules
 
