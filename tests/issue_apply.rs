@@ -487,55 +487,85 @@ fn plan_errors_escape_terminal_controls_in_fields_references_and_paths() {
 #[test]
 fn new_retries_fresh_snapshot_after_competing_allocation() {
     use std::os::unix::fs::PermissionsExt;
-    let repo = Repo::new();
-    let shims = repo.0.join("shims");
-    std::fs::create_dir(&shims).unwrap();
-    let real_git = repo.git(&["--exec-path"]);
-    let real_git = Path::new(real_git.trim()).join("git");
-    let real_git = if real_git.is_file() {
-        real_git
-    } else {
-        PathBuf::from("/usr/bin/git")
-    };
-    let marker = shims.join("competed");
-    let script = format!("#!/bin/bash\nif [[ \"$*\" == *'update-ref --stdin'* && ! -e '{}' ]]; then\n  touch '{}'\n  '{}' issue new Competitor || exit $?\nfi\nexec '{}' \"$@\"\n", marker.display(), marker.display(), env!("CARGO_BIN_EXE_git-forge"), real_git.display());
-    let shim = shims.join("git");
-    std::fs::write(&shim, script).unwrap();
-    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-    let output = Command::new(env!("CARGO_BIN_EXE_git-forge"))
-        .args(["issue", "new", "Requested", "--json"])
-        .current_dir(&repo.0)
-        .env(
-            "PATH",
-            format!("{}:{}", shims.display(), std::env::var("PATH").unwrap()),
-        )
-        .env("GIT_CONFIG_GLOBAL", "/dev/null")
-        .env("GIT_CONFIG_NOSYSTEM", "1")
-        .env_remove("GIT_FORGE_ROLE")
-        .output()
-        .unwrap();
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(marker.exists(), "the competing allocation must execute");
-    let store = EventStore::open(&repo.0).unwrap();
-    assert_eq!(store.counter_next().unwrap(), 3);
-    assert_eq!(
-        git_forge::event::fold(&store.read_chain(&issue_ref(1)).unwrap())
-            .issue
-            .title
-            .as_deref(),
-        Some("Competitor")
-    );
-    assert_eq!(
-        git_forge::event::fold(&store.read_chain(&issue_ref(2)).unwrap())
-            .issue
-            .title
-            .as_deref(),
-        Some("Requested")
-    );
+    for initialized in [false, true] {
+        let repo = Repo::new();
+        if initialized {
+            repo.ok(&["issue", "new", "Initial"]);
+        }
+        let expected_counter = if initialized {
+            repo.git(&["rev-parse", "refs/forge/meta/counter"])
+                .trim()
+                .to_owned()
+        } else {
+            String::new()
+        };
+        let shims = repo.0.join("shims");
+        std::fs::create_dir(&shims).unwrap();
+        let real_git = repo.git(&["--exec-path"]);
+        let real_git = Path::new(real_git.trim()).join("git");
+        let real_git = if real_git.is_file() {
+            real_git
+        } else {
+            PathBuf::from("/usr/bin/git")
+        };
+        let marker = shims.join("competed");
+        let rejection = shims.join("rejection");
+        let script = format!("#!/bin/bash\nif [[ \"$*\" == *'update-ref --stdin'* && ! -e '{}' ]]; then\n  touch '{}'\n  '{}' issue new Competitor || exit $?\n  '{}' \"$@\" 2>'{}'\n  code=$?\n  cat '{}' >&2\n  exit $code\nfi\nexec '{}' \"$@\"\n", marker.display(), marker.display(), env!("CARGO_BIN_EXE_git-forge"), real_git.display(), rejection.display(), rejection.display(), real_git.display());
+        let shim = shims.join("git");
+        std::fs::write(&shim, script).unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let output = Command::new(env!("CARGO_BIN_EXE_git-forge"))
+            .args(["issue", "new", "Requested", "--json"])
+            .current_dir(&repo.0)
+            .env(
+                "PATH",
+                format!("{}:{}", shims.display(), std::env::var("PATH").unwrap()),
+            )
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env_remove("GIT_FORGE_ROLE")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(marker.exists(), "the competing allocation must execute");
+        let diagnostic = std::fs::read_to_string(&rejection).unwrap();
+        if initialized {
+            assert!(
+                diagnostic.contains("cannot lock ref 'refs/forge/meta/counter': is at "),
+                "{diagnostic}"
+            );
+            assert!(
+                diagnostic.contains(&format!(" but expected {expected_counter}")),
+                "{diagnostic}"
+            );
+        } else {
+            assert!(
+                diagnostic.contains("reference already exists"),
+                "{diagnostic}"
+            );
+        }
+        let competitor = if initialized { 2 } else { 1 };
+        let store = EventStore::open(&repo.0).unwrap();
+        assert_eq!(store.counter_next().unwrap(), competitor + 2);
+        assert_eq!(
+            git_forge::event::fold(&store.read_chain(&issue_ref(competitor)).unwrap())
+                .issue
+                .title
+                .as_deref(),
+            Some("Competitor")
+        );
+        assert_eq!(
+            git_forge::event::fold(&store.read_chain(&issue_ref(competitor + 1)).unwrap())
+                .issue
+                .title
+                .as_deref(),
+            Some("Requested")
+        );
+    }
 }
 
 #[test]

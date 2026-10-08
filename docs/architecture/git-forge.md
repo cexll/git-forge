@@ -288,6 +288,14 @@ in that transaction; without allocations the observed counter is still verified.
 The counter also protects against concurrent allocations introducing graph
 members after the snapshot. An absent counter is verified as absent.
 
+Snapshot reads bracket Issue ref enumeration and folding with counter-tip reads.
+A moved counter discards the entire read and starts a fresh snapshot, bounded
+by the same three-attempt allocation limit. Exhaustion returns `CasConflict`;
+`issue new` retries it within its allocation loop, while `issue apply` reports
+the conflict. A stable counter pointing at an existing Issue ref remains an
+error, not a retryable conflict. Existing Issue tip changes remain protected
+by publication CAS; the snapshot read does not lock the graph.
+
 A moved dependency, changed Issue tip, counter conflict or occupied new ref
 fails the entire transaction: no partial Issue refs or counter advancement.
 Prepared immutable git objects may exist, but are not published forge state.

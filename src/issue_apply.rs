@@ -348,7 +348,11 @@ pub(crate) fn new_issue(
         return Err("issue new: blocked_by: duplicate issue".into());
     }
     for _ in 0..crate::store::MAX_ALLOC_RETRIES {
-        let snapshot = store.store().issue_snapshot().map_err(|e| e.to_string())?;
+        let snapshot = match store.store().issue_snapshot() {
+            Ok(snapshot) => snapshot,
+            Err(crate::store::StoreError::CasConflict) => continue,
+            Err(error) => return Err(error.to_string()),
+        };
         let id = snapshot.next;
         if snapshot.tips.contains_key(&id) {
             return Err("issue new: counter collides with an existing issue ref".into());
