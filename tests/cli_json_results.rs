@@ -454,3 +454,158 @@ fn json_with_help_is_a_usage_error_for_every_json_command() {
     );
     assert_eq!(created["title"], "--help");
 }
+
+/// Names of every ref under `refs/forge` plus the branch heads, so two
+/// repositories with the same history compare equal regardless of commit ids.
+fn ref_names(repo: &Repo) -> String {
+    repo.git(&[
+        "for-each-ref",
+        "--format=%(refname)",
+        "refs/forge",
+        "refs/heads",
+    ])
+}
+
+/// A `-h`/`--help` token consumed as the value of a value-taking option is
+/// data, not a help request: under `--json` the command behaves exactly as
+/// without it (same exit status, same failure message, same refs written).
+/// The run without `--json` keeps the pre-JSON behavior, so it is the oracle.
+#[test]
+fn help_tokens_consumed_as_option_values_are_data_under_json() {
+    type Setup = fn(&Repo);
+    let none: Setup = |_| {};
+    let pr: Setup = |repo| repo.pr();
+    let cases: &[(Setup, &[&str])] = &[
+        (none, &["issue", "new", "t", "--label", "--help"]),
+        (none, &["issue", "new", "t", "-l", "-h"]),
+        (none, &["issue", "new", "t", "--parent", "--help"]),
+        (none, &["issue", "new", "t", "--blocked-by", "-h"]),
+        (none, &["issue", "list", "--parent", "--help"]),
+        (none, &["issue", "list", "--state", "-h"]),
+        (
+            pr,
+            &[
+                "pr", "create", "--source", "feature", "--base", "main", "t", "--body", "--help",
+            ],
+        ),
+        (
+            pr,
+            &[
+                "pr", "create", "--source", "feature", "--base", "main", "t", "--label", "-h",
+            ],
+        ),
+        (
+            pr,
+            &[
+                "pr", "create", "--source", "feature", "--base", "main", "t", "--closes", "--help",
+            ],
+        ),
+        (
+            pr,
+            &["pr", "create", "--source", "--help", "--base", "main", "t"],
+        ),
+        (
+            pr,
+            &["pr", "create", "--source", "feature", "--base", "-h", "t"],
+        ),
+        (
+            pr,
+            &[
+                "pr",
+                "review",
+                "1",
+                "--approve",
+                "--file",
+                "--help",
+                "--line",
+                "1",
+                "--commit",
+                "main",
+            ],
+        ),
+        (
+            pr,
+            &[
+                "pr",
+                "review",
+                "1",
+                "--approve",
+                "--file",
+                "f",
+                "--line",
+                "-h",
+                "--commit",
+                "main",
+            ],
+        ),
+        (
+            pr,
+            &[
+                "pr",
+                "review",
+                "1",
+                "--approve",
+                "--file",
+                "f",
+                "--line",
+                "1",
+                "--commit",
+                "--help",
+            ],
+        ),
+        (pr, &["pr", "abandon", "1", "--reason", "--help"]),
+        (pr, &["pr", "abandon", "1", "--reason", "-h"]),
+        (pr, &["pr", "merge", "1", "--recycle-worktree", "--help"]),
+    ];
+    for (setup, args) in cases {
+        let plain_repo = Repo::new();
+        setup(&plain_repo);
+        let plain = plain_repo.run(args);
+        let json_repo = Repo::new();
+        setup(&json_repo);
+        let mut json_args = args[..2].to_vec();
+        json_args.push("--json");
+        json_args.extend(&args[2..]);
+        let json = json_repo.run(&json_args);
+        assert_eq!(json.status.code(), plain.status.code(), "{json_args:?}");
+        let stdout = String::from_utf8(json.stdout).unwrap();
+        let document: serde_json::Value = serde_json::from_str(&stdout)
+            .unwrap_or_else(|e| panic!("{json_args:?}: {e}: {stdout}"));
+        if plain.status.success() {
+            assert!(document.get("error").is_none(), "{json_args:?}: {stdout}");
+        } else {
+            assert_eq!(json.stderr, plain.stderr, "{json_args:?}");
+            let message = String::from_utf8_lossy(&plain.stderr);
+            assert_eq!(
+                document["error"]["message"]
+                    .as_str()
+                    .map(|m| format!("git-forge: {m}\n")),
+                Some(message.into_owned()),
+                "{json_args:?}"
+            );
+        }
+        assert_eq!(
+            ref_names(&json_repo),
+            ref_names(&plain_repo),
+            "{json_args:?}"
+        );
+    }
+    // The reported regression: the label value `--help` is recorded.
+    let repo = Repo::new();
+    let created: serde_json::Value =
+        serde_json::from_str(&repo.ok(&["issue", "new", "title", "--json", "--label", "--help"]))
+            .unwrap();
+    assert_eq!(created["labels"], serde_json::json!(["--help"]));
+    // `pr prepare` treats any help token as help without `--json`; under
+    // `--json`, `--strategy --help` is a strategy value and is rejected as one.
+    let repo = Repo::new();
+    repo.pr();
+    let before = ref_names(&repo);
+    let output = repo.run(&["pr", "prepare", "1", "--json", "--strategy", "--help"]);
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        "git-forge: unknown strategy '--help'; use --strategy merge|squash|rebase|ff\n"
+    );
+    assert_eq!(ref_names(&repo), before);
+}

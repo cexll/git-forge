@@ -7,8 +7,8 @@
 use crate::cli_error::CliError;
 
 use crate::cli::{
-    body_obj, help_requested, json_str, open_store, parse_entity_id, sanitize_terminal,
-    store_has_ref,
+    body_obj, help_requested, help_result, json_flag, json_str, open_store, parse_entity_id,
+    sanitize_terminal, store_has_ref,
 };
 use crate::event::{Event, EventKind, JsonValue};
 use crate::identity::open_mutation_store;
@@ -266,7 +266,7 @@ fn cmd_comment(args: &[String]) -> Result<String, CliError> {
     );
     let event = store.append_event(&r, &ev).map_err(CliError::from)?;
     if json {
-        let chain = store.store().read_chain(&r).map_err(CliError::from)?;
+        let chain = store.read_chain_at(event).map_err(CliError::from)?;
         let state = machine::issue_state_name(&crate::event::fold(&chain).issue);
         return Ok(machine::event_result_json(id, state, &event.to_string()));
     }
@@ -319,9 +319,10 @@ pub fn run_issue(argv: &[String]) -> Result<String, CliError> {
     let sub = argv.first().map(|s| s.as_str()).unwrap_or("");
     // Subcommand-level `-h`/`--help` is answered HERE, before any store open,
     // so help works outside a git repository (same as the namespace helps).
+    let json = json_flag(argv);
     if help_requested(argv.get(1..).unwrap_or(&[])) {
         if let Some(usage) = issue_sub_usage(sub) {
-            return Ok(usage.into());
+            return help_result(json, &argv[1], usage.into());
         }
     }
     match sub {
@@ -341,7 +342,7 @@ pub fn run_issue(argv: &[String]) -> Result<String, CliError> {
             };
             cmd_state(kind, &argv[1..])
         }
-        "help" | "-h" | "--help" => Ok(issue_help()),
+        "help" | "-h" | "--help" => help_result(json, sub, issue_help()),
         "" => Ok(issue_help()),
         other => Err(CliError::usage(
             format!("unknown issue subcommand '{other}'"),

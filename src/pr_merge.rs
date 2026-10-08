@@ -188,7 +188,7 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
                 // #4: unlocks ONLY the dirty-source-worktree recycle refusal.
                 force = true;
             }
-            "-h" | "--help" => return Ok(pr_merge_help()),
+            h @ ("-h" | "--help") => return crate::cli::help_result(json, h, pr_merge_help()),
             s if s.starts_with('-') => {
                 return Err(CliError::usage(format!("unknown option '{s}'"), s))
             }

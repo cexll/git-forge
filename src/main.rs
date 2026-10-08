@@ -14,15 +14,11 @@ fn main() -> ExitCode {
         })
         .unwrap_or(false);
 
-    // `--json` with a help request is refused before any dispatch (help has
-    // no JSON result).
-    let result = git_forge::machine::reject_json_help(&argv).and_then(|()| {
-        if invoked_as_wrapper {
-            run_wrapper(&argv)
-        } else {
-            run_forge(&argv)
-        }
-    });
+    let result = if invoked_as_wrapper {
+        run_wrapper(&argv)
+    } else {
+        run_forge(&argv)
+    };
 
     match result {
         Ok(out) => {
@@ -42,6 +38,8 @@ fn main() -> ExitCode {
 }
 
 fn run_forge(argv: &[String]) -> Result<String, git_forge::cli_error::CliError> {
+    let json = argv.iter().any(|arg| arg == "--json");
+    let help = |token: &str| git_forge::cli::help_result(json, token, top_help());
     match argv.first().map(|s| s.as_str()) {
         // `git forge issue ...` → git runs `git-forge` with argv = ["issue", ...]
         Some("issue") => git_forge::issue::run_issue(&argv[1..]),
@@ -58,7 +56,7 @@ fn run_forge(argv: &[String]) -> Result<String, git_forge::cli_error::CliError> 
             Some("pr") => git_forge::cli::run_pr(&argv[2..]),
             Some("ci") => git_forge::cli::run_ci(&argv[2..]),
             Some("version") => git_forge::machine::cmd_version(&argv[2..]),
-            Some("help") | Some("-h") | Some("--help") => Ok(top_help()),
+            Some(token @ ("help" | "-h" | "--help")) => help(token),
             Some(other) => Err(git_forge::cli_error::CliError::new(
                 "E_USAGE",
                 format!("unknown forge subcommand '{other}'"),
@@ -69,7 +67,7 @@ fn run_forge(argv: &[String]) -> Result<String, git_forge::cli_error::CliError> 
             None => Ok(top_help()),
         },
         // `git-forge --help` (verify-cli contract): exit 0 with usage.
-        Some("help") | Some("-h") | Some("--help") => Ok(top_help()),
+        Some(token @ ("help" | "-h" | "--help")) => help(token),
         Some(other) => Err(git_forge::cli_error::CliError::new(
             "E_USAGE",
             format!("unknown command '{other}'"),

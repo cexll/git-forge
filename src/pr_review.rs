@@ -32,7 +32,7 @@ pub(crate) fn cmd_pr_review(args: &[String]) -> Result<String, CliError> {
             "--file" => file = Some(next_arg(&mut i, "--file requires a path")?),
             "--line" => line = Some(next_arg(&mut i, "--line requires a number")?),
             "--commit" => commit = Some(next_arg(&mut i, "--commit requires a hash")?),
-            "-h" | "--help" => return Ok(USAGE.into()),
+            h @ ("-h" | "--help") => return crate::cli::help_result(json, h, USAGE.into()),
             a if a.starts_with('-') => {
                 return Err(CliError::usage(format!("unknown option '{a}'"), a))
             }

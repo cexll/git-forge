@@ -225,9 +225,10 @@ form prints. Unlike `pr show`, `base` here is a commit, not a branch name.
 ```
 
 Help has no JSON result. A help request combined with `--json` exits 1 with
-`E_USAGE` before any command runs. A help request is a `-h` or `--help` token
-before any `--` separator, or a `help` word in the subcommand position. Under
-`--json`, an option value that equals `-h` or `--help` is also refused.
+`E_USAGE` and writes nothing. A help request is a `-h` or `--help` token, or
+a `help` subcommand word, where the command's parser reads it as help. A
+`-h` or `--help` token that is the value of an option (for example
+`--label --help`) is data, with or without `--json`.
 
 A `pr merge --recycle-worktree` whose recycle step fails after the merge is
 already final still exits 1 with the merged line and the recycle failure in

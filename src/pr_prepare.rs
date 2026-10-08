@@ -33,6 +33,9 @@ fn prepare_arguments(args: &[String]) -> Result<(u64, String), CliError> {
                 }
                 strategy = Some(args[i].clone());
             }
+            // Reached only under `--json`: without it any help token already
+            // printed help before parsing.
+            h @ ("-h" | "--help") => return Err(crate::cli::json_help_refused(h)),
             s if s.starts_with('-') => {
                 return Err(CliError::usage(format!("unknown option '{s}'"), s))
             }
@@ -80,9 +83,13 @@ fn prepare_arguments(args: &[String]) -> Result<(u64, String), CliError> {
 /// contract surface.
 pub(crate) fn cmd_pr_prepare(args: &[String]) -> Result<String, CliError> {
     let (json, args) = crate::machine::json_requested(args);
-    if args
-        .iter()
-        .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
+    // Without `--json` any help token prints help (existing behavior). Under
+    // `--json` the parser below decides: a standalone help token is refused,
+    // and a `--strategy` value is validated as a strategy.
+    if !json
+        && args
+            .iter()
+            .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
     {
         return Ok(pr_prepare_help());
     }

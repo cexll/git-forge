@@ -339,6 +339,12 @@ impl EventStore {
         self.chain_events_from_tip(tip)
     }
 
+    /// Read an event chain oldest→`tip`, where `tip` is an event commit (for
+    /// example the one `append_event` returned), ignoring later appends.
+    pub fn read_chain_at(&self, tip: Oid) -> Result<Vec<Event>, StoreError> {
+        self.chain_events_from_tip(tip)
+    }
+
     /// Pure comparison of the snapshot refs against an AUTHORITATIVE
     /// `pr.created` state (the caller MUST have obtained it from an anchored
     /// read). The merge gate passes its ALREADY-ANCHORED gate state here, so a
@@ -559,6 +565,10 @@ impl BoundEventStore {
     /// Read a single entity event chain (delegation to the read surface).
     pub fn read_chain(&self, entity_ref: &str) -> Result<Vec<Event>, StoreError> {
         self.inner.read_chain(entity_ref)
+    }
+    /// Read an event chain as of one event commit (delegation to the read surface).
+    pub fn read_chain_at(&self, tip: Oid) -> Result<Vec<Event>, StoreError> {
+        self.inner.read_chain_at(tip)
     }
     /// Read the counter next value (delegation to the read surface).
     pub fn counter_next(&self) -> Result<u64, StoreError> {

@@ -1328,3 +1328,42 @@ fn concurrent_create_pr_retries_and_yields_distinct_ids() {
     };
     assert_ne!(id1, id2, "distinct ids from a concurrent race");
 }
+
+/// A mutation's result folds the chain as of its own appended event: a later
+/// append (here a close after a comment) does not change what
+/// `read_chain_at(<comment commit>)` returns. This is the seam the comment
+/// commands' `--json` state uses; a CLI race would not be deterministic.
+#[test]
+fn read_chain_at_folds_the_chain_as_of_the_given_event() {
+    let dir = tmpdir("chain-at");
+    let store = bound(&dir);
+    let id = store.allocate_id().unwrap();
+    let r = issue_ref(id);
+    let created = event(
+        EventKind::IssueCreated,
+        "issue",
+        id,
+        "a@x",
+        &[("title", JsonValue::String("T".into()))],
+    );
+    let comment = event(
+        EventKind::IssueComment,
+        "issue",
+        id,
+        "a@x",
+        &[("body", JsonValue::String("hello".into()))],
+    );
+    let close = event(EventKind::IssueClose, "issue", id, "b@x", &[]);
+    store.append_event(&r, &created).unwrap();
+    let comment_commit = store.append_event(&r, &comment).unwrap();
+    store.append_event(&r, &close).unwrap();
+    let at_comment = store.read_chain_at(comment_commit).unwrap();
+    assert_eq!(at_comment.len(), 2);
+    assert_eq!(at_comment[1].id, comment.id);
+    assert!(git_forge::event::fold(&at_comment).issue.open);
+    assert!(
+        !git_forge::event::fold(&store.read_chain(&r).unwrap())
+            .issue
+            .open
+    );
+}

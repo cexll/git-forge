@@ -47,31 +47,6 @@ pub(crate) fn json_requested(args: &[String]) -> (bool, Vec<String>) {
     (json, rest)
 }
 
-/// Refuse a help request combined with a bare `--json` token before any
-/// command runs: help has no JSON result, so printing it would break the rule
-/// that a successful `--json` command prints one JSON document. A help request
-/// is a `-h`/`--help` token before any `--` separator, or a `help` word in the
-/// subcommand position (after the leading `forge`/`issue`/`pr`/`ci` words).
-/// A literal option value equal to `-h`/`--help` is also refused under
-/// `--json`; after `--` it stays data.
-pub fn reject_json_help(argv: &[String]) -> Result<(), CliError> {
-    if !argv.iter().any(|arg| arg == "--json") {
-        return Ok(());
-    }
-    let options = || argv.iter().take_while(|arg| *arg != "--");
-    let help_flag = options().find(|arg| matches!(arg.as_str(), "-h" | "--help"));
-    let help_word = options()
-        .find(|arg| !matches!(arg.as_str(), "forge" | "issue" | "pr" | "ci"))
-        .filter(|arg| *arg == "help");
-    match help_flag.or(help_word) {
-        Some(help) => Err(CliError::usage(
-            "--json cannot be combined with a help request; help has no JSON result",
-            help.as_str(),
-        )),
-        None => Ok(()),
-    }
-}
-
 /// Reject any FLAG token among the leftovers of a command whose grammar
 /// takes no options: a usage error naming the flag (`--json=x` gets the
 /// bare-flag hint), exit-1, before any side effect (VAL-202). Positionals are
