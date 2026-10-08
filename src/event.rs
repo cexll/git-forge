@@ -440,6 +440,13 @@ fn str_field(body: &HashMap<String, JsonValue>, key: &str) -> Option<String> {
     body.get(key).and_then(JsonValue::as_str).map(String::from)
 }
 
+/// The `generation` body field, or `default` for events written without it.
+fn generation_field(body: &HashMap<String, JsonValue>, default: u64) -> u64 {
+    body.get("generation")
+        .and_then(JsonValue::as_u64)
+        .unwrap_or(default)
+}
+
 impl PrState {
     fn apply(&mut self, event: &Event) {
         match event.kind {
@@ -468,11 +475,7 @@ impl PrState {
                     // generation current at review time; events without the
                     // field (pre-#1 chains) bind the generation current in
                     // the fold, which keeps legacy gen-0 chains valid.
-                    self.decision_generation = event
-                        .body
-                        .get("generation")
-                        .and_then(JsonValue::as_u64)
-                        .unwrap_or(self.generation);
+                    self.decision_generation = generation_field(&event.body, self.generation);
                     // #2 result-bound review: the decision binds the live
                     // base-branch tip it was taken against; events without
                     // the field (pre-#2 chains) fold as None and only the
@@ -505,11 +508,7 @@ impl PrState {
                 self.source_head = str_field(&event.body, "new_source_head");
                 self.base_head = str_field(&event.body, "new_base_head");
                 self.merge_base = str_field(&event.body, "new_merge_base");
-                self.generation = event
-                    .body
-                    .get("generation")
-                    .and_then(JsonValue::as_u64)
-                    .unwrap_or(self.generation + 1);
+                self.generation = generation_field(&event.body, self.generation + 1);
             }
             EventKind::PrPrepared => {
                 // Last-wins: the latest `pr.prepared` event is the PR's
@@ -517,11 +516,7 @@ impl PrState {
                 // bumps the generation so the gate sees the candidate as
                 // stale (its prepared_generation no longer matches).
                 self.prepared = Some(PreparedCandidate {
-                    generation: event
-                        .body
-                        .get("generation")
-                        .and_then(JsonValue::as_u64)
-                        .unwrap_or(self.generation),
+                    generation: generation_field(&event.body, self.generation),
                     source_head: str_field(&event.body, "source_head").unwrap_or_default(),
                     base_head: str_field(&event.body, "base_head").unwrap_or_default(),
                     strategy: str_field(&event.body, "strategy").unwrap_or_default(),
@@ -539,11 +534,7 @@ impl PrState {
                 self.ci_actor = Some(event.actor.clone());
                 self.ci_ts = Some(event.ts.clone());
                 // Generation binding (same default rule as PrReview).
-                self.ci_generation = event
-                    .body
-                    .get("generation")
-                    .and_then(JsonValue::as_u64)
-                    .unwrap_or(self.generation);
+                self.ci_generation = generation_field(&event.body, self.generation);
                 // #2 result-bound CI: the Check binds the live base-branch
                 // tip it ran against (same None default as PrReview).
                 self.ci_base_head = str_field(&event.body, "base_head");
