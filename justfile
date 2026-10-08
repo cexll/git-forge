@@ -97,7 +97,7 @@ test *args:
 unit:
     @if [ -f Cargo.toml ]; then cargo test --lib; else echo "unit: no Cargo.toml yet — lands with devflow t0"; fi
 
-# Real enforced e2e gate (F-008): `just e2e` runs `dogfood-all` — BOTH 45/45
+# Real enforced e2e gate (F-008): `just e2e` runs `dogfood-all` — BOTH 141/141
 # dogfood oracles on disposable clones: the master-default oracle
 # (scripts/gf-dogfood.sh) and the owned main-default regression
 # (scripts/gf-dogfood-main-default.sh). Supersedes the previous stub target
@@ -105,21 +105,21 @@ unit:
 # `just check` (fast path).
 e2e: dogfood-all
 
-# Full 45-check dogfood e2e (scripts/gf-dogfood.sh). Self-contained:
+# Full 141-check dogfood e2e (scripts/gf-dogfood.sh). Self-contained:
 # builds/refreshes the release binary from THIS checkout (never a stale one)
 # into a controlled temp --target-dir (immune to CARGO_TARGET_DIR / cargo
 # target-dir config; no git-visible target/ left in the checkout), preflights
 # GDOGFOOD_SRC (env, default dsh-deepwork: existing dir, git repo, PLAN.md
-# present), clones it into a mktemp -d disposable area, runs the 45 checks from
-# a non-base checkout, and exits 0 iff the dogfood summary reports pass=45
+# present), clones it into a mktemp -d disposable area, runs the 141 checks from
+# a non-base checkout, and exits 0 iff the dogfood summary reports pass=141
 # fail=0. Temp dirs are trap-cleaned on exit.
 dogfood:
     bash scripts/gf-dogfood.sh
 
-# Owned F-033 regression: the same 45-check dogfood flow against a MAIN-default
+# Owned F-033 regression: the same 141-check dogfood flow against a MAIN-default
 # source (scripts/gf-dogfood-main-default.sh builds a throwaway `git init -b
 # main` repo with PLAN.md, exports GDOGFOOD_SRC at it, and runs the FULL real
-# scripts/gf-dogfood.sh, asserting the summary reports pass=45 fail=0). RED
+# scripts/gf-dogfood.sh, asserting the summary reports pass=141 fail=0). RED
 # against a gf-dogfood.sh that hardcodes master; GREEN after the fix.
 dogfood-main-default:
     bash scripts/gf-dogfood-main-default.sh
