@@ -19,7 +19,7 @@ use git2::{Commit, Error as GitError, Oid, Repository, Signature, TreeBuilder, T
 
 use crate::event::{Event, EventKind, JsonValue};
 mod issue_batch;
-pub(crate) use issue_batch::IssueSnapshot;
+pub(crate) use issue_batch::{expected_value_rejected, IssueSnapshot};
 
 /// The single mutable counter ref holding the next sequential id.
 pub const COUNTER_REF: &str = "refs/forge/meta/counter";

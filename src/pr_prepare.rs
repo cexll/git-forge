@@ -79,13 +79,14 @@ fn prepare_arguments(args: &[String]) -> Result<(u64, String), CliError> {
 /// stdout line and `pr show`'s additive `prepared:` line are the adapter
 /// contract surface.
 pub(crate) fn cmd_pr_prepare(args: &[String]) -> Result<String, CliError> {
+    let (_, args) = crate::machine::json_requested(args);
     if args
         .iter()
         .any(|arg| matches!(arg.as_str(), "-h" | "--help"))
     {
         return Ok(pr_prepare_help());
     }
-    let (id, strategy) = prepare_arguments(args)?;
+    let (id, strategy) = prepare_arguments(&args)?;
     // Read-only path first: existence and terminality resolve nothing and
     // write nothing.
     let store = open_read_store()?;
@@ -243,7 +244,9 @@ struct MaterializeInputs<'a> {
 /// base tip, or the source snapshot for rebase); returns (result_commit,
 /// result_tree) and cleans up the worktree. Errors carry the user-facing
 /// message with the worktree already removed best-effort.
-fn materialize_candidate(inputs: MaterializeInputs<'_>) -> Result<(git2::Oid, git2::Oid), String> {
+fn materialize_candidate(
+    inputs: MaterializeInputs<'_>,
+) -> Result<(git2::Oid, git2::Oid), CliError> {
     let MaterializeInputs {
         store,
         repo_dir,
@@ -310,7 +313,7 @@ fn materialize_candidate(inputs: MaterializeInputs<'_>) -> Result<(git2::Oid, gi
     };
     if !ok_wt {
         release_lock(&mut lock_handle, &tmp);
-        return Err(format!("failed to create temporary worktree: {err_wt}"));
+        return Err(format!("failed to create temporary worktree: {err_wt}").into());
     }
     // Execute the strategy in the worktree; result_commit = worktree HEAD.
     let exec = crate::git::execute_strategy(
@@ -326,7 +329,17 @@ fn materialize_candidate(inputs: MaterializeInputs<'_>) -> Result<(git2::Oid, gi
         Ok(o) => o,
         Err(e) => {
             release_lock(&mut lock_handle, &tmp);
-            return Err(e);
+            return Err(if e.conflict {
+                CliError::new(
+                    "E_PREPARE_CONFLICT",
+                    e.message,
+                    id.to_string(),
+                    "Inspect the repository and the reported failure before retrying.",
+                    false,
+                )
+            } else {
+                CliError::from(e.message)
+            });
         }
     };
     let result_commit = result_commit.parse::<git2::Oid>().map_err(|_| {
@@ -358,16 +371,18 @@ fn materialize_candidate(inputs: MaterializeInputs<'_>) -> Result<(git2::Oid, gi
     if let Err(err_rm) = crate::git::worktree_remove(repo_dir, &tmp) {
         let _ = std::fs::remove_file(tmp.with_extension("lock"));
         return Err(format!(
-                "strategy executed but temp worktree removal failed: {err_rm}                  (worktree left at {})",
-                tmp.display()
-            ));
+            "strategy executed but temp worktree removal failed: {err_rm}                  (worktree left at {})",
+            tmp.display()
+        )
+        .into());
     }
     if tmp.exists() {
         let _ = std::fs::remove_file(tmp.with_extension("lock"));
         return Err(format!(
             "strategy executed but temp worktree directory still exists at {}",
             tmp.display()
-        ));
+        )
+        .into());
     }
     release_lock(&mut lock_handle, &tmp);
     Ok((result_commit, result_tree))
@@ -394,33 +409,42 @@ pub(crate) fn validate_prepared_candidate(
     base_ref: &str,
     current_base: Oid,
     strategy: &str,
-) -> Result<(), String> {
+) -> Result<(), CliError> {
+    let gate_error = |message: String| {
+        CliError::new(
+            "E_GATE",
+            message,
+            id.to_string(),
+            "Inspect PR review and CI state and satisfy the reported merge gate.",
+            false,
+        )
+    };
     if candidate.generation != state.generation {
-        return Err(format!(
+        return Err(gate_error(format!(
             "PR #{id} prepared candidate is stale (prepared on generation {}, current \
              snapshot generation {}); re-run `git forge pr prepare {id} --strategy \
              {strategy}`, then `git forge ci run {id}` and `git forge pr review {id} \
              --approve`, then merge",
             candidate.generation, state.generation
-        ));
+        )));
     }
     if candidate.base_head != current_base.to_string() {
-        return Err(format!(
+        return Err(gate_error(format!(
             "PR #{id} prepared candidate is stale (built against base tip {}, current \
              base tip of '{base_ref}' is {current_base}); re-run `git forge pr prepare \
              {id} --strategy {strategy}`, then `git forge ci run {id}` and `git forge pr \
              review {id} --approve`, then merge",
             candidate.base_head
-        ));
+        )));
     }
     if candidate.strategy != strategy {
-        return Err(format!(
+        return Err(gate_error(format!(
             "PR #{id} prepared candidate is for strategy '{candidate_strategy}' but the \
              merge requested '{strategy}'; re-run `git forge pr prepare {id} --strategy \
              {strategy}`, then `git forge ci run {id}` and `git forge pr review {id} \
              --approve`, then merge",
             candidate_strategy = candidate.strategy
-        ));
+        )));
     }
     // Approve bound to the candidate (issue #2: a review decision must bind
     // the result being merged). A legacy approve (no candidate identity) or
@@ -429,12 +453,12 @@ pub(crate) fn validate_prepared_candidate(
         || state.decision_result_commit.as_deref() != Some(candidate.result_commit.as_str())
         || state.decision_result_tree.as_deref() != Some(candidate.result_tree.as_str())
     {
-        return Err(format!(
+        return Err(gate_error(format!(
             "PR #{id} approve is not bound to the prepared candidate (generation {}, \
              base {}, result {}); re-approve after re-running the candidate CI: \
              `git forge pr review {id} --approve`, then merge",
             candidate.generation, candidate.base_head, candidate.result_commit
-        ));
+        )));
     }
     // Latest CI Check success AND bound to this candidate.
     match state.ci_status.as_deref() {
@@ -443,23 +467,23 @@ pub(crate) fn validate_prepared_candidate(
                 && state.ci_result_commit.as_deref() == Some(candidate.result_commit.as_str())
                 && state.ci_result_tree.as_deref() == Some(candidate.result_tree.as_str()) => {}
         Some("success") => {
-            return Err(format!(
+            return Err(gate_error(format!(
                 "PR #{id} is not mergeable: latest CI Check is valid but not bound to \
                  the prepared candidate (generation {}, base {}, result {}); run \
                  `git forge ci run {id}` against the candidate, then merge",
                 candidate.generation, candidate.base_head, candidate.result_commit
-            ));
+            )));
         }
         Some(status) => {
-            return Err(format!(
+            return Err(gate_error(format!(
                 "PR #{id} is not mergeable: latest CI Check is `{status}` (expected \
                  `success`); run `git forge ci run {id}`, then merge"
-            ));
+            )));
         }
         None => {
-            return Err(format!(
+            return Err(gate_error(format!(
                 "PR #{id} is not mergeable: no CI Check recorded; run `git forge ci run {id}`, then merge"
-            ));
+            )));
         }
     }
     Ok(())

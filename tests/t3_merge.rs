@@ -1664,6 +1664,145 @@ fn release_issue_barrier(dir: &Path) {
     let _ = f.write_all(b"go\n");
 }
 
+fn assert_finalize_json_error(
+    output: &std::process::Output,
+    code: &str,
+    message: &str,
+    input: &str,
+    retryable: bool,
+) {
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&output.stderr),
+        format!("git-forge: {message}\n")
+    );
+    let document: serde_json::Value = serde_json::from_slice(&output.stdout)
+        .expect("all stdout must be exactly one JSON document");
+    let hint = if retryable {
+        "Read the current state and retry the command."
+    } else {
+        "Inspect PR review and CI state and satisfy the reported merge gate."
+    };
+    assert_eq!(
+        document,
+        serde_json::json!({"error": {
+            "code": code,
+            "message": message,
+            "input": input,
+            "hint": hint,
+            "retryable": retryable
+        }})
+    );
+}
+
+#[test]
+fn finalize_retry_gate_refusal_preserves_json_classification() {
+    let dir = tmpdir("finalize-retry-gate");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "retry gate PR");
+    checkout(&dir, "feature");
+    let barrier = tmpdir("finalize-retry-gate-window");
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_git-forge"))
+        .args(["forge", "pr", "merge", "1", "--json"])
+        .current_dir(&dir)
+        .env("GIT_FORGE_TEST_MERGE_BARRIER", &barrier)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !barrier.join("ready").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "merge never reached pending window"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(ref_oid(&dir, "refs/forge/prs/1/result").is_some());
+    let (code, _, stderr) = forge(&dir, &["forge", "pr", "review", "1", "--reject"]);
+    assert_eq!(code, 0, "concurrent reject failed: {stderr}");
+    let head_after_reject = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+    release_issue_barrier(&barrier);
+    let output = child.wait_with_output().unwrap();
+    assert_finalize_json_error(
+        &output,
+        "E_GATE",
+        "PR #1 is not approved (effective decision: reject) (merge aborted: the PR head changed during finalization; refs unchanged)",
+        "1",
+        false,
+    );
+    assert_eq!(ref_oid(&dir, "refs/heads/main").unwrap(), base_before);
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/head").unwrap(),
+        head_after_reject
+    );
+    assert!(ref_oid(&dir, "refs/forge/prs/1/result").is_none());
+    assert_no_temp_worktree(&dir);
+}
+
+#[test]
+fn finalize_retry_candidate_change_preserves_gate_classification() {
+    let dir = tmpdir("finalize-candidate-change");
+    init_repo(&dir);
+    create_approved_pr(&dir, "feature", "candidate retry PR");
+    checkout(&dir, "feature");
+    for args in [
+        vec!["forge", "pr", "prepare", "1", "--strategy", "merge"],
+        vec!["forge", "ci", "run", "1"],
+        vec!["forge", "pr", "review", "1", "--approve"],
+    ] {
+        let (code, _, stderr) = forge(&dir, &args);
+        assert_eq!(code, 0, "initial candidate setup failed: {stderr}");
+    }
+    let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let candidate_before = ref_oid(&dir, "refs/forge/prs/1/result").unwrap();
+    let barrier = tmpdir("finalize-candidate-change-window");
+    let child = Command::new(env!("CARGO_BIN_EXE_git-forge"))
+        .args(["forge", "pr", "merge", "1", "--json"])
+        .current_dir(&dir)
+        .env("GIT_FORGE_TEST_MERGE_BARRIER", &barrier)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !barrier.join("ready").exists() {
+        assert!(
+            Instant::now() < deadline,
+            "merge never reached pending window"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    for args in [
+        vec!["forge", "pr", "prepare", "1", "--strategy", "squash"],
+        vec!["forge", "ci", "run", "1"],
+        vec!["forge", "pr", "review", "1", "--approve"],
+    ] {
+        let (code, _, stderr) = forge(&dir, &args);
+        assert_eq!(code, 0, "replacement candidate setup failed: {stderr}");
+    }
+    let candidate_after = ref_oid(&dir, "refs/forge/prs/1/result").unwrap();
+    assert_ne!(candidate_before, candidate_after);
+    let head_after = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+    release_issue_barrier(&barrier);
+    let output = child.wait_with_output().unwrap();
+    assert_finalize_json_error(
+        &output,
+        "E_GATE",
+        "merge execution finished but the PR candidate changed during finalization; re-run `git forge pr prepare 1`, then `git forge ci run 1` and `git forge pr review 1 --approve`, then merge; refs unchanged; pending result ref refs/forge/prs/1/result left in place",
+        "1",
+        false,
+    );
+    assert_eq!(ref_oid(&dir, "refs/heads/main").unwrap(), base_before);
+    assert_eq!(ref_oid(&dir, "refs/forge/prs/1/head").unwrap(), head_after);
+    assert_eq!(
+        ref_oid(&dir, "refs/forge/prs/1/result").unwrap(),
+        candidate_after
+    );
+    assert_no_temp_worktree(&dir);
+}
+
 #[test]
 fn merge_explicit_merge_flag_conflict_rejected() {
     // pr_merge.rs:24 — the `--merge` arm's duplicate-flag check. The existing
@@ -2272,8 +2411,8 @@ fn finalize_failure_after_barrier_leaves_refs_unchanged() {
     let head_before = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
 
     let bin = env!("CARGO_BIN_EXE_git-forge");
-    let mut child: Child = Command::new(bin)
-        .args(["forge", "pr", "merge", "1"])
+    let child: Child = Command::new(bin)
+        .args(["forge", "pr", "merge", "1", "--json"])
         .current_dir(&dir)
         .env("GIT_FORGE_TEST_MERGE_BARRIER", &barrier)
         .stdout(Stdio::piped())
@@ -2295,10 +2434,8 @@ fn finalize_failure_after_barrier_leaves_refs_unchanged() {
         base_before,
         "base must be unchanged while merge is pending"
     );
-    assert!(
-        ref_oid(&dir, "refs/forge/prs/1/result").is_some(),
-        "pending result ref must exist in barrier window"
-    );
+    let result_before = ref_oid(&dir, "refs/forge/prs/1/result")
+        .expect("pending result ref must exist in barrier window");
     // Sabotage the completion transaction: move the pending ref away from the
     // expected result commit, then release the barrier.
     let (c, _, e) = git(
@@ -2316,27 +2453,11 @@ fn finalize_failure_after_barrier_leaves_refs_unchanged() {
             .expect("release sentinel must be created atomically");
         let _ = f.write_all(b"go\n");
     }
-    let status = child.wait().unwrap();
-    assert!(
-        !status.success(),
-        "merge must fail when the final transaction cannot complete"
+    let output = child.wait_with_output().unwrap();
+    let expected = format!(
+        "merge execution finished but final transaction failed (git command failed: fatal: prepare: cannot lock ref 'refs/forge/prs/1/result': is at {base_before} but expected {result_before}); refs unchanged; pending result ref refs/forge/prs/1/result left in place"
     );
-    let mut stderr = String::new();
-    {
-        use std::io::Read as _;
-        if let Some(mut e) = child.stderr.take() {
-            let _ = e.read_to_string(&mut stderr);
-        }
-    }
-    assert!(
-        stderr.contains("merge execution finished but final transaction failed"),
-        "stderr: {stderr}"
-    );
-    assert!(stderr.contains("refs unchanged"), "stderr: {stderr}");
-    assert!(
-        stderr.contains("pending result ref refs/forge/prs/1/result left in place"),
-        "stderr: {stderr}"
-    );
+    assert_finalize_json_error(&output, "E_CONFLICT", &expected, "", true);
     assert_eq!(
         ref_oid(&dir, "refs/heads/main").unwrap(),
         base_before,
@@ -3315,7 +3436,7 @@ fn merge_issue_cas_exhaustion_keeps_issue_open() {
 
     let bin = env!("CARGO_BIN_EXE_git-forge");
     let child: Child = Command::new(bin)
-        .args(["forge", "pr", "merge", "2"])
+        .args(["forge", "pr", "merge", "2", "--json"])
         .current_dir(&dir)
         .env("GIT_FORGE_TEST_MERGE_ISSUE_BARRIER", &barrier)
         .stdout(Stdio::piped())
@@ -3326,26 +3447,24 @@ fn merge_issue_cas_exhaustion_keeps_issue_open() {
     // Initial attempt + 3 retries: move the issue inside EVERY window so the
     // first-transaction CAS loses each time and the retry budget exhausts.
     let deadline = Instant::now() + Duration::from_secs(30);
+    let mut issue_tip_before_last = String::new();
+    let mut issue_tip_after_last = String::new();
     for round in 0..4u32 {
         wait_issue_barrier_round(&barrier, round, deadline, "cas-exhaust");
+        issue_tip_before_last = ref_oid(&dir, "refs/forge/issues/1").unwrap();
         let (cm, _, em) = forge(
             &dir,
             &["forge", "issue", "comment", "1", &format!("move {round}")],
         );
         assert_eq!(cm, 0, "concurrent issue comment failed: {em}");
+        issue_tip_after_last = ref_oid(&dir, "refs/forge/issues/1").unwrap();
         release_issue_barrier(&barrier);
     }
     let output = child.wait_with_output().unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !output.status.success(),
-        "CAS exhaustion must fail the merge: {stderr}"
+    let expected = format!(
+        "merge execution finished but the merge inputs kept moving during finalization (git command failed: fatal: prepare: cannot lock ref 'refs/forge/issues/1': is at {issue_tip_after_last} but expected {issue_tip_before_last}); refs unchanged"
     );
-    assert!(
-        stderr.contains("kept moving during finalization"),
-        "stderr must name the exhausted retries: {stderr}"
-    );
-    assert!(stderr.contains("refs unchanged"), "stderr: {stderr}");
+    assert_finalize_json_error(&output, "E_CONFLICT", &expected, "", true);
     assert_eq!(
         ref_oid(&dir, "refs/heads/main").unwrap(),
         base_before,
@@ -3360,6 +3479,10 @@ fn merge_issue_cas_exhaustion_keeps_issue_open() {
     // The test's own comments moved the issue chain; the merge must not have
     // appended anything on top of the LAST comment tip (no close event).
     let tip_after_moves = ref_oid(&dir, "refs/forge/issues/1").unwrap();
+    assert_eq!(
+        tip_after_moves, issue_tip_after_last,
+        "merge must not move issue"
+    );
     assert_ne!(
         tip_after_moves, issue_before,
         "setup: comments must move the issue"
@@ -5542,9 +5665,10 @@ fn finalize_refuses_snapshot_change_during_pending_window() {
     checkout(&dir, "feature");
     let barrier = tmpdir("f003-window");
     let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+    let source_before = ref_oid(&dir, "refs/heads/feature").unwrap();
     let bin = env!("CARGO_BIN_EXE_git-forge");
     let child: Child = Command::new(bin)
-        .args(["forge", "pr", "merge", "1"])
+        .args(["forge", "pr", "merge", "1", "--json"])
         .current_dir(&dir)
         .env("GIT_FORGE_TEST_MERGE_BARRIER", &barrier)
         .stdout(Stdio::piped())
@@ -5561,6 +5685,7 @@ fn finalize_refuses_snapshot_change_during_pending_window() {
     }
     // While parked: fix round + pr update + fresh CI + fresh approve.
     fix_round_commit(&dir, "feature", "feature.txt", "feat\nfix\n");
+    let source_after = ref_oid(&dir, "refs/heads/feature").unwrap();
     checkout(&dir, "main");
     let (c, _, e) = forge(&dir, &["forge", "pr", "update", "1"]);
     assert_eq!(c, 0, "pr update failed: {e}");
@@ -5580,15 +5705,10 @@ fn finalize_refuses_snapshot_change_during_pending_window() {
         let _ = f.write_all(b"go\n");
     }
     let output = child.wait_with_output().unwrap();
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        !output.status.success(),
-        "a snapshot change during finalization must refuse the merge: {stderr}"
+    let expected = format!(
+        "merge execution finished but the PR snapshot changed during finalization (generation 0 -> 1, source {source_before} -> {source_after}); refs unchanged"
     );
-    assert!(
-        stderr.contains("snapshot changed during finalization"),
-        "refusal must name the snapshot change: {stderr}"
-    );
+    assert_finalize_json_error(&output, "E_GATE", &expected, "1", false);
     assert_eq!(
         ref_oid(&dir, "refs/heads/main").unwrap(),
         base_before,

@@ -11,3 +11,6 @@ libc = "0.2"
 [lib]
 name = "git_forge"
 path = "src/lib.rs"
+
+[dev-dependencies]
+serde_json = "1"

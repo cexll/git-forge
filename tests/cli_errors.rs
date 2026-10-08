@@ -52,19 +52,61 @@ fn assert_error(output: &Output, code: &str, message: &str, input: &str, retryab
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert_eq!(stdout.lines().count(), 1, "one JSON document: {stdout}");
-    assert!(
-        stdout.starts_with(&format!("{{\"error\":{{\"code\":\"{code}\",\"message\":")),
-        "{stdout}"
+    let document: serde_json::Value = serde_json::from_str(&stdout).expect("valid complete JSON");
+    let root = document.as_object().expect("object envelope");
+    assert_eq!(
+        root.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["error"]
     );
-    assert!(
-        stdout.contains(&format!("\"input\":\"{input}\"")),
-        "{stdout}"
+    let error = root["error"].as_object().expect("error object");
+    assert_eq!(
+        error.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["code", "hint", "input", "message", "retryable"]
     );
-    assert!(stdout.contains("\"hint\":\""), "{stdout}");
-    assert!(
-        stdout.ends_with(&format!("\"retryable\":{retryable}}}}}\n")),
-        "{stdout}"
+    for (key, expected) in [("code", code), ("message", message), ("input", input)] {
+        assert_eq!(error[key].as_str(), Some(expected), "{key}");
+    }
+    let hint = match code {
+        "E_USAGE" => "Run the command with --help and correct its arguments.",
+        "E_NOT_FOUND" => "List the existing entities or branches and use an existing identifier.",
+        "E_CONFLICT" => "Read the current state and retry the command.",
+        "E_CI_FAILED" => "Fix the CI plan and run CI again.",
+        "E_INVALID" => "Correct the input or repository state before retrying.",
+        _ => panic!("supply an independent expected hint for {code}"),
+    };
+    assert_eq!(error["hint"].as_str(), Some(hint));
+    assert_eq!(error["retryable"].as_bool(), Some(retryable));
+    assert_eq!(
+        error["message"].as_str().unwrap(),
+        String::from_utf8_lossy(&output.stderr)
+            .strip_prefix("git-forge: ")
+            .unwrap()
+            .strip_suffix('\n')
+            .unwrap()
     );
+}
+
+#[test]
+fn error_oracle_rejects_corrupted_cli_documents() {
+    let repo = Repo::new();
+    let message = "usage: git forge pr show <n> [--json]";
+    for (from, to) in [
+        (message, "wrong message"),
+        ("\"hint\":\"", "\"hint\":false,\"ignored\":\""),
+        ("\"input\":\"\"", "\"input\":\"\",\"extra\":1"),
+        ("\"retryable\":false", "\"retryable\":\"false\""),
+        ("\"hint\":", "\"hint\"::"),
+    ] {
+        let mut output = repo.run(&["pr", "show", "--json"]);
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stdout.contains(from));
+        output.stdout = stdout.replace(from, to).into_bytes();
+        assert!(
+            std::panic::catch_unwind(|| assert_error(&output, "E_USAGE", message, "", false))
+                .is_err(),
+            "oracle accepted corrupted CLI output: {to}"
+        );
+    }
 }
 
 #[test]
@@ -92,6 +134,111 @@ fn missing_pr_show_is_usage_in_text_and_json() {
     );
 }
 
+#[test]
+fn missing_pr_diff_is_usage_in_text_and_json() {
+    let repo = Repo::new();
+    let message = "usage: git forge pr diff <n> [--json]";
+    let plain = repo.run(&["pr", "diff"]);
+    assert_eq!(plain.status.code(), Some(1));
+    assert!(plain.stdout.is_empty());
+    assert_eq!(plain.stderr, format!("git-forge: {message}\n").as_bytes());
+    assert_error(
+        &repo.run(&["pr", "diff", "--json"]),
+        "E_USAGE",
+        message,
+        "",
+        false,
+    );
+}
+
+#[test]
+fn merge_json_reaches_missing_pr_boundary() {
+    let repo = Repo::new();
+    assert_error(
+        &repo.run(&["pr", "merge", "999", "--json"]),
+        "E_NOT_FOUND",
+        "PR #999 does not exist",
+        "999",
+        false,
+    );
+}
+
+#[test]
+fn missing_local_source_and_base_are_not_found() {
+    let repo = Repo::new();
+    for args in [
+        vec!["config", "user.name", "Test"],
+        vec!["config", "user.email", "test@example.com"],
+        vec!["commit", "--allow-empty", "-qm", "base"],
+        vec!["branch", "-M", "main"],
+    ] {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(&repo.0)
+            .status()
+            .unwrap()
+            .success());
+    }
+    for (source, base, missing) in [
+        ("missing", "main", "missing"),
+        ("main", "missing", "missing"),
+        ("refs/heads/missing", "main", "refs/heads/missing"),
+        ("main", "refs/heads/missing", "refs/heads/missing"),
+    ] {
+        let message = format!("'{missing}' is not a canonical local branch; use a plain branch name (tags, remote-tracking refs, OIDs, and revision expressions are rejected)");
+        assert_error(
+            &repo.run(&[
+                "pr", "create", "--source", source, "--base", base, "title", "--json",
+            ]),
+            "E_NOT_FOUND",
+            &message,
+            missing,
+            false,
+        );
+    }
+}
+
+#[test]
+fn invalid_role_reports_configured_input() {
+    let repo = Repo::new();
+    let output = Command::new(env!("CARGO_BIN_EXE_git-forge"))
+        .args(["issue", "new", "title", "--json"])
+        .current_dir(&repo.0)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_FORGE_ROLE", "bogus")
+        .output()
+        .unwrap();
+    assert_error(
+        &output,
+        "E_INVALID",
+        "unknown GIT_FORGE_ROLE 'bogus' (expected one of: worker, reviewer, orchestrator)",
+        "bogus",
+        false,
+    );
+    assert_eq!(repo.run(&["issue", "list", "--json"]).stdout, b"[]\n");
+}
+
+#[test]
+fn version_errors_identify_flag_and_positional() {
+    let repo = Repo::new();
+    for (input, message) in [
+        ("--bogus", "unknown option '--bogus'"),
+        ("unexpected", "unexpected argument 'unexpected'"),
+    ] {
+        let plain = repo.run(&["version", input]);
+        assert_eq!(plain.status.code(), Some(1));
+        assert!(plain.stdout.is_empty());
+        assert_eq!(plain.stderr, format!("git-forge: {message}\n").as_bytes());
+        assert_error(
+            &repo.run(&["version", input, "--json"]),
+            "E_USAGE",
+            message,
+            input,
+            false,
+        );
+    }
+}
 #[test]
 fn every_subcommand_handles_no_arguments() {
     let repo = Repo::new();
@@ -127,10 +274,7 @@ fn every_subcommand_handles_no_arguments() {
                 .strip_prefix("git-forge: ")
                 .unwrap()
                 .to_string();
-            let input = if matches!(
-                (namespace, sub),
-                ("pr", "review" | "update" | "prepare" | "merge" | "abandon")
-            ) {
+            let input = if matches!((namespace, sub), ("pr", "review" | "update" | "abandon")) {
                 "--json"
             } else {
                 ""
@@ -284,4 +428,54 @@ fn failed_ci_has_json_error_and_records_failed_check() {
     let show = repo.run(&["pr", "show", "1", "--json"]);
     assert!(show.status.success());
     assert!(String::from_utf8_lossy(&show.stdout).contains("\"status\":\"failed\""));
+}
+
+#[test]
+fn existing_hexadecimal_local_branch_remains_accepted() {
+    let repo = Repo::new();
+    let branch = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    for args in [
+        vec!["config", "user.name", "Test"],
+        vec!["config", "user.email", "test@example.com"],
+        vec!["commit", "--allow-empty", "-qm", "base"],
+        vec!["branch", "-M", "main"],
+        vec!["checkout", "-qb", branch],
+        vec!["commit", "--allow-empty", "-qm", "source"],
+    ] {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(&repo.0)
+            .status()
+            .unwrap()
+            .success());
+    }
+    for source in [branch.to_string(), format!("refs/heads/{branch}")] {
+        let output = repo.run(&[
+            "pr", "create", "--source", &source, "--base", "main", "title", "--json",
+        ]);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let object: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(object["source"].as_str(), Some(branch));
+    }
+}
+
+#[test]
+fn missing_leading_dash_branch_is_invalid() {
+    let repo = Repo::new();
+    for source in ["-bad", "refs/heads/-bad"] {
+        let message = format!("'{source}' is not a canonical local branch; use a plain branch name (tags, remote-tracking refs, OIDs, and revision expressions are rejected)");
+        assert_error(
+            &repo.run(&[
+                "pr", "create", "--source", source, "--base", "main", "title", "--json",
+            ]),
+            "E_INVALID",
+            &message,
+            "",
+            false,
+        );
+    }
 }

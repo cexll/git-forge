@@ -292,7 +292,7 @@ pub fn cmd_version(args: &[String]) -> Result<String, CliError> {
             } else {
                 format!("unexpected argument '{a}'")
             },
-            "",
+            a,
         ));
     }
     Ok(version_string())

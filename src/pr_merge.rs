@@ -108,6 +108,7 @@ pub(crate) fn cmd_pr_diff(store: &EventStore, args: &[String]) -> Result<String,
 // the sole lib/src function over the 150-line clippy::too_many_lines threshold.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String, CliError> {
+    let (_, args) = crate::machine::json_requested(args);
     let mut id_arg = None;
     let mut strategy: Option<&str> = None; // merge | squash | rebase
     let mut recycle: Option<String> = None;
@@ -288,14 +289,19 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
             strategy,
         )?;
     } else if moved {
-        return Err((format!(
-            "PR #{id} base branch '{base_ref}' has moved since the PR snapshot \
-             ({current_base} != snapshot {base_oid}); prepare the merge result \
-             first: run `git forge pr prepare {id} --strategy {strategy}`, then \
-             `git forge ci run {id}` and `git forge pr review {id} --approve`, \
-             then merge"
-        ))
-        .into());
+        return Err(CliError::new(
+            "E_GATE",
+            format!(
+                "PR #{id} base branch '{base_ref}' has moved since the PR snapshot \
+                 ({current_base} != snapshot {base_oid}); prepare the merge result \
+                 first: run `git forge pr prepare {id} --strategy {strategy}`, then \
+                 `git forge ci run {id}` and `git forge pr review {id} --approve`, \
+                 then merge"
+            ),
+            id.to_string(),
+            "Inspect PR review and CI state and satisfy the reported merge gate.",
+            false,
+        ));
     } else if state.prepared.is_some() {
         // A STALE prepared candidate (e.g. superseded by `pr update`) still
         // pins `refs/forge/prs/<n>/result`; the legacy path's
@@ -303,15 +309,20 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
         // the re-prepare remedy instead of a confusing mid-merge failure.
         // (A manually-created ref with no prepared event keeps the legacy
         // create-time refusal — that path is unchanged.)
-        return Err((format!(
-            "PR #{id} has a stale prepared candidate (prepared on generation {}, \
-             current snapshot generation {}); re-run `git forge pr prepare {id} \
-             --strategy {strategy}`, then `git forge ci run {id}` and `git forge pr \
-             review {id} --approve`, then merge",
-            state.prepared.as_ref().map(|c| c.generation).unwrap_or(0),
-            state.generation
-        ))
-        .into());
+        return Err(CliError::new(
+            "E_GATE",
+            format!(
+                "PR #{id} has a stale prepared candidate (prepared on generation {}, \
+                 current snapshot generation {}); re-run `git forge pr prepare {id} \
+                 --strategy {strategy}`, then `git forge ci run {id}` and `git forge pr \
+                 review {id} --approve`, then merge",
+                state.prepared.as_ref().map(|c| c.generation).unwrap_or(0),
+                state.generation
+            ),
+            id.to_string(),
+            "Inspect PR review and CI state and satisfy the reported merge gate.",
+            false,
+        ));
     }
 
     // Temporary worktree, detached at the immutable base OID. worktree
@@ -430,7 +441,7 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
             ))
             .into());
         }
-        return Ok(crate::merge_state::run_finalize(
+        return crate::merge_state::run_finalize(
             &store,
             crate::merge_state::MergeFinalizeSpec {
                 id,
@@ -450,7 +461,7 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
             },
             &mut no_lock,
             &prepared_tmp,
-        )?);
+        );
     }
 
     // Repo-specific temp worktree path: hash the canonical workdir so parallel
@@ -543,7 +554,8 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
         current_base,
         exec_merge_base,
         state.title.as_deref().unwrap_or(""),
-    )?;
+    )
+    .map_err(|error| CliError::from(error.message))?;
     let result_commit = result_commit.parse::<git2::Oid>().map_err(|_| {
         crate::git::cleanup_failed_worktree(
             &repo_dir,
@@ -692,7 +704,7 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
         }
         return Err((b).into());
     }
-    Ok(crate::merge_state::run_finalize(
+    crate::merge_state::run_finalize(
         &store,
         crate::merge_state::MergeFinalizeSpec {
             id,
@@ -716,7 +728,7 @@ pub(crate) fn cmd_pr_merge(store: EventStore, args: &[String]) -> Result<String,
         },
         &mut lock_handle,
         &tmp,
-    )?)
+    )
 }
 
 /// `git forge pr update <n>` — re-pin the PR to the source branch tip as a

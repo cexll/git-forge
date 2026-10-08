@@ -100,27 +100,31 @@ fn resolve_local_branch(store: &EventStore, arg: &str) -> Result<(String, git2::
     if arg.is_empty() {
         return Err(CliError::usage("branch name must be non-empty", ""));
     }
-    let (name, full) = if let Some(stripped) = arg.strip_prefix("refs/heads/") {
-        // Full form: must be a real refs/heads ref; the canonical name is the
-        // stripped remainder (may itself contain slashes, e.g. feat/foo).
-        if stripped.is_empty() {
-            return Err(CliError::invalid(format!("'{arg}' is not a canonical local branch; use a plain branch name (tags, remote-tracking refs, OIDs, and revision expressions are rejected)")));
-        }
-        (stripped.to_string(), arg.to_string())
-    } else {
-        // Bare form: resolve as refs/heads/<arg>. Slashes are legal inside
-        // branch names, so no early '/' rejection — a name that does not
-        // resolve is rejected below. `refs/tags/...`, `refs/remotes/...`,
-        // OIDs, and revision expressions all fail resolution and are rejected.
-        (arg.to_string(), format!("refs/heads/{arg}"))
+    let name = arg.strip_prefix("refs/heads/").unwrap_or(arg);
+    let full = format!("refs/heads/{name}");
+    let message = || {
+        format!("'{arg}' is not a canonical local branch; use a plain branch name (tags, remote-tracking refs, OIDs, and revision expressions are rejected)")
     };
-    let oid = store
-        .repo()
-        .find_reference(&full)
-        .ok()
-        .and_then(|r| r.target())
-        .ok_or_else(|| CliError::invalid(format!("'{arg}' is not a canonical local branch; use a plain branch name (tags, remote-tracking refs, OIDs, and revision expressions are rejected)")))?;
-    Ok((name, oid))
+    if name.is_empty()
+        || (arg.starts_with("refs/") && !arg.starts_with("refs/heads/"))
+        || !git2::Reference::is_valid_name(&full)
+        || name == "HEAD"
+    {
+        return Err(CliError::invalid(message()));
+    }
+    let reference = store.repo().find_reference(&full).map_err(|error| {
+        let bare_oid =
+            arg == name && name.len() == 40 && name.bytes().all(|byte| byte.is_ascii_hexdigit());
+        if error.code() == git2::ErrorCode::NotFound && !bare_oid && !name.starts_with('-') {
+            CliError::not_found(message(), arg)
+        } else {
+            CliError::invalid(message())
+        }
+    })?;
+    let oid = reference
+        .target()
+        .ok_or_else(|| CliError::invalid(message()))?;
+    Ok((name.to_string(), oid))
 }
 
 /// `git forge pr create --source <branch> --base <branch> <title> [--body <text>] [--label <x>]... [--closes <n>]`

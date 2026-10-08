@@ -102,7 +102,7 @@ impl BoundEventStore {
 
 // Git has no structured update-ref error code. Only recognized expected-value
 // diagnostics for this transaction permit retry; unknown failures stay fatal.
-fn expected_value_rejected(error: &StoreError, lines: &[String]) -> bool {
+pub(crate) fn expected_value_rejected(error: &StoreError, lines: &[String]) -> bool {
     let StoreError::Command(stderr) = error else {
         return false;
     };

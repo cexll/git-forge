@@ -15,7 +15,22 @@ input fails. Entity checks assign `E_NOT_FOUND`. Storage errors convert at the
 CLI boundary, retaining `E_CONFLICT` and `retryable` for CAS failures.
 `main` renders one JSON failure object when the invocation contains a bare
 `--json` token. `Display` retains the human stderr message and exit 1.
-The existing event serializer owns string escaping. No dependency is added.
+The existing event serializer owns string escaping. CLI tests use the
+dev-only `serde_json` parser to check complete error documents independently
+of that serializer. Production dependencies are unchanged.
+The parser is available under MIT. Reusing the production parser would weaken
+oracle independence; extending it to parse arbitrary CLI documents is not needed.
+
+Branch syntax is validated before lookup: valid absent local branches return
+`E_NOT_FOUND`; noncanonical inputs remain `E_INVALID`. Finalization retains
+typed CAS classes while adding human context. Git's recognized expected-value
+rejection identifies a CAS failure; concurrent movement alone does not.
+Candidate staleness and gate refusals return `E_GATE`. Preparation returns
+`E_PREPARE_CONFLICT` only when the failed strategy leaves an unmerged index,
+checked before cleanup. A failing hook that leaves unmerged entries receives
+the same code; hook and process failures without such entries remain `E_INTERNAL`.
+Conflicted-path diagnostics and conflict-specific remedies belong to the
+separate preparation-diagnostics contract.
 
 ## Alternatives considered
 
@@ -32,3 +47,11 @@ The wire contract defines required fields and permits additive diagnostic
 Binary-boundary tests cover every no-argument subcommand, missing entities,
 unknown options, and a competing real allocation that causes an atomic apply
 CAS conflict without publishing requested Issues.
+The error oracle checks exact keys, types, values, and equality with independently
+expected stderr. Mutation qualification rejects malformed JSON, changed messages,
+extra keys, and wrong types. Literal PR diff usage has a dedicated boundary check.
+Merge and prepare normalize `--json` without changing their human success output.
+Strategy execution and pre-cleanup classification live in `src/git/strategy.rs`.
+Atomic retry orchestration and adopted-input validation live in
+`src/merge_state/finalize.rs`. Their parent modules retain the existing API.
+These private modules keep both owners below the mandatory per-file size gate.

@@ -33,11 +33,16 @@ fn resolve_role() -> Result<Option<String>, CliError> {
         return Ok(COMMAND_ROLE.get_or_init(|| None).clone());
     }
     if !ROLES.contains(&raw) {
-        return Err((format!(
-            "unknown GIT_FORGE_ROLE '{raw}' (expected one of: {})",
-            ROLES.join(", ")
-        ))
-        .into());
+        return Err(CliError::new(
+            "E_INVALID",
+            format!(
+                "unknown GIT_FORGE_ROLE '{raw}' (expected one of: {})",
+                ROLES.join(", ")
+            ),
+            raw,
+            "Correct the input or repository state before retrying.",
+            false,
+        ));
     }
     let role = Some(raw.to_string());
     Ok(COMMAND_ROLE.get_or_init(|| role.clone()).clone())
