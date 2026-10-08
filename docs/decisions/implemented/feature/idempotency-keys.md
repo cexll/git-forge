@@ -71,7 +71,19 @@ write barriers, releases them in order, and checks one mutation, one
 record, and identical output.
 
 **Replay.** A replay reads only. It never resolves the identity, so it
-writes nothing and does not validate `GIT_FORGE_ROLE`. It precedes domain
+writes nothing and does not validate `GIT_FORGE_ROLE`. A same-key loser
+also validates state after its lookup (branches, `--closes`, parent,
+blockers, the commented entity). When any step after the lookup fails, the
+command re-reads the record (`idempotency::recheck`) and answers from it if
+present, so a winner that committed and a later change to that state (a
+deleted source branch, a deleted Issue ref) cannot turn the loser's replay
+into `E_NOT_FOUND` or `E_INVALID`. This also covers identity resolution: a
+loser with an invalid `GIT_FORGE_ROLE` replays the recorded result.
+
+**Malformed records.** Only an absent ref means "no record". A symbolic
+ref at a record path is malformed (`E_INVALID`): treating it as absent let
+the claim line write through it to its target. A non-commit target or a
+commit without a valid record blob is malformed too. It precedes domain
 validation, so a replay succeeds after the Issue was closed, the PR
 abandoned, or a branch moved or deleted. A key reused with different inputs
 fails with `E_CONFLICT`, `retryable: false` (a retry with the same key cannot

@@ -163,7 +163,8 @@ pub(crate) fn cmd_pr_create(args: &[String]) -> Result<String, CliError> {
         labels,
         closes,
     };
-    publish(&input, request.as_ref(), json)
+    let created = publish(&input, request.as_ref(), json);
+    crate::idempotency::recheck(request.as_ref(), json, created)
 }
 
 /// The parsed `pr create` inputs (title untrimmed, as typed).

@@ -673,15 +673,23 @@ fn release(child: std::process::Child, barrier: &Path) -> Output {
 /// commits; the second one's transaction fails on the record ref it expected
 /// to be absent, and it prints the first one's result.
 fn race(repo: &Repo, args: &[&str]) -> (String, String) {
+    let (first, second) = race_then(repo, args, |_| {});
+    (success(&first), success(&second))
+}
+
+/// [`race`] that runs `between` after the first call committed and before
+/// the second one, parked past its record lookup, resumes.
+fn race_then(repo: &Repo, args: &[&str], between: impl Fn(&Repo)) -> (Output, Output) {
     let a = repo.0.with_extension("barrier-a");
     let b = repo.0.with_extension("barrier-b");
     let first = spawn_parked(repo, args, &a);
     let second = spawn_parked(repo, args, &b);
     let first = release(first, &a);
+    between(repo);
     let second = release(second, &b);
     let _ = std::fs::remove_dir_all(&a);
     let _ = std::fs::remove_dir_all(&b);
-    (success(&first), success(&second))
+    (first, second)
 }
 
 #[test]
@@ -904,4 +912,212 @@ fn commands_without_a_key_write_no_record_and_repeat_the_mutation() {
         .forge_ref_names()
         .iter()
         .all(|name| !name.starts_with("refs/forge/idempotency/")));
+}
+
+// ─────────────────────────── malformed records ───────────────────────────
+
+/// A record ref that exists but is not a direct ref to a record commit is
+/// `E_INVALID`, never an absent key: a symbolic ref, a non-commit target,
+/// and a commit with a malformed record blob.
+#[test]
+fn a_present_but_malformed_record_ref_is_invalid() {
+    let record = record_ref("issue-new", "k");
+    let message = format!("invalid store state: malformed idempotency record {record}");
+    type Corrupt = fn(&Repo, &str);
+    let corrupt: [(&str, Corrupt); 3] = [
+        ("symbolic ref", |repo, record| {
+            repo.git(&["symbolic-ref", record, "refs/forge/issues/1"]);
+        }),
+        ("blob target", |repo, record| {
+            let blob = repo.git(&["rev-parse", "HEAD:base.txt"]);
+            repo.git(&["update-ref", record, &blob]);
+        }),
+        ("malformed blob", |repo, record| {
+            std::fs::create_dir_all(repo.0.join(".forge")).unwrap();
+            std::fs::write(repo.0.join(".forge/idempotency.json"), "{}").unwrap();
+            repo.git(&["add", ".forge/idempotency.json"]);
+            let tree = repo.git(&["write-tree"]);
+            let commit = repo.git(&["commit-tree", &tree, "-m", "bad"]);
+            repo.git(&["rm", "-q", "--cached", ".forge/idempotency.json"]);
+            repo.git(&["update-ref", record, &commit]);
+        }),
+    ];
+    for (case, corrupt) in corrupt {
+        let repo = Repo::new();
+        repo.branches();
+        repo.ok(&["issue", "new", "one"]);
+        corrupt(&repo, &record);
+        let refs = repo.forge_refs();
+        for args in [
+            &["issue", "new", "t", "--idempotency-key", "k", "--json"][..],
+            &["issue", "new", "t", "--idempotency-key", "k"][..],
+        ] {
+            let output = repo.run(args);
+            assert_eq!(output.status.code(), Some(1), "{case}");
+            assert_eq!(stderr(&output), format!("git-forge: {message}\n"), "{case}");
+            if args.contains(&"--json") {
+                assert_eq!(
+                    json(&stdout(&output)),
+                    serde_json::json!({"error": {
+                        "code": "E_INVALID", "message": message, "input": "",
+                        "hint": "Correct the repository state before retrying.",
+                        "retryable": false,
+                    }}),
+                    "{case}"
+                );
+            } else {
+                assert_eq!(stdout(&output), "", "{case}");
+            }
+            assert_eq!(repo.forge_refs(), refs, "{case}");
+        }
+    }
+}
+
+/// A same-key loser that resumes after the winner committed must answer from
+/// the winner's record even when the state its own validation reads changed
+/// in between (a deleted branch, Issue, PR, parent or blocker).
+#[test]
+fn a_same_key_loser_replays_even_when_its_validation_inputs_changed() {
+    type Change = fn(&Repo);
+    let cases: [(&str, &[&str], Change); 7] = [
+        (
+            "pr create, source branch deleted",
+            &[
+                "pr",
+                "create",
+                "--source",
+                "feature",
+                "--base",
+                "main",
+                "p",
+                "--closes",
+                "1",
+                "--idempotency-key",
+                "k",
+                "--json",
+            ],
+            |repo| {
+                repo.git(&["branch", "-D", "feature"]);
+            },
+        ),
+        (
+            "pr create, base branch moved onto the source",
+            &[
+                "pr",
+                "create",
+                "--source",
+                "feature",
+                "--base",
+                "other",
+                "p",
+                "--idempotency-key",
+                "k",
+                "--json",
+            ],
+            |repo| {
+                repo.git(&["update-ref", "refs/heads/other", "refs/heads/feature"]);
+            },
+        ),
+        (
+            "pr create, closed issue deleted",
+            &[
+                "pr",
+                "create",
+                "--source",
+                "feature",
+                "--base",
+                "main",
+                "p",
+                "--closes",
+                "1",
+                "--idempotency-key",
+                "k",
+                "--json",
+            ],
+            |repo| {
+                repo.git(&["update-ref", "-d", "refs/forge/issues/1"]);
+            },
+        ),
+        (
+            "issue new, parent deleted",
+            &[
+                "issue",
+                "new",
+                "t",
+                "--parent",
+                "1",
+                "--idempotency-key",
+                "k",
+                "--json",
+            ],
+            |repo| {
+                repo.git(&["update-ref", "-d", "refs/forge/issues/1"]);
+            },
+        ),
+        (
+            "issue new, blocker deleted",
+            &[
+                "issue",
+                "new",
+                "t",
+                "--blocked-by",
+                "1",
+                "--idempotency-key",
+                "k",
+                "--json",
+            ],
+            |repo| {
+                repo.git(&["update-ref", "-d", "refs/forge/issues/1"]);
+            },
+        ),
+        (
+            "issue comment, issue deleted",
+            &[
+                "issue",
+                "comment",
+                "1",
+                "c",
+                "--idempotency-key",
+                "k",
+                "--json",
+            ],
+            |repo| {
+                repo.git(&["update-ref", "-d", "refs/forge/issues/1"]);
+            },
+        ),
+        (
+            "pr comment, PR deleted",
+            &[
+                "pr",
+                "comment",
+                "2",
+                "c",
+                "--idempotency-key",
+                "k",
+                "--json",
+            ],
+            |repo| {
+                repo.git(&["update-ref", "-d", "refs/forge/prs/2/head"]);
+            },
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (case, args, change) in cases {
+        let repo = Repo::new();
+        repo.branches();
+        repo.ok(&["issue", "new", "one"]);
+        repo.ok(&["pr", "create", "--source", "other", "--base", "main", "q"]);
+        let (first, second) = race_then(&repo, args, change);
+        let first = success(&first);
+        assert!(json(&first)["id"].as_u64().unwrap() > 0, "{case}");
+        if second.status.code() != Some(0) || stdout(&second) != first || !second.stderr.is_empty()
+        {
+            failures.push(format!(
+                "{case}: {:?} {}",
+                second.status.code(),
+                stderr(&second)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }

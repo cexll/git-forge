@@ -119,7 +119,8 @@ fn cmd_new(args: &[String]) -> Result<String, CliError> {
         return Ok(output);
     }
     let fields = (title, description, labels, parent, blocked_by);
-    crate::issue_apply::new_issue_keyed(fields, json, request.as_ref())
+    let created = crate::issue_apply::new_issue_keyed(fields, json, request.as_ref());
+    crate::idempotency::recheck(request.as_ref(), json, created)
 }
 
 /// `git forge issue list`
@@ -274,24 +275,27 @@ fn cmd_comment(args: &[String]) -> Result<String, CliError> {
     if let Some(output) = crate::idempotency::replay(request.as_ref(), json)? {
         return Ok(output);
     }
-    let (store, actor) = open_mutation_store()?;
     let r = crate::store::issue_ref(id);
+    let ev = |actor: &str| {
+        issue_event(
+            EventKind::IssueComment,
+            id,
+            actor,
+            body_obj(&[("body", json_str(&body))]),
+        )
+    };
+    if let Some(request) = &request {
+        let state = |folded: &crate::event::FoldState| machine::issue_state_name(&folded.issue);
+        return crate::idempotency::comment(&r, id, &ev, request, json, state);
+    }
+    let (store, actor) = open_mutation_store()?;
     if !store_has_ref(store.store(), &r) {
         return Err(CliError::not_found(
             format!("issue #{id} does not exist"),
             id.to_string(),
         ));
     }
-    let ev = issue_event(
-        EventKind::IssueComment,
-        id,
-        &actor,
-        body_obj(&[("body", json_str(&body))]),
-    );
-    if let Some(request) = &request {
-        let state = |folded: &crate::event::FoldState| machine::issue_state_name(&folded.issue);
-        return crate::idempotency::append_comment(&store, &r, &ev, request, json, state);
-    }
+    let ev = ev(&actor);
     let event = store.append_event(&r, &ev).map_err(CliError::from)?;
     if json {
         let state = machine::issue_state_at(store.store(), event)?;

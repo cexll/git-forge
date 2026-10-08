@@ -171,10 +171,16 @@ impl EventStore {
         request: &IdempotencyRequest,
     ) -> Result<Option<IdempotencyRecord>, StoreError> {
         let name = request.ref_name();
-        let Some(tip) = self.current_tip(&name)? else {
-            return Ok(None);
-        };
         let malformed = || StoreError::InvalidState(format!("malformed idempotency record {name}"));
+        // Absent is the only "no record" answer. A present ref that is not a
+        // direct ref (a symbolic ref) is malformed, never an absent key: the
+        // claim line would otherwise write through it.
+        let reference = match self.repo.find_reference(&name) {
+            Ok(reference) => reference,
+            Err(e) if e.code() == git2::ErrorCode::NotFound => return Ok(None),
+            Err(e) => return Err(StoreError::Git(e)),
+        };
+        let tip = reference.target().ok_or_else(malformed)?;
         let commit = self.repo.find_commit(tip).map_err(|_| malformed())?;
         let entry = commit
             .tree()?

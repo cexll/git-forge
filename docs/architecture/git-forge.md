@@ -360,8 +360,18 @@ returns the first result instead of a second Issue, PR or comment.
 {"error":{"code":"E_CONFLICT","message":"idempotency key 'k1' was already used by issue new with different inputs (issue #3)","input":"k1","hint":"Repeat the original inputs to read the recorded result, or use a new idempotency key.","retryable":false,"data":{"command":"issue new","key":"k1","id":3}}}
 ```
 
-A record that is not well formed for its key is `E_INVALID`. Commands
-without the flag read and write no record.
+- **Loser after validation**: a same-key call that passed the lookup
+  before the winner committed re-reads the record when any later step
+  fails, including validation of state the winner's commit or a later
+  change made stale (a deleted branch, Issue, PR, parent or blocker). It
+  answers from the record (the result, or `E_CONFLICT`) instead of the
+  failure.
+
+A record ref that exists but is not well formed is `E_INVALID`
+(`malformed idempotency record <ref>`): a symbolic ref, a target that is
+not a commit, or a commit without a valid record blob for its key. Only an
+absent ref means a new key. Commands without the flag read and write no
+record.
 
 ### Ref Layout
 

@@ -258,25 +258,28 @@ fn cmd_pr_comment(args: &[String]) -> Result<String, CliError> {
     if let Some(output) = crate::idempotency::replay(request.as_ref(), json)? {
         return Ok(output);
     }
-    let (store, actor) = open_mutation_store()?;
     let r = crate::store::pr_head_ref(id);
+    let ev = |actor: &str| {
+        Event::new(
+            EventKind::PrComment,
+            "pr",
+            id,
+            actor,
+            body_obj(&[("body", json_str(&body))]),
+        )
+    };
+    if let Some(request) = &request {
+        let state = |folded: &crate::event::FoldState| machine::pr_state_name(&folded.pr);
+        return crate::idempotency::comment(&r, id, &ev, request, json, state);
+    }
+    let (store, actor) = open_mutation_store()?;
     if !store_has_ref(store.store(), &r) {
         return Err(CliError::not_found(
             format!("PR #{id} does not exist"),
             id.to_string(),
         ));
     }
-    let ev = Event::new(
-        EventKind::PrComment,
-        "pr",
-        id,
-        &actor,
-        body_obj(&[("body", json_str(&body))]),
-    );
-    if let Some(request) = &request {
-        let state = |folded: &crate::event::FoldState| machine::pr_state_name(&folded.pr);
-        return crate::idempotency::append_comment(&store, &r, &ev, request, json, state);
-    }
+    let ev = ev(&actor);
     let event = store.append_event(&r, &ev).map_err(CliError::from)?;
     if json {
         let state = machine::pr_state_at(store.store(), event)?;

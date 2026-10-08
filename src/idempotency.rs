@@ -10,8 +10,8 @@
 use crate::cli_error::CliError;
 use crate::event::{Event, FoldState, JsonValue};
 use crate::store::{
-    BoundEventStore, Claim, Claimed, IdempotencyRecord, IdempotencyRequest, IdempotentCommand,
-    RecordedResult, StoreError, MAX_KEY_BYTES,
+    Claim, Claimed, IdempotencyRecord, IdempotencyRequest, IdempotentCommand, RecordedResult,
+    StoreError, MAX_KEY_BYTES,
 };
 
 /// The option name, shared by every keyed command parser.
@@ -179,6 +179,21 @@ pub(crate) fn replay(
     }
 }
 
+/// The outcome of a keyed command's write path. When it failed, a same-key
+/// call may have committed after this call's first lookup and changed the
+/// state its validation read (a deleted branch, Issue or PR): the committed
+/// record answers before the failure does.
+pub(crate) fn recheck(
+    request: Option<&IdempotencyRequest>,
+    json: bool,
+    outcome: Result<String, CliError>,
+) -> Result<String, CliError> {
+    match outcome {
+        Err(error) if request.is_some() => replay(request, json)?.ok_or(error),
+        outcome => outcome,
+    }
+}
+
 /// The output of a claimed mutation: this invocation's result when it
 /// wrote, otherwise the earlier invocation's recorded result.
 pub(crate) fn output<T>(
@@ -235,13 +250,15 @@ fn resolve(
     Err(error)
 }
 
-/// Keyed comment append, shared by `issue comment` and `pr comment`: the
-/// comment event and its record commit in one transaction. `state` names the
-/// entity state folded at the appended event.
-pub(crate) fn append_comment(
-    store: &BoundEventStore,
+/// Keyed comment, shared by `issue comment` and `pr comment`: resolve the
+/// identity, check that entity `id` exists, then append the comment event
+/// (built by `event` for the actor) and its record commit in one
+/// transaction. `state` names the entity state folded at the appended
+/// event. A failure re-checks the committed record ([`recheck`]).
+pub(crate) fn comment(
     entity_ref: &str,
-    event: &Event,
+    id: u64,
+    event: &dyn Fn(&str) -> Event,
     request: &IdempotencyRequest,
     json: bool,
     state: fn(&FoldState) -> &'static str,
@@ -250,20 +267,28 @@ pub(crate) fn append_comment(
         IdempotentCommand::PrComment => "PR",
         _ => "issue",
     };
-    let render = |id: u64, event: git2::Oid| {
-        let folded = crate::event::fold(&store.read_chain_at(event)?);
-        Ok(RecordedResult {
-            id,
-            json: crate::machine::event_result_json(id, state(&folded), &event.to_string()),
-            text: format!("comment added to {entity} #{id}"),
-        })
-    };
-    let claim = Claim {
-        request,
-        render: &render,
-    };
-    let claimed = store.append_event_claimed(entity_ref, event, &claim)?;
-    output(Some(request), claimed, json, |oid| {
-        render(event.entity_id, oid)
-    })
+    let appended = (|| {
+        let (store, actor) = crate::identity::open_mutation_store()?;
+        if !crate::cli::store_has_ref(store.store(), entity_ref) {
+            return Err(CliError::not_found(
+                format!("{entity} #{id} does not exist"),
+                id.to_string(),
+            ));
+        }
+        let render = |id: u64, event: git2::Oid| {
+            let folded = crate::event::fold(&store.read_chain_at(event)?);
+            Ok(RecordedResult {
+                id,
+                json: crate::machine::event_result_json(id, state(&folded), &event.to_string()),
+                text: format!("comment added to {entity} #{id}"),
+            })
+        };
+        let claim = Claim {
+            request,
+            render: &render,
+        };
+        let claimed = store.append_event_claimed(entity_ref, &event(&actor), &claim)?;
+        output(Some(request), claimed, json, |oid| render(id, oid))
+    })();
+    recheck(Some(request), json, appended)
 }

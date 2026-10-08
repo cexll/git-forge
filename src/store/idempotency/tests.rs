@@ -395,6 +395,47 @@ fn a_malformed_record_is_an_error() {
         store.store().idempotency_record(&req),
         Err(StoreError::InvalidState(_))
     ));
+    // A record ref at a non-commit object.
+    let blob = store.repo().blob(good.as_bytes()).unwrap();
+    store
+        .store()
+        .run_update_ref_stdin(&[format!("update {name} {blob}")])
+        .unwrap();
+    assert!(matches!(
+        store.store().idempotency_record(&req),
+        Err(StoreError::InvalidState(_))
+    ));
+    // A symbolic record ref, dangling or pointing at a record commit.
+    let good_commit = store
+        .write_forge_commit("idempotency.json", good.as_bytes(), &[], "m")
+        .unwrap();
+    store
+        .store()
+        .run_update_ref_stdin(&[format!("update refs/forge/other {good_commit}")])
+        .unwrap();
+    for target in ["refs/forge/missing", "refs/forge/other"] {
+        store
+            .store()
+            .run_update_ref_stdin(&[format!("delete {name}")])
+            .unwrap();
+        store
+            .repo()
+            .reference_symbolic(&name, target, true, "m")
+            .unwrap();
+        assert!(
+            matches!(
+                store.store().idempotency_record(&req),
+                Err(StoreError::InvalidState(_))
+            ),
+            "{target}"
+        );
+    }
+    store
+        .repo()
+        .find_reference(&name)
+        .unwrap()
+        .delete()
+        .unwrap();
     // The well-formed record parses back.
     let commit = store
         .write_forge_commit("idempotency.json", good.as_bytes(), &[], "m")
