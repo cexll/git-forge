@@ -719,7 +719,10 @@ impl BoundEventStore {
                     let next = self.inner.read_counter_next(counter_tip)?;
                     // Versioned chain: the new counter commit's sole parent is
                     // the observed counter tip (wire contract).
-                    let counter_new = self.write_counter_commit(next + 1, Some(counter_tip))?;
+                    let following = next
+                        .checked_add(1)
+                        .ok_or_else(|| StoreError::InvalidState("counter exhausted".into()))?;
+                    let counter_new = self.write_counter_commit(following, Some(counter_tip))?;
                     let genesis = self.genesis_oid()?;
                     let lines = vec![
                         format!("update {COUNTER_REF} {counter_new} {counter_tip}"),
@@ -794,9 +797,12 @@ impl BoundEventStore {
                     ),
                     Some(ct) => {
                         let next = self.inner.read_counter_next(ct)?;
+                        let following = next
+                            .checked_add(1)
+                            .ok_or_else(|| StoreError::InvalidState("counter exhausted".into()))?;
                         (
                             Some(ct),
-                            self.write_counter_commit(next + 1, Some(ct))?,
+                            self.write_counter_commit(following, Some(ct))?,
                             next,
                             self.genesis_oid()?,
                         )

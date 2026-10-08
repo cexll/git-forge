@@ -42,14 +42,19 @@ impl EventStore {
         let mut states = BTreeMap::new();
         for reference in self.repo.references_glob("refs/forge/issues/*")? {
             let reference = reference?;
-            let name = reference
-                .name()
-                .ok_or_else(|| StoreError::InvalidState("non-UTF-8 issue ref".into()))?;
-            let id: u64 = name
+            let Some(name) = reference.name() else {
+                continue;
+            };
+            let Some(id) = name
                 .strip_prefix("refs/forge/issues/")
-                .and_then(|s| s.parse().ok())
-                .filter(|id| *id > 0)
-                .ok_or_else(|| StoreError::InvalidState(format!("invalid issue ref {name}")))?;
+                .filter(|s| {
+                    matches!(s.as_bytes().first(), Some(b'1'..=b'9'))
+                        && s.bytes().all(|b| b.is_ascii_digit())
+                })
+                .and_then(|s| s.parse::<u64>().ok())
+            else {
+                continue;
+            };
             let tip = reference
                 .target()
                 .ok_or_else(|| StoreError::InvalidState(format!("symbolic issue ref {name}")))?;

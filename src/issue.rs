@@ -173,9 +173,11 @@ fn cmd_show(store: &EventStore, args: &[String]) -> Result<String, String> {
     if !store_has_ref(store, &r) {
         return Err(format!("issue #{id} does not exist"));
     }
-    let chain = store.read_chain(&r).map_err(|e| e.to_string())?;
+    let chain = store
+        .read_chain(&r)
+        .map_err(|e| format!("cannot read {r}: {e}"))?;
     if chain.is_empty() {
-        return Err(format!("issue #{id} has no events"));
+        return Err(format!("issue #{id} has no events ({r})"));
     }
     let state = crate::event::fold(&chain).issue;
     let all = machine::fold_all_issues(store)?;

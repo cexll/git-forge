@@ -18,10 +18,17 @@ changes its compact serialization.
 
 Share actual Issue-ref enumeration between graph snapshots and Issue display.
 Keep reads through Git ref APIs, numeric ordering, and snapshot counter/CAS
-bracketing. Propagate unreadable-chain errors with the ref name. Issue display
-rejects chains without a usable creation for the ref's Issue id instead of
-silently omitting them. Graph snapshots retain eventless allocation tips for
-CAS validation. PR listing retains its existing behavior.
+bracketing. Ignore noncanonical suffixes before resolving targets: an Issue ref
+uses positive decimal digits, without signs or leading zeros, fitting `u64`.
+Propagate unreadable canonical-chain errors with the ref name in list/show.
+Issue display rejects chains without a usable creation for the ref's Issue id.
+Graph snapshots retain eventless allocation tips for CAS validation.
+PR listing retains its existing behavior.
+
+Check counter increments before writing or publishing allocation state.
+`allocate_id` and PR creation reject `u64::MAX` with a clean store error.
+Issue new/apply preserve their existing `i64::MAX` advanced-counter bound.
+An exhausted allocation or batch leaves all refs unchanged.
 
 ## Alternatives considered
 
@@ -37,6 +44,8 @@ CAS validation. PR listing retains its existing behavior.
 ## Consequences
 
 Older spaced counters work with both `issue new` and `issue apply`. Spaced event
-JSON remains readable. Issue lists and graph snapshots fail on unreadable refs
-with diagnostic context. Missing refs are still harmless. Counter parsing rejects
-malformed JSON and non-`u64` values. No migration or source-ref rewrite is needed.
+JSON remains readable. Issue lists and graph snapshots fail on unreadable
+canonical refs with diagnostic context. Missing and unrelated refs are harmless.
+Counter parsing rejects malformed JSON and non-`u64` values. Exhaustion returns
+an error rather than panicking or wrapping, and publishes no partial batch.
+No migration or source-ref rewrite is needed.

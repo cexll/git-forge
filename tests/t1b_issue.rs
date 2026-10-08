@@ -914,6 +914,98 @@ fn issue_apply_accepts_standard_json_counter_spacing() {
 }
 
 #[test]
+fn issue_new_and_apply_reject_spaced_exhausted_counters_without_changing_refs() {
+    for next in [u64::MAX, i64::MAX as u64, i64::MAX as u64 - 1] {
+        let dir = tmpdir("issue-counter-exhausted");
+        init_repo(&dir);
+        assert_eq!(forge(&dir, &["issue", "new", "Existing issue"]).0, 0);
+        assert_eq!(
+            git_out(&dir, &["update-ref", "-d", "refs/forge/meta/counter"]).0,
+            0
+        );
+        publish_json(
+            &dir,
+            "refs/forge/meta/counter",
+            "counter.json",
+            &format!(r#"{{"v": 1, "next": {next}}}"#),
+        );
+        let plans = dir.join("plans");
+        std::fs::create_dir(&plans).unwrap();
+        for key in ["first", "second"] {
+            std::fs::write(
+                plans.join(format!("{key}.md")),
+                format!("---\nkey: {key}\ntitle: {key}\n---\nBody\n"),
+            )
+            .unwrap();
+        }
+        let refs = ["for-each-ref", "--format=%(refname) %(objectname)"];
+        let before = git_out(&dir, &refs);
+        assert_eq!(before.0, 0);
+        let mut commands = vec![
+            vec!["issue", "apply", plans.to_str().unwrap()],
+            vec![
+                "issue",
+                "apply",
+                plans.to_str().unwrap(),
+                "--dry-run",
+                "--json",
+            ],
+        ];
+        if next >= i64::MAX as u64 {
+            commands.push(vec!["issue", "new", "Exhausted"]);
+        }
+        for args in commands {
+            let (code, out, err) = forge(&dir, &args);
+            assert_eq!(code, 1, "{next}: {args:?}: {err}");
+            assert!(err.contains("counter exhausted"), "{next}: {err}");
+            assert!(out.is_empty(), "exhausted batch reported success: {out}");
+            assert_eq!(git_out(&dir, &refs), before, "{next}: changed refs");
+        }
+    }
+}
+
+#[test]
+fn pr_create_rejects_spaced_exhausted_counter_without_changing_refs() {
+    let dir = tmpdir("pr-counter-exhausted");
+    init_repo(&dir);
+    assert_eq!(git_out(&dir, &["checkout", "-q", "-b", "main"]).0, 0);
+    assert_eq!(
+        git_out(&dir, &["commit", "--allow-empty", "-q", "-m", "base"]).0,
+        0
+    );
+    assert_eq!(git_out(&dir, &["checkout", "-q", "-b", "feature"]).0, 0);
+    assert_eq!(
+        git_out(&dir, &["commit", "--allow-empty", "-q", "-m", "feature"]).0,
+        0
+    );
+    publish_json(
+        &dir,
+        "refs/forge/meta/counter",
+        "counter.json",
+        r#"{"v": 1, "next": 18446744073709551615}"#,
+    );
+    let refs = ["for-each-ref", "--format=%(refname) %(objectname)"];
+    let before = git_out(&dir, &refs);
+    assert_eq!(before.0, 0);
+    let (code, out, err) = forge(
+        &dir,
+        &[
+            "pr",
+            "create",
+            "--source",
+            "feature",
+            "--base",
+            "main",
+            "Exhausted",
+        ],
+    );
+    assert_eq!(code, 1, "expected clean exhaustion error: {err}");
+    assert!(err.contains("counter exhausted"), "{err}");
+    assert!(out.is_empty(), "failed create reported success: {out}");
+    assert_eq!(git_out(&dir, &refs), before, "exhaustion changed refs");
+}
+
+#[test]
 fn issue_list_and_show_read_standard_json_event_spacing_without_counter() {
     let dir = tmpdir("spaced-event");
     init_repo(&dir);
@@ -962,6 +1054,51 @@ fn issue_list_tolerates_missing_ref_gap() {
 }
 
 #[test]
+fn issue_list_and_show_ignore_noncanonical_refs() {
+    for suffix in [
+        "archive",
+        "01",
+        "+1",
+        "0",
+        "18446744073709551616",
+        "archive/2",
+    ] {
+        let dir = tmpdir("noncanonical-issue-ref");
+        init_repo(&dir);
+        assert_eq!(forge(&dir, &["issue", "new", "Healthy issue"]).0, 0);
+        publish_json(
+            &dir,
+            &format!("refs/forge/issues/{suffix}"),
+            "event.json",
+            "not JSON",
+        );
+        for args in [
+            vec!["issue", "list"],
+            vec!["issue", "list", "--json"],
+            vec!["issue", "show", "1"],
+            vec!["issue", "show", "1", "--json"],
+        ] {
+            let (code, out, err) = forge(&dir, &args);
+            assert_eq!(code, 0, "{suffix}: {args:?}: {err}");
+            if args.contains(&"--json") {
+                let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+                let issue = if args[1] == "list" {
+                    let issues = value.as_array().unwrap();
+                    assert_eq!(issues.len(), 1, "noncanonical ref listed: {out}");
+                    &issues[0]
+                } else {
+                    &value
+                };
+                assert_eq!(issue["id"], 1);
+                assert_eq!(issue["title"], "Healthy issue");
+            } else {
+                assert!(out.contains("#1 Healthy issue"), "{suffix}: {out}");
+            }
+        }
+    }
+}
+
+#[test]
 fn issue_list_rejects_unreadable_refs_with_ref_name() {
     for (tag, payload) in [
         ("invalid-json", Some("not JSON")),
@@ -986,6 +1123,8 @@ fn issue_list_rejects_unreadable_refs_with_ref_name() {
         for args in [
             vec!["issue", "list", "--state", "all"],
             vec!["issue", "list", "--state", "all", "--json"],
+            vec!["issue", "show", "2"],
+            vec!["issue", "show", "2", "--json"],
         ] {
             let (code, out, err) = forge(&dir, &args);
             assert_ne!(code, 0, "unreadable ref silently skipped ({tag}): {out}");
