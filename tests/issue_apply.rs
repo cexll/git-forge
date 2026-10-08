@@ -397,3 +397,85 @@ fn plan_errors_escape_terminal_controls_in_fields_references_and_paths() {
         assert_eq!(repo.refs(), "");
     }
 }
+
+#[test]
+fn new_retries_fresh_snapshot_after_competing_allocation() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = Repo::new();
+    let shims = repo.0.join("shims");
+    std::fs::create_dir(&shims).unwrap();
+    let real_git = repo.git(&["--exec-path"]);
+    let real_git = Path::new(real_git.trim()).join("git");
+    let real_git = if real_git.is_file() {
+        real_git
+    } else {
+        PathBuf::from("/usr/bin/git")
+    };
+    let marker = shims.join("competed");
+    let script = format!("#!/bin/bash\nif [[ \"$*\" == *'update-ref --stdin'* && ! -e '{}' ]]; then\n  touch '{}'\n  '{}' issue new Competitor || exit $?\nfi\nexec '{}' \"$@\"\n", marker.display(), marker.display(), env!("CARGO_BIN_EXE_git-forge"), real_git.display());
+    let shim = shims.join("git");
+    std::fs::write(&shim, script).unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_git-forge"))
+        .args(["issue", "new", "Requested", "--json"])
+        .current_dir(&repo.0)
+        .env(
+            "PATH",
+            format!("{}:{}", shims.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_FORGE_ROLE")
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(marker.exists(), "the competing allocation must execute");
+    let store = EventStore::open(&repo.0).unwrap();
+    assert_eq!(store.counter_next().unwrap(), 3);
+    assert_eq!(
+        git_forge::event::fold(&store.read_chain(&issue_ref(1)).unwrap())
+            .issue
+            .title
+            .as_deref(),
+        Some("Competitor")
+    );
+    assert_eq!(
+        git_forge::event::fold(&store.read_chain(&issue_ref(2)).unwrap())
+            .issue
+            .title
+            .as_deref(),
+        Some("Requested")
+    );
+}
+
+#[test]
+fn new_does_not_retry_nonconflict_transaction_failure() {
+    use std::os::unix::fs::PermissionsExt;
+    let repo = Repo::new();
+    let shims = repo.0.join("shims");
+    std::fs::create_dir(&shims).unwrap();
+    let attempts = shims.join("attempts");
+    let shim = shims.join("git");
+    std::fs::write(&shim, format!("#!/bin/bash\nif [[ \"$*\" == *'update-ref --stdin'* ]]; then\n  echo attempted >> '{}'\n  echo 'injected write failure' >&2\n  exit 73\nfi\nexec /usr/bin/git \"$@\"\n", attempts.display())).unwrap();
+    std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_git-forge"))
+        .args(["issue", "new", "Requested"])
+        .current_dir(&repo.0)
+        .env(
+            "PATH",
+            format!("{}:{}", shims.display(), std::env::var("PATH").unwrap()),
+        )
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env_remove("GIT_FORGE_ROLE")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("injected write failure"));
+    assert_eq!(std::fs::read_to_string(attempts).unwrap(), "attempted\n");
+    assert_eq!(repo.refs(), "");
+}

@@ -287,6 +287,10 @@ Prepared immutable git objects may exist, but are not published forge state.
 A fresh snapshot and full revalidation are required before another publication
 attempt; never retry only the stale changed subset. `issue new` uses the same
 whole-graph validator and atomic graph publication, not separate edge rules.
+`issue apply` reports a conflict without retrying. Individual `issue new` keeps
+the existing three-attempt allocation bound: only an identified moved-ref CAS
+conflict retries, with a fresh complete snapshot, id and graph validation.
+Other transaction failures propagate without retrying.
 
 #### Individual commands and graph display
 

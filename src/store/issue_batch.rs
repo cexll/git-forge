@@ -83,7 +83,18 @@ impl BoundEventStore {
             let old = expected.map_or_else(|| ZERO_OID.into(), |tip| tip.to_string());
             lines.push(format!("update {} {tip} {old}", issue_ref(*id)));
         }
-        self.inner.run_update_ref_stdin(&lines)
+        if let Err(error) = self.inner.run_update_ref_stdin(&lines) {
+            if self.inner.current_tip(COUNTER_REF)? != snapshot.counter_tip {
+                return Err(StoreError::CasConflict);
+            }
+            for id in snapshot.tips.keys().chain(changes.keys()) {
+                if self.inner.current_tip(&issue_ref(*id))? != snapshot.tips.get(id).copied() {
+                    return Err(StoreError::CasConflict);
+                }
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 }
 

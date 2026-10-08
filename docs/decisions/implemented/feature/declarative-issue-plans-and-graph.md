@@ -39,6 +39,9 @@ advancement in one ref transaction, verifying every read graph tip and the
 counter, with expected absence for newly allocated refs. A dependency or counter
 CAS conflict publishes none of the plan; a new attempt needs a fresh snapshot
 and full graph validation, not a retry of only changed entries.
+Individual `issue new` preserves bounded concurrent allocation retries: capture
+and validate a fresh graph after an identified moved-ref CAS conflict, up to the
+existing three-attempt limit. Apply itself remains fail-fast on a conflict.
 
 Keep schema v1 additive: `issue.created` gains optional key/parent/blocker fields;
 `issue.updated` stores only changed metadata. Open/closed transitions remain

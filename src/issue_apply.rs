@@ -317,46 +317,51 @@ pub(crate) fn new_issue(
     json: bool,
 ) -> Result<String, String> {
     let (store, actor) = crate::identity::open_mutation_store()?;
-    let snapshot = store.store().issue_snapshot().map_err(|e| e.to_string())?;
     blocked_by.sort_unstable();
     if blocked_by.windows(2).any(|w| w[0] == w[1]) {
         return Err("issue new: blocked_by: duplicate issue".into());
     }
-    let id = snapshot.next;
-    if snapshot.tips.contains_key(&id) {
-        return Err("issue new: counter collides with an existing issue ref".into());
+    for _ in 0..crate::store::MAX_ALLOC_RETRIES {
+        let snapshot = store.store().issue_snapshot().map_err(|e| e.to_string())?;
+        let id = snapshot.next;
+        if snapshot.tips.contains_key(&id) {
+            return Err("issue new: counter collides with an existing issue ref".into());
+        }
+        let next = id
+            .checked_add(1)
+            .filter(|n| *n <= i64::MAX as u64)
+            .ok_or("issue counter exhausted")?;
+        let state = IssueState {
+            id,
+            title: Some(title.clone()),
+            description: description.clone(),
+            labels: labels.clone(),
+            parent,
+            blocked_by: blocked_by.clone(),
+            open: true,
+            ..IssueState::default()
+        };
+        let mut plan = Plan {
+            states: snapshot.states.clone(),
+            events: BTreeMap::new(),
+            changes: Vec::new(),
+            next,
+        };
+        record(&mut plan, state.clone(), None, &actor);
+        validate_graph(&plan.states).map_err(|(_, field, e)| format!("issue new: {field}: {e}"))?;
+        match store.apply_issue_batch(&snapshot, next, &plan.events) {
+            Ok(()) => {}
+            Err(crate::store::StoreError::CasConflict) => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+        return if json {
+            Ok(crate::machine::issue_json(
+                &state,
+                &plan.states.into_values().collect::<Vec<_>>(),
+            ))
+        } else {
+            Ok(format!("issue #{id} created: {title}"))
+        };
     }
-    let next = id
-        .checked_add(1)
-        .filter(|n| *n <= i64::MAX as u64)
-        .ok_or("issue counter exhausted")?;
-    let state = IssueState {
-        id,
-        title: Some(title.clone()),
-        description,
-        labels,
-        parent,
-        blocked_by,
-        open: true,
-        ..IssueState::default()
-    };
-    let mut plan = Plan {
-        states: snapshot.states.clone(),
-        events: BTreeMap::new(),
-        changes: Vec::new(),
-        next,
-    };
-    record(&mut plan, state.clone(), None, &actor);
-    validate_graph(&plan.states).map_err(|(_, field, e)| format!("issue new: {field}: {e}"))?;
-    store
-        .apply_issue_batch(&snapshot, next, &plan.events)
-        .map_err(|e| e.to_string())?;
-    if json {
-        Ok(crate::machine::issue_json(
-            &state,
-            &plan.states.into_values().collect::<Vec<_>>(),
-        ))
-    } else {
-        Ok(format!("issue #{id} created: {title}"))
-    }
+    Err(crate::store::StoreError::Exhausted.to_string())
 }

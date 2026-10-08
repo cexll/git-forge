@@ -31,7 +31,7 @@ const GENESIS_MSG: &str = "forge:genesis";
 pub(crate) const MAX_APPEND_RETRIES: u32 = 3;
 
 /// Number of bounded allocation retries on counter collision.
-const MAX_ALLOC_RETRIES: u32 = 3;
+pub(crate) const MAX_ALLOC_RETRIES: u32 = 3;
 
 /// All-zero OID used by `git update-ref` to mean "ref must not exist".
 pub(crate) const ZERO_OID: &str = "0000000000000000000000000000000000000000";
