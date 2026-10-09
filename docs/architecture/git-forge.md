@@ -279,6 +279,11 @@ base branch '<base_ref>' has moved since PR #<n> was created; run git forge pr p
 A deleted base branch is not a moved base: `pr update` keeps its
 `branch '<base_ref>' does not exist` refusal with `E_NOT_FOUND`.
 
+The update transaction verifies that the base branch still points at the
+tip the check read. A base that moves or is deleted after the check and
+before publication returns the same `E_BASE_MOVED` (with the moved tip as
+`current_base`) or `E_NOT_FOUND`, and publishes no generation.
+
 #### CI failure
 
 A `ci run` that is not green records a `failed` Check with exactly one
@@ -430,6 +435,11 @@ returns the first result instead of a second Issue, PR or comment.
   change made stale (a deleted branch, Issue, PR, parent or blocker). It
   answers from the record (the result, or `E_CONFLICT`) instead of the
   failure.
+- **Loser before the winner commits**: when the keyed transaction fails
+  because another transaction holds a lock on one of its refs (for
+  example a same-key winner that is prepared but not yet committed) and no
+  record is readable yet, the call returns `E_CONFLICT` with
+  `retryable: true`. A retry after the winner commits replays its result.
 
 A record ref that exists but is not well formed is `E_INVALID`
 (`malformed idempotency record <ref>`), never a new key, a conflict or an
