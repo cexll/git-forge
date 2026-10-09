@@ -476,3 +476,51 @@ fn worktree_cleanup_failure_is_cleanup_failed() {
         repo.git(&["worktree", "remove", "-f", "-f", &path]);
     }
 }
+
+/// A plan-controlled multi-line lock reason with terminal controls reaches
+/// the cleanup diagnostic through git's stderr. The human line and the JSON
+/// `message` are one terminal-safe line; `data` and the stored Check keep
+/// the exact reason and tail.
+#[test]
+fn hostile_worktree_lock_reason_is_sanitized_in_the_message() {
+    let repo = Repo::new("hostile-lock");
+    repo.pr_with(&ci_sh(
+        "#!/bin/bash\necho locking\n\
+         git worktree lock --reason $'held\\nforged line\\e[31mred\\x7f\\r' \"$PWD\" || exit 9\n\
+         exit 0\n",
+    ));
+    let output = repo.forge(&["ci", "run", "1", "--json"], &[]);
+    let stderr = String::from_utf8(output.stderr.clone()).unwrap();
+    let line = stderr.strip_suffix('\n').unwrap_or(&stderr);
+    let unsafe_chars: Vec<char> = line
+        .chars()
+        .filter(|c| matches!(*c as u32, 0..=0x1f | 0x7f..=0x9f))
+        .collect();
+    assert!(unsafe_chars.is_empty(), "{unsafe_chars:?} in {stderr:?}");
+    // git renders the reason's other controls as `?`; its newlines and the
+    // multi-line diagnostic itself are escaped by git-forge.
+    assert!(
+        line.contains("lock reason: held\\x0aforged line"),
+        "{stderr}"
+    );
+    assert!(
+        line.ends_with("; reason: cleanup_failed; output tail: locking\\x0a"),
+        "{stderr}"
+    );
+    let message = line["git-forge: ".len()..].to_string();
+    assert_ci_failure(
+        &repo,
+        &output,
+        &Expected {
+            message,
+            hint: CLEANUP_HINT,
+            reason: "cleanup_failed",
+            tail: "locking\n".into(),
+            plan: Some(".forge/ci.sh"),
+        },
+    );
+    for path in repo.ci_worktrees() {
+        repo.git(&["worktree", "unlock", &path]);
+        repo.git(&["worktree", "remove", "-f", &path]);
+    }
+}

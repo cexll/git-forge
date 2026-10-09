@@ -466,7 +466,9 @@ fn pr_help() -> String {
 /// best-effort remove `tmp`, then report WHY it is not fully cleaned (removal
 /// failed, directory still present, verification failed, or still registered) —
 /// or None when it is gone. Shared by `cmd_ci_run`'s happy-path and add-failure
-/// cleanup so a leftover is always reported, never silently discarded.
+/// cleanup so a leftover is always reported, never silently discarded. The
+/// report embeds git's stderr, which can carry a plan-controlled lock reason,
+/// so it is terminal-safe: one line, every control escaped.
 fn worktree_leftover(repo_dir: &std::path::Path, tmp: &std::path::Path) -> Option<String> {
     crate::git::worktree_remove_ci(repo_dir, tmp)
         .err()
@@ -483,7 +485,7 @@ fn worktree_leftover(repo_dir: &std::path::Path, tmp: &std::path::Path) -> Optio
                 None
             }
         })
-        .map(|reason| format!("{reason} (worktree left at {})", tmp.display()))
+        .map(|reason| sanitize_terminal(&format!("{reason} (worktree left at {})", tmp.display())))
 }
 
 /// `git forge ci run <pr>` — execute the repo CI plan against the PR's own
@@ -703,6 +705,7 @@ fn cmd_ci_run(args: &[String]) -> Result<String, CliError> {
         // add never registered (clean early-validation failure) is no leftover.
         let leftover = worktree_leftover(&repo_dir, &tmp);
         release_lock(&mut lock_handle, &tmp);
+        let err_wt = sanitize_terminal(&err_wt);
         return Err((match leftover {
             Some(l) => format!("failed to create temporary worktree for CI run: {err_wt}; {l}"),
             None => format!("failed to create temporary worktree for CI run: {err_wt}"),
