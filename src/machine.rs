@@ -23,27 +23,66 @@ fn json_escape(s: &str) -> String {
     crate::event::json_escape_for_machine(s)
 }
 
-/// Strip bare `--json` flag tokens from `args`, returning whether at least
-/// one was present plus the remaining arguments. `--json` is a pure
-/// output-mode switch, so — unlike value-taking options — it is recognized in
-/// ANY position (before or after positionals); `--json=x` is NOT matched.
-/// This seam ONLY owns the machine-flag split: whether the leftovers are
-/// grammatical belongs to each per-command parser, which rejects any token it
-/// does not know — including a leftover `--json=x` — with a clean
-/// `unknown option '<flag>'` usage error before any side effect (exit-1 is
-/// unchanged, VAL-202). Commands with NO options at all call
-/// [`reject_leftover_flags`] on the remainder; option-taking parsers reject
-/// in their own match arms, where `--source` etc. are known.
+/// [`json_requested_with`] for a grammar without value-taking options.
 pub(crate) fn json_requested(args: &[String]) -> (bool, Vec<String>) {
+    json_requested_with(args, &[])
+}
+
+thread_local! {
+    /// The output mode the last grammar-aware split decided (see
+    /// [`json_mode`]).
+    static JSON_MODE: std::cell::Cell<Option<bool>> = const { std::cell::Cell::new(None) };
+}
+
+/// The output mode the command's grammar decided: whether a standalone
+/// `--json` was present. `None` before any command grammar ran (top-level
+/// dispatch errors), where the caller falls back to any `--json` token.
+pub fn json_mode() -> Option<bool> {
+    JSON_MODE.with(std::cell::Cell::get)
+}
+
+/// The namespace dispatcher's split (`issue`, `pr`, `ci`): `argv` is the
+/// namespace's arguments with the subcommand first, `values` the
+/// subcommand's value-taking options (none for an unknown subcommand, so
+/// every `--json` after it is standalone). A `--json` in the subcommand slot
+/// is standalone too: the dispatcher rejects it as an unknown subcommand,
+/// and that error is JSON.
+pub(crate) fn json_requested_by_dispatch(argv: &[String], values: &[&str]) -> (bool, Vec<String>) {
+    let (json, rest) = json_requested_with(argv.get(1..).unwrap_or(&[]), values);
+    let json = json || argv.first().is_some_and(|sub| sub == "--json");
+    JSON_MODE.with(|mode| mode.set(Some(json)));
+    (json, rest)
+}
+
+/// Split standalone `--json` tokens from `args`: whether at least one was
+/// present, plus the remaining arguments in order. `values` names the
+/// command's value-taking options: each such option and the token after it
+/// are copied verbatim, so an option value that equals `--json` is data
+/// (the same rule as an option value equal to `-h`/`--help`). A `"--"` entry
+/// declares end-of-options: from a `--` token on, every token is data.
+/// A standalone `--json` is recognized in ANY other position; `--json=x` is
+/// NOT matched. The decision is recorded for [`json_mode`], so a failure
+/// renders as JSON only when the grammar saw a standalone `--json`.
+/// Grammaticality of the leftovers belongs to each per-command parser, which
+/// rejects any token it does not know (exit 1, VAL-202).
+pub(crate) fn json_requested_with(args: &[String], values: &[&str]) -> (bool, Vec<String>) {
     let mut json = false;
     let mut rest = Vec::with_capacity(args.len());
-    for a in args {
-        if a == "--json" {
+    let mut tokens = args.iter();
+    while let Some(a) = tokens.next() {
+        if a == "--" && values.contains(&"--") {
+            rest.push(a.clone());
+            rest.extend(tokens.by_ref().cloned());
+        } else if a == "--json" {
             json = true;
         } else {
             rest.push(a.clone());
+            if values.contains(&a.as_str()) {
+                rest.extend(tokens.next().cloned());
+            }
         }
     }
+    JSON_MODE.with(|mode| mode.set(Some(json)));
     (json, rest)
 }
 
@@ -509,7 +548,44 @@ pub(crate) fn fold_all_prs(store: &EventStore) -> Result<Vec<crate::event::PrSta
 
 #[cfg(test)]
 mod tests {
-    use super::{issue_json, issue_list_json};
+    use super::{issue_json, issue_list_json, json_mode, json_requested_with};
+
+    #[test]
+    fn json_split_keeps_option_values_and_end_of_options_as_data() {
+        let split = |args: &[&str], values: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            let (json, rest) = json_requested_with(&args, values);
+            assert_eq!(json_mode(), Some(json));
+            (json, rest)
+        };
+        let values = ["--label", "--"];
+        assert_eq!(
+            split(&["t", "--label", "--json"], &values),
+            (false, vec!["t".into(), "--label".into(), "--json".into()])
+        );
+        assert_eq!(
+            split(&["--json", "t", "--label", "--json", "--json"], &values),
+            (true, vec!["t".into(), "--label".into(), "--json".into()])
+        );
+        assert_eq!(
+            split(&["--label", "--", "--json"], &values),
+            (true, vec!["--label".into(), "--".into()])
+        );
+        assert_eq!(
+            split(&["--", "--json", "--label"], &values),
+            (false, vec!["--".into(), "--json".into(), "--label".into()])
+        );
+        // Without declared values every `--json` is standalone; a trailing
+        // value option keeps its missing value for the parser to reject.
+        assert_eq!(
+            split(&["--label", "--json", "--"], &[]),
+            (true, vec!["--label".into(), "--".into()])
+        );
+        assert_eq!(
+            split(&["--label"], &values),
+            (false, vec!["--label".into()])
+        );
+    }
     use crate::event::IssueState;
 
     #[test]

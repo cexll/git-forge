@@ -28,7 +28,11 @@ fn main() -> ExitCode {
             ExitCode::SUCCESS
         }
         Err(err) => {
-            if argv.iter().any(|arg| arg == "--json") {
+            // The command grammar's decision; before any grammar ran,
+            // any `--json` token requests a JSON error.
+            let json = git_forge::machine::json_mode()
+                .unwrap_or_else(|| argv.iter().any(|arg| arg == "--json"));
+            if json {
                 println!("{}", err.to_json());
             }
             eprintln!("git-forge: {err}");

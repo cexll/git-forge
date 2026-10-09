@@ -23,7 +23,7 @@ Must-not-haves (L1): web UI, single-file export, GitHub bridge, accounts/permiss
 |---|---|---|---|
 | `event` (model) | `Event`, `EventKind`, `JsonValue`, `is_uuid_v4` | Event schema v1, UUID generation, kind/body validation | Deep: pure, no I/O, fully testable; deletion would scatter state logic across CLI and store |
 | `fold` (state derivation) | `fold(events) -> FoldState`, `IssueState`/`PrState`/`SeqState`, `first_allocation` | Deterministic ordering, issue/PR state derivation, effective review decision | Pure, no I/O |
-| `store` (git refs) | `EventStore`: `append_event`, `read_chain`, `create_pr`, `allocate_id` (versioned counter CAS) | Ref naming under `refs/forge/*`, commit creation, packed-ref-safe reads, counter commit chain | Deep: hides all git plumbing; callers never touch refs directly |
+| `store` (git refs) | `EventStore`: `append_event`, `read_chain`, `create_pr`, `allocate_id` (versioned counter CAS); `append_event_claimed`, `create_pr_claimed`, `apply_issue_batch_claimed`, `idempotency_record` (idempotency records) | Ref naming under `refs/forge/*`, commit creation, packed-ref-safe reads, counter commit chain | Deep: hides all git plumbing; callers never touch refs directly |
 | `identity` (actor) | `resolve_identity`, `bind_identity`, `open_mutation_store` | The invoking repo's `user.email` resolved once per write via `crate::git::config_get_identity` (a safe `git config --null --get` child — never libgit2, VAL-115 stage A). Stage A (config-open fault) propagates a clean CLI error; stage B (absent/empty/non-UTF-8 email) falls back to `forge@localhost`. Signature + actor are bound before any write. | Shallow: never a libgit2 `repo.config()` read at write time (the VAL-115 SIGSEGV-on-corrupt-config path) |
 | `git` (adapter) | `worktree_add`/`worktree_remove`/`worktree_list`, `base_checked_out_elsewhere`, `execute_strategy`, `cleanup_failed_worktree`, `require_single_merge_base` | `git` binary shell-outs for merge execution and worktree plumbing. `git/strategy.rs` owns merge/squash/rebase execution and conflict classification before cleanup. | Deep: protocol correctness delegated to git itself; the merge-gate predicate stays in `merge_state` |
 | `ci` (runner) | `ci_timeout`, `snapshot_ci_plan`, `run_ci_plan` | Bounded CI plan execution in a disposable worktree: immutable-snapshot plan resolution/materialization, process-group kill+reap under a deadline, env tightening, one failure `reason` per non-green run and the bounded 4 KiB output tail (`ci/output.rs`) | Security-sensitive: isolates the plan subprocess (`/bin/bash` / `just`) and its environment |
@@ -31,8 +31,10 @@ Must-not-haves (L1): web UI, single-file export, GitHub bridge, accounts/permiss
 | `pr_merge` (merge commands) | `cmd_pr_merge`, `pr_merge_help` | Merge orchestration (live-base resolution + moved-base candidate routing, checked-out-base guard, temp-worktree lifecycle, pending-result cleanup); gate + finalize delegated to `merge_state` | Deep: the orchestration boundary; `cli` dispatches to it |
 | `issue` (commands) | `run_issue` dispatch; issue `cmd_*` handlers | Issue command parsing + human-readable output; apply and new graph publication delegated to `issue_apply`; graph JSON derived from folded states | Shallow: command surface only |
 | `issue_plan` (plans) | strict plan parsing, whole-graph validation, desired-state diff | Minimal frontmatter grammar; repository-wide key mapping and reference resolution; parent/blocking cycle checks | No YAML dependency; shared graph rules for apply and new |
-| `issue_apply` (publication) | `cmd_apply`, `new_issue` | Complete Issue graph snapshot, allocation, event construction and one atomic snapshot/CAS publication via store | Owns orchestration, not a second storage implementation |
+| `issue_apply` (publication) | `cmd_apply`, `new_issue_keyed` | Complete Issue graph snapshot, allocation, event construction and one atomic snapshot/CAS publication via store | Owns orchestration, not a second storage implementation |
+| `idempotency` (keys) | `FLAG`, `set_key`, `take_key`, `issue_new_request`/`pr_create_request`/`comment_request`, `replay`, `recheck`, `output`, `comment` | `--idempotency-key` parsing, the canonical inputs per command, replay or `E_CONFLICT` before any write, the record re-read after a failed keyed write (`recheck`), and the keyed comment operation shared by `issue comment` and `pr comment` (`comment`); the record and its atomic publication live in `store/idempotency.rs` | CLI-layer owner of the key contract; one implementation for the four keyed commands |
 | `cli_error` (failures) | `CliError` | Stable codes, preserved human messages, optional structured data and JSON error rendering; typed storage conversion | CLI-layer boundary; core and store do not import it |
+| `pr_create` (create command) | `cmd_pr_create` | Branch resolution and atomic PR creation through `store::create_pr` | CLI-layer owner, extracted to retain the file-size gate |
 | `pr_review` (review command) | `cmd_pr_review` | Review argument handling and generation/candidate-bound event publication | CLI-layer owner, extracted to retain the file-size gate |
 | `cli` (entry) | `run_pr`, `run_ci` dispatch; `cmd_pr_diff` (arguments + result handling) | Command parsing; the merge-gate predicate + finalize live in `merge_state`, orchestration in `pr_merge`; `cmd_pr_diff` delegates the subprocess to `git::git_in_ci` | Shallow by design: dispatch only, no direct subprocess spawning (diff goes through the sanitized git adapter) |
 | `sync` (L2) | — | Explicit forge refspec push, additive fetch refspec, per-entity DAG merge convergence | Not built in L1; no `src/sync.rs` yet |
@@ -91,6 +93,9 @@ git-forge/
 │   ├── issue_plan.rs    # strict plan parser, complete graph validation and diff
 │   ├── issue_apply.rs   # snapshot + atomic apply/new graph publication
 │   ├── store/issue_batch.rs # snapshot/CAS batch ref transaction
+│   ├── store/idempotency.rs # idempotency record refs, published in the mutation's transaction
+│   ├── store/update_ref.rs  # the one `git update-ref --stdin` transaction runner
+│   ├── idempotency.rs   # --idempotency-key parsing, canonical inputs, replay
 │   ├── pr_merge.rs      # cmd_pr_merge: merge-gate predicate + orchestration (temp worktree, pending result, atomic finalize)
 │   └── store.rs         # refs read/write via git2
 └── tests/
@@ -130,6 +135,21 @@ prints `git-forge: <message>`. With a bare `--json` token, stdout contains one
 JSON error object and stderr keeps the same line. This also applies when a
 command rejects `--json` because it has no machine success result.
 
+A bare `--json` is a standalone token: not the value of a value-taking
+option and not after an end-of-options `--` (`issue new`, `pr create`).
+`issue new t --label --json` creates an Issue labeled `--json` and prints
+the human result; `--idempotency-key --json` uses the key `--json`. Each
+command declares its value-taking options to the shared split
+(`machine::json_requested_with`), and the result of that split also decides
+whether a failure prints a JSON error. Where the decision is made:
+
+| Path | JSON error when |
+|---|---|
+| Top level (`git-forge <cmd>`), unknown command, `forge <sub>` with an unknown `<sub>`, `version` | any argument is `--json` (no command grammar ran) |
+| Namespace dispatch (`issue`, `pr`, `ci`, the `forge` form and the `git-issue`/`git-pr` wrappers) | the subcommand slot is `--json`, or a standalone `--json` follows the subcommand; an unknown subcommand has no value-taking options, so every `--json` after it is standalone |
+| Namespace help (`help`, `-h`, `--help` as the subcommand, or a leading help token after a known subcommand) | a standalone `--json` follows the subcommand (`E_USAGE`, help has no JSON) |
+| A known subcommand | its own split decides, before its parser reports any usage error |
+
 ```json
 {"error":{"code":"E_USAGE","message":"usage: git forge pr show <n> [--json]","input":"","hint":"Run the command with --help and correct its arguments.","retryable":false}}
 ```
@@ -145,7 +165,7 @@ keeps its current schema-1 shapes; it has no common envelope.
 |---|---|
 | `E_USAGE` | Missing or malformed command arguments, or unknown options |
 | `E_NOT_FOUND` | Referenced Issue, PR, or branch does not exist |
-| `E_CONFLICT` | Compare-and-swap conflict, exhausted CAS retries, or stale snapshot; read current state before retrying |
+| `E_CONFLICT` | Compare-and-swap conflict, exhausted CAS retries, or stale snapshot; read current state before retrying. Also an idempotency key reused with different inputs (`retryable: false`) |
 | `E_BASE_MOVED` | Base movement prevents the requested operation |
 | `E_PREPARE_CONFLICT` | Candidate preparation encounters a merge conflict |
 | `E_GATE` | Merge gate refuses the operation |
@@ -360,6 +380,68 @@ already final still exits 1 with the merged line and the recycle failure in
 the error message; it does not print a success result.
 
 
+### Idempotency Keys (schema 1)
+
+`issue new`, `pr create`, `issue comment` and `pr comment` accept
+`--idempotency-key <k>`. A retry with the same key and the same inputs
+returns the first result instead of a second Issue, PR or comment.
+
+- **Key**: any non-empty value of at most 100 bytes, compared byte for
+  byte. A missing value, an empty value, a longer value, or a repeated flag
+  is `E_USAGE` before any read or write.
+- **Scope**: per repository and per command kind. The same key on two
+  command kinds names two independent records. Keys never expire.
+- **Same inputs** (normalized as the command stores them):
+  - `issue new`: title, description, labels in order, parent, and the
+    blocking Issues as a set.
+  - `pr create`: title, source and base branch names (a `refs/heads/`
+    prefix removed; the names, not the commits they point at), body,
+    labels in order, and `--closes`.
+  - `issue comment` / `pr comment`: the target id and the comment body.
+  `--json` is an output mode, not an input.
+- **Record**: `refs/forge/idempotency/<command>/<hex>`, where `<hex>` is
+  the lowercase hex of the key bytes, points at a root commit whose tree
+  holds `.forge/idempotency.json`:
+  `{"v":1,"command":"issue new","key":"<k>","inputs":"<digest>","id":<n>,"json":"<result>","text":"<result>"}`.
+  `inputs` is the git blob id of the canonical inputs. `json` and `text`
+  are the exact `--json` and human results of the recorded mutation, so a
+  replay prints them byte for byte in either mode.
+- **Atomicity**: the record ref is created (expected absent, with
+  `option no-deref`) in the same `git update-ref --stdin` transaction as
+  the mutation's refs. Either both are published or neither is. After
+  `prepare` locks every ref, the record ref must still not exist in any
+  form; a symbolic ref there, even one inserted after the lookup, aborts
+  the whole transaction, so nothing is written through it. When the transaction fails and a record for
+  the key exists, a concurrent call with the same key committed first; the
+  command answers from that record instead of retrying.
+- **Replay**: the command reads the record before it resolves its identity
+  or writes anything. Same inputs: exit 0 with the recorded result, also
+  after the entity was closed, abandoned or commented on, or a branch moved.
+  Different inputs: exit 1 with `E_CONFLICT`, `retryable: false`, the key
+  as `input`, and `data` with `command`, `key` and the recorded `id`:
+
+```json
+{"error":{"code":"E_CONFLICT","message":"idempotency key 'k1' was already used by issue new with different inputs (issue #3)","input":"k1","hint":"Repeat the original inputs to read the recorded result, or use a new idempotency key.","retryable":false,"data":{"command":"issue new","key":"k1","id":3}}}
+```
+
+- **Loser after validation**: a same-key call that passed the lookup
+  before the winner committed re-reads the record when any later step
+  fails, including validation of state the winner's commit or a later
+  change made stale (a deleted branch, Issue, PR, parent or blocker). It
+  answers from the record (the result, or `E_CONFLICT`) instead of the
+  failure.
+
+A record ref that exists but is not well formed is `E_INVALID`
+(`malformed idempotency record <ref>`), never a new key, a conflict or an
+internal error: an unreadable ref file, a symbolic ref, a target that is
+missing or not a root commit, a missing tree, a tree with any entry besides
+`.forge/idempotency.json`, a missing record blob or one that is not a
+regular file (mode `100644`), or a blob that is not a well-formed record for its key (exactly the
+seven fields, `v` 1, matching `command` and `key`, `inputs` exactly 40
+lowercase hex digits, `id` a positive integer, `json` and `text` strings).
+Only an absent ref means a new key. Commands without the flag read and write no
+record.
+
 ### Ref Layout
 
 ```
@@ -370,6 +452,7 @@ refs/forge/prs/<n>/gen/<k>/source        # t1: immutable snapshot ref for genera
 refs/forge/prs/<n>/gen/<k>/base          # t1: immutable snapshot ref for generation k >= 1 → gen-k base_head
 refs/forge/prs/<n>/result                # prepared-candidate/pending merge-result ref → result_commit (created by `pr prepare`, deleted by the merge final transaction or reported as leftover on failure)
 refs/forge/meta/counter                  # versioned counter commit chain (next sequential id)
+refs/forge/idempotency/<command>/<hex>   # idempotency record (immutable): <command> = issue-new|pr-create|issue-comment|pr-comment, <hex> = lowercase hex of the key bytes
 refs/remotes/<remote>/forge/*            # remote-tracking mirror; never local-authoritative
 ```
 

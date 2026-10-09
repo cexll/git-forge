@@ -62,6 +62,26 @@ impl BoundEventStore {
         next: u64,
         changes: &BTreeMap<u64, Vec<Event>>,
     ) -> Result<(), StoreError> {
+        self.apply_issue_batch_claimed(snapshot, next, changes, None)?
+            .written()
+    }
+
+    /// [`Self::apply_issue_batch`] that also publishes the idempotency record
+    /// of Issue `id`'s change (`claim`) in the SAME transaction. When the
+    /// transaction fails and a record for the key exists, that record is
+    /// returned instead of the CAS failure.
+    pub(crate) fn apply_issue_batch_claimed(
+        &self,
+        snapshot: &IssueSnapshot,
+        next: u64,
+        changes: &BTreeMap<u64, Vec<Event>>,
+        claim: Option<(u64, &Claim<'_>)>,
+    ) -> Result<Claimed<()>, StoreError> {
+        if claim.is_some_and(|(id, _)| !changes.contains_key(&id)) {
+            return Err(StoreError::InvalidState(
+                "idempotency claim names an issue outside the batch".into(),
+            ));
+        }
         let mut lines = Vec::new();
         let old_counter = snapshot
             .counter_tip
@@ -92,10 +112,17 @@ impl BoundEventStore {
                 parent.ok_or_else(|| StoreError::InvalidState("empty issue event batch".into()))?;
             let old = expected.map_or_else(|| ZERO_OID.into(), |tip| tip.to_string());
             lines.push(format!("update {} {tip} {old}", issue_ref(*id)));
+            if let Some((_, claim)) = claim.filter(|(claimed, _)| claimed == id) {
+                lines.extend(self.claim_lines(claim, *id, tip)?);
+            }
         }
-        match self.inner.run_update_ref_stdin(&lines) {
-            Err(error) if expected_value_rejected(&error, &lines) => Err(StoreError::CasConflict),
-            result => result,
+        match self.run_claimed(&lines, claim.map(|(_, claim)| claim)) {
+            Ok(()) => Ok(Claimed::Written(())),
+            Err(error) => match self.existing_claim(claim.map(|(_, claim)| claim))? {
+                Some(record) => Ok(Claimed::Existing(record)),
+                None if expected_value_rejected(&error, &lines) => Err(StoreError::CasConflict),
+                None => Err(error),
+            },
         }
     }
 }

@@ -18,7 +18,13 @@ use std::process::Command;
 use git2::{Commit, Error as GitError, Oid, Repository, Signature, TreeBuilder, TreeEntry};
 
 use crate::event::{Event, EventKind, JsonValue};
+mod idempotency;
 mod issue_batch;
+mod update_ref;
+pub(crate) use idempotency::{
+    Claim, Claimed, IdempotencyRecord, IdempotencyRequest, IdempotentCommand, RecordedResult,
+    MAX_KEY_BYTES,
+};
 pub(crate) use issue_batch::{expected_value_rejected, IssueSnapshot};
 
 /// The single mutable counter ref holding the next sequential id.
@@ -211,42 +217,6 @@ impl EventStore {
         BoundEventStore {
             inner: self,
             signature: sig,
-        }
-    }
-
-    /// Run `git update-ref --stdin` with the given transaction lines.
-    /// Returns Ok(()) when every command applied atomically, Err otherwise
-    /// (stderr included in the error). Never swallows failures.
-    pub(crate) fn run_update_ref_stdin(&self, lines: &[String]) -> Result<(), StoreError> {
-        use std::io::Write;
-        let mut child = Command::new("git")
-            .arg("--git-dir")
-            .arg(&self.git_dir)
-            .arg("update-ref")
-            .arg("--stdin")
-            .env("LC_ALL", "C")
-            .stdin(std::process::Stdio::piped())
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::piped())
-            .spawn()
-            .map_err(|e| StoreError::Command(e.to_string()))?;
-        let mut stdin = child.stdin.take().unwrap();
-        let mut buf = String::from("start\n");
-        for l in lines {
-            buf.push_str(l);
-            buf.push('\n');
-        }
-        buf.push_str("prepare\ncommit\n");
-        let _ = stdin.write_all(buf.as_bytes());
-        drop(stdin);
-        let out = child
-            .wait_with_output()
-            .map_err(|e| StoreError::Command(e.to_string()))?;
-        if out.status.success() {
-            Ok(())
-        } else {
-            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-            Err(StoreError::Command(stderr))
         }
     }
 
@@ -793,6 +763,41 @@ impl BoundEventStore {
         labels: &[String],
         closes: Option<u64>,
     ) -> Result<u64, StoreError> {
+        self.create_pr_claimed(
+            title,
+            source_ref,
+            base_ref,
+            source_oid,
+            base_oid,
+            merge_base,
+            actor,
+            description,
+            labels,
+            closes,
+            None,
+        )?
+        .written()
+    }
+
+    /// [`Self::create_pr`] that also publishes `claim`'s idempotency record
+    /// in the SAME transaction. When the transaction fails and a record for
+    /// the key exists, the earlier invocation's record is returned instead
+    /// of retrying, so concurrent same-key creates allocate one PR.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn create_pr_claimed(
+        &self,
+        title: &str,
+        source_ref: &str,
+        base_ref: &str,
+        source_oid: Oid,
+        base_oid: Oid,
+        merge_base: Oid,
+        actor: &str,
+        description: Option<&str>,
+        labels: &[String],
+        closes: Option<u64>,
+        claim: Option<&Claim<'_>>,
+    ) -> Result<Claimed<u64>, StoreError> {
         for _ in 0..MAX_ALLOC_RETRIES {
             let (counter_tip, counter_new, next, genesis) =
                 match self.inner.current_tip(COUNTER_REF)? {
@@ -858,9 +863,17 @@ impl BoundEventStore {
             for (r, oid) in &plan {
                 lines.push(format!("update {r} {oid} {ZERO_OID}"));
             }
-            match self.inner.run_update_ref_stdin(&lines) {
-                Ok(()) => return Ok(next),
+            if let Some(claim) = claim {
+                lines.extend(self.claim_lines(claim, next, ci_oid)?);
+            }
+            match self.run_claimed(&lines, claim) {
+                Ok(()) => return Ok(Claimed::Written(next)),
                 Err(e) => {
+                    // A same-key record explains the failure before any retry:
+                    // the winner also moved the counter.
+                    if let Some(record) = self.existing_claim(claim)? {
+                        return Ok(Claimed::Existing(record));
+                    }
                     // Counter first: if it moved, a concurrent allocator won →
                     // retry with a fresh id.
                     if self.inner.current_tip(COUNTER_REF)? != counter_tip {
@@ -995,121 +1008,4 @@ fn parse_counter_next(content: &str) -> Result<u64, StoreError> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use std::error::Error;
-
-    #[test]
-    fn map_repo_open_err_not_found_becomes_not_a_git_repo() {
-        // A path that is not a repository yields ErrorCode::NotFound, which
-        // must map to the user-facing NotAGitRepository.
-        let e = match git2::Repository::open("/tmp/gf-no-such-repo-xyz") {
-            Ok(_) => panic!("open must fail on a nonexistent path"),
-            Err(e) => e,
-        };
-        assert!(matches!(
-            map_repo_open_err(e),
-            StoreError::NotAGitRepository
-        ));
-    }
-
-    #[test]
-    fn store_error_display_constracts_user_facing_text() {
-        assert_eq!(
-            StoreError::NotAGitRepository.to_string(),
-            "not a git repository (or any of the parent directories)"
-        );
-        assert_eq!(
-            StoreError::CasConflict.to_string(),
-            "ref CAS conflict — ref moved, retry"
-        );
-        assert_eq!(
-            StoreError::Exhausted.to_string(),
-            "bounded CAS retries exhausted; refs unchanged"
-        );
-        assert_eq!(
-            StoreError::MissingEvent.to_string(),
-            "entity chain has no event.json payload"
-        );
-        assert_eq!(
-            StoreError::MissingRef.to_string(),
-            "required ref does not exist"
-        );
-        assert_eq!(
-            StoreError::RefExists("refs/forge/issues/1".into()).to_string(),
-            "entity ref already exists: refs/forge/issues/1"
-        );
-        assert_eq!(
-            StoreError::Command("boom".into()).to_string(),
-            "git command failed: boom"
-        );
-        assert_eq!(
-            StoreError::InvalidState("whatev".into()).to_string(),
-            "invalid store state: whatev"
-        );
-    }
-
-    #[test]
-    fn store_error_source_exposes_git_but_not_other_variants() {
-        // Only the Git variant surfaces a std source; the user-facing variants
-        // must report None (they are terminal, not wrapped errors).
-        let ge = git2::Error::from_str("boom");
-        assert!(StoreError::Git(ge).source().is_some());
-        assert!(StoreError::NotAGitRepository.source().is_none());
-        assert!(StoreError::CasConflict.source().is_none());
-        assert!(StoreError::Exhausted.source().is_none());
-        assert!(StoreError::MissingEvent.source().is_none());
-        assert!(StoreError::MissingRef.source().is_none());
-        assert!(StoreError::RefExists("x".into()).source().is_none());
-        assert!(StoreError::Command("y".into()).source().is_none());
-        assert!(StoreError::InvalidState("z".into()).source().is_none());
-        // Display for the Git wrapper keeps the "git error:" prefix.
-        let ge2 = git2::Error::from_str("boom");
-        assert!(StoreError::Git(ge2).to_string().starts_with("git error:"));
-    }
-
-    #[test]
-    fn map_repo_open_err_non_not_found_stays_git() {
-        // A git2 error whose code is not NotFound must pass through as a
-        // StoreError::Git (keeping its diagnostic), not be coerced to the
-        // user-facing "not a git repository" message.
-        let ge = git2::Error::from_str("boom");
-        assert!(matches!(map_repo_open_err(ge), StoreError::Git(_)));
-    }
-
-    #[test]
-    fn parse_counter_next_reads_and_rejects() {
-        assert_eq!(parse_counter_next(r#"{"v":1,"next":7}"#).unwrap(), 7);
-        assert_eq!(parse_counter_next("  {\"v\":1,\"next\":42}  ").unwrap(), 42);
-        // missing "next" key
-        assert!(matches!(
-            parse_counter_next(r#"{"v":1}"#),
-            Err(StoreError::InvalidState(_))
-        ));
-        // non-numeric next
-        assert!(matches!(
-            parse_counter_next(r#"{"v":1,"next":abc}"#),
-            Err(StoreError::InvalidState(_))
-        ));
-    }
-
-    #[test]
-    fn current_tip_absent_entity_is_none_not_error() {
-        // An entity ref that does not exist reads as None (fresh entity), not
-        // an error — this is how lazy first allocation starts.
-        let d = std::env::temp_dir().join(format!(
-            "gf-store-tip-{}-{:?}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
-        let _ = std::fs::remove_dir_all(&d);
-        let repo = git2::Repository::init(&d).unwrap();
-        let store = EventStore::from_repo(repo).unwrap();
-        let tip = store.current_tip("refs/forge/issues/999").unwrap();
-        assert_eq!(tip, None);
-        let _ = std::fs::remove_dir_all(&d);
-    }
-}
+mod tests;

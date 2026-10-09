@@ -112,11 +112,14 @@ pub(crate) fn cmd_pr_diff(args: &[String]) -> Result<String, CliError> {
 /// worktree, and atomically finalize: delete pending result ref + CAS base
 /// branch + CAS PR head chain in ONE ref transaction.
 //
+/// Value-taking options of `pr merge`.
+pub(crate) const MERGE_VALUES: &[&str] = &["--recycle-worktree"];
+
 // Baseline exemption (removal trigger in constraints.yaml baseline.lint_allow):
 // the sole lib/src function over the 150-line clippy::too_many_lines threshold.
 #[allow(clippy::too_many_lines)]
 pub(crate) fn cmd_pr_merge(args: &[String]) -> Result<String, CliError> {
-    let (json, args) = crate::machine::json_requested(args);
+    let (json, args) = crate::machine::json_requested_with(args, MERGE_VALUES);
     let render = |outcome: crate::merge_state::MergeOutcome| {
         if json {
             crate::machine::pr_merge_json(&outcome)

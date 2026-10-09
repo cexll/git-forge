@@ -28,17 +28,42 @@ fn issue_event(kind: EventKind, id: u64, actor: &str, body: HashMap<String, Json
     )
 }
 
+/// Value-taking options of `issue new` (`--` ends options).
+const NEW_VALUES: &[&str] = &[
+    "--label",
+    "-l",
+    "--parent",
+    "--blocked-by",
+    crate::idempotency::FLAG,
+    "--",
+];
+/// Value-taking options of `issue list`.
+const LIST_VALUES: &[&str] = &["--parent", "--state"];
+/// Value-taking options of `issue comment` and `pr comment`.
+pub(crate) const COMMENT_VALUES: &[&str] = &[crate::idempotency::FLAG];
+
+/// The value-taking options of issue subcommand `sub`.
+fn issue_values(sub: &str) -> &'static [&'static str] {
+    match sub {
+        "new" => NEW_VALUES,
+        "list" => LIST_VALUES,
+        "comment" => COMMENT_VALUES,
+        _ => &[],
+    }
+}
+
 /// `git forge issue new <title> [description]`
 fn cmd_new(args: &[String]) -> Result<String, CliError> {
-    const USAGE: &str = "usage: git forge issue new <title> [description] [--label <x>]... [--parent <n>] [--blocked-by <n>]... [--json]";
+    const USAGE: &str = "usage: git forge issue new <title> [description] [--label <x>]... [--parent <n>] [--blocked-by <n>]... [--idempotency-key <k>] [--json]";
     // Pure argument validation first — a usage error must not be masked by a
     // later config-open failure (error precedence, F-028). Supports
     // `--label <x>` (repeatable) alongside the positional `<title> [description]`.
-    let (json, args) = machine::json_requested(args);
+    let (json, args) = machine::json_requested_with(args, NEW_VALUES);
     let mut labels: Vec<String> = Vec::new();
     let mut parent = None;
     let mut blocked_by = Vec::new();
     let mut positional: Vec<String> = Vec::new();
+    let mut key = None;
     let mut i = 0;
     while i < args.len() {
         if args[i] == "--" {
@@ -75,6 +100,10 @@ fn cmd_new(args: &[String]) -> Result<String, CliError> {
                     blocked_by.push(id);
                 }
             }
+            crate::idempotency::FLAG => {
+                i += 1;
+                crate::idempotency::set_key(&mut key, args.get(i))?;
+            }
             a if a.starts_with('-') => {
                 return Err(CliError::usage(format!("unknown option '{a}'; {USAGE}"), a))
             }
@@ -102,14 +131,27 @@ fn cmd_new(args: &[String]) -> Result<String, CliError> {
         .get(1)
         .map(|d| d.trim().to_string())
         .filter(|d| !d.is_empty());
-    crate::issue_apply::new_issue(title, description, labels, parent, blocked_by, json)
+    let request = crate::idempotency::issue_new_request(
+        key.as_deref(),
+        &title,
+        description.as_deref(),
+        &labels,
+        parent,
+        &blocked_by,
+    )?;
+    if let Some(output) = crate::idempotency::replay(request.as_ref(), json)? {
+        return Ok(output);
+    }
+    let fields = (title, description, labels, parent, blocked_by);
+    let created = crate::issue_apply::new_issue_keyed(fields, json, request.as_ref());
+    crate::idempotency::recheck(request.as_ref(), json, created)
 }
 
 /// `git forge issue list`
 fn cmd_list(args: &[String]) -> Result<String, CliError> {
     const USAGE: &str =
         "usage: git forge issue list [--parent <n>] [--state open|closed|all] [--json]";
-    let (json, args) = machine::json_requested(args);
+    let (json, args) = machine::json_requested_with(args, LIST_VALUES);
     let mut parent = None;
     let mut desired_state = "all";
     let mut i = 0;
@@ -238,7 +280,8 @@ fn cmd_comment(args: &[String]) -> Result<String, CliError> {
     // Same strict flag/token split as every other issue subcommand: an
     // unknown option is a clean usage error naming the flag (VAL-202),
     // never a silently-ignored prefix of the comment body.
-    let (json, args) = machine::json_requested(args);
+    let (json, args) = machine::json_requested_with(args, COMMENT_VALUES);
+    let (key, args) = crate::idempotency::take_key(&args)?;
     // The grammar is `<n> <body>` — positionals ARE the body. Only flag
     // tokens are rejected here (naming the flag, VAL-202); existence and
     // emptiness are checked below, as before.
@@ -251,20 +294,32 @@ fn cmd_comment(args: &[String]) -> Result<String, CliError> {
     if body.is_empty() {
         return Err(CliError::usage("comment body must be non-empty", ""));
     }
-    let (store, actor) = open_mutation_store()?;
+    let kind = crate::store::IdempotentCommand::IssueComment;
+    let request = crate::idempotency::comment_request(kind, key.as_deref(), id, &body)?;
+    if let Some(output) = crate::idempotency::replay(request.as_ref(), json)? {
+        return Ok(output);
+    }
     let r = crate::store::issue_ref(id);
+    let ev = |actor: &str| {
+        issue_event(
+            EventKind::IssueComment,
+            id,
+            actor,
+            body_obj(&[("body", json_str(&body))]),
+        )
+    };
+    if let Some(request) = &request {
+        let state = |folded: &crate::event::FoldState| machine::issue_state_name(&folded.issue);
+        return crate::idempotency::comment(&r, id, &ev, request, json, state);
+    }
+    let (store, actor) = open_mutation_store()?;
     if !store_has_ref(store.store(), &r) {
         return Err(CliError::not_found(
             format!("issue #{id} does not exist"),
             id.to_string(),
         ));
     }
-    let ev = issue_event(
-        EventKind::IssueComment,
-        id,
-        &actor,
-        body_obj(&[("body", json_str(&body))]),
-    );
+    let ev = ev(&actor);
     let event = store.append_event(&r, &ev).map_err(CliError::from)?;
     if json {
         let state = machine::issue_state_at(store.store(), event)?;
@@ -320,7 +375,7 @@ pub fn run_issue(argv: &[String]) -> Result<String, CliError> {
     let sub = argv.first().map(|s| s.as_str()).unwrap_or("");
     // Subcommand-level `-h`/`--help` is answered HERE, before any store open,
     // so help works outside a git repository (same as the namespace helps).
-    let (json, rest) = machine::json_requested(argv.get(1..).unwrap_or(&[]));
+    let (json, rest) = machine::json_requested_by_dispatch(argv, issue_values(sub));
     if help_requested(&rest) {
         if let Some(usage) = issue_sub_usage(sub) {
             return help_result(json, &rest[0], usage.into());
@@ -354,11 +409,11 @@ pub fn run_issue(argv: &[String]) -> Result<String, CliError> {
 
 fn issue_sub_usage(sub: &str) -> Option<&'static str> {
     Some(match sub {
-        "new" => "usage: git forge issue new <title> [description] [--label <x>]... [--parent <n>] [--blocked-by <n>]... [--json]",
+        "new" => "usage: git forge issue new <title> [description] [--label <x>]... [--parent <n>] [--blocked-by <n>]... [--idempotency-key <k>] [--json]",
         "apply" => "usage: git forge issue apply <dir|file> [--dry-run] [--json]",
         "list" => "usage: git forge issue list [--parent <n>] [--state open|closed|all] [--json]",
         "show" => "usage: git forge issue show <n>",
-        "comment" => "usage: git forge issue comment <n> <body> [--json]",
+        "comment" => "usage: git forge issue comment <n> <body> [--idempotency-key <k>] [--json]",
         "close" => "usage: git forge issue close <n> [--json]",
         "reopen" => "usage: git forge issue reopen <n> [--json]",
         _ => return None,
@@ -368,11 +423,11 @@ fn issue_sub_usage(sub: &str) -> Option<&'static str> {
 fn issue_help() -> String {
     "usage: git forge issue <new|apply|list|show|comment|close|reopen> ...\n\
      \nsubcommands:\n\
-     \x20 new <title> [description] [--label <x>]... [--parent <n>] [--blocked-by <n>]... [--json]\n\
+     \x20 new <title> [description] [--label <x>]... [--parent <n>] [--blocked-by <n>]... [--idempotency-key <k>] [--json]\n\
      \x20 apply <dir|file> [--dry-run] [--json]\n\
      \x20 list [--parent <n>] [--state open|closed|all] [--json]\n\
      \x20 show <n> [--json]\n\
-     \x20 comment <n> <body> [--json]\n\
+     \x20 comment <n> <body> [--idempotency-key <k>] [--json]\n\
      \x20 close <n> [--json]\n\
      \x20 reopen <n> [--json]"
         .to_string()

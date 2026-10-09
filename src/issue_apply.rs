@@ -2,7 +2,7 @@
 use crate::cli_error::CliError;
 use crate::event::{Event, EventKind, IssueState, JsonValue};
 use crate::issue_plan::{self, Entry};
-use crate::store::{EventStore, IssueSnapshot};
+use crate::store::{Claim, EventStore, IdempotencyRequest, IssueSnapshot, RecordedResult};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::Path;
 
@@ -412,13 +412,25 @@ pub(crate) fn cmd_apply(args: &[String]) -> Result<String, CliError> {
         })?;
     Ok(render(&plan, json))
 }
+#[cfg(test)]
 pub(crate) fn new_issue(
     title: String,
     description: Option<String>,
     labels: Vec<String>,
     parent: Option<u64>,
-    mut blocked_by: Vec<u64>,
+    blocked_by: Vec<u64>,
     json: bool,
+) -> Result<String, CliError> {
+    new_issue_keyed((title, description, labels, parent, blocked_by), json, None)
+}
+/// The `issue new` fields: title, description, labels, parent, blocked-by.
+pub(crate) type NewIssue = (String, Option<String>, Vec<String>, Option<u64>, Vec<u64>);
+/// Create one Issue; with `request`, publish its idempotency record in the
+/// same transaction (a concurrent same-key winner's record is replayed).
+pub(crate) fn new_issue_keyed(
+    (title, description, labels, parent, mut blocked_by): NewIssue,
+    json: bool,
+    request: Option<&IdempotencyRequest>,
 ) -> Result<String, CliError> {
     let (store, actor) = crate::identity::open_mutation_store()?;
     blocked_by.sort_unstable();
@@ -498,19 +510,30 @@ pub(crate) fn new_issue(
                 false,
             )
         })?;
-        match store.apply_issue_batch(&snapshot, next, &plan.events) {
-            Ok(()) => {}
-            Err(crate::store::StoreError::CasConflict) => continue,
-            Err(error) => return Err(error.into()),
-        }
-        return if json {
-            Ok(crate::machine::issue_json(
+        let result = RecordedResult {
+            id,
+            json: crate::machine::issue_json(
                 &state,
                 &plan.states.into_values().collect::<Vec<_>>(),
-            ))
-        } else {
-            Ok(format!("issue #{id} created: {title}"))
+            ),
+            text: format!("issue #{id} created: {title}"),
         };
+        let render = |_, _| Ok(result.clone());
+        let claim = request.map(|request| Claim {
+            request,
+            render: &render,
+        });
+        let claimed = match store.apply_issue_batch_claimed(
+            &snapshot,
+            next,
+            &plan.events,
+            claim.as_ref().map(|claim| (id, claim)),
+        ) {
+            Ok(claimed) => claimed,
+            Err(crate::store::StoreError::CasConflict) => continue,
+            Err(error) => return Err(error.into()),
+        };
+        return crate::idempotency::output(request, claimed, json, |()| Ok(result));
     }
     Err(crate::store::StoreError::Exhausted.into())
 }
