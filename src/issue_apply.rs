@@ -434,15 +434,6 @@ pub(crate) fn new_issue_keyed(
 ) -> Result<String, CliError> {
     let (store, actor) = crate::identity::open_mutation_store()?;
     blocked_by.sort_unstable();
-    if blocked_by.windows(2).any(|w| w[0] == w[1]) {
-        return Err(CliError::new(
-            "E_INVALID",
-            "issue new: blocked_by: duplicate issue",
-            "blocked_by",
-            "Remove duplicate blocking issue identifiers.",
-            false,
-        ));
-    }
     for _ in 0..crate::store::MAX_ALLOC_RETRIES {
         let snapshot = match store.store().issue_snapshot() {
             Ok(snapshot) => snapshot,

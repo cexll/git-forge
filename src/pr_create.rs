@@ -6,25 +6,37 @@ use crate::identity::open_mutation_store;
 use crate::machine;
 use crate::store::{EventStore, IdempotencyRequest};
 
-/// Resolve a `--source`/`--base` argument to its canonical bare local branch
-/// name and OID. Accepts `refs/heads/<name>` (full form) and `<name>` (bare
+/// The refusal for a `--source`/`--base` argument that is not a canonical
+/// local branch.
+fn not_canonical(arg: &str) -> String {
+    format!("'{arg}' is not a canonical local branch; use a plain branch name (tags, remote-tracking refs, OIDs, and revision expressions are rejected)")
+}
+
+/// The bare branch name of a `--source`/`--base` argument, checked from the
+/// argument alone. Accepts `refs/heads/<name>` (full form) and `<name>` (bare
 /// form; slashes are legal inside branch names, e.g. `feat/foo`); rejects
-/// tags, remote-tracking refs, OIDs, and revision expressions. The returned
-/// name is always the bare branch name, so downstream construction of
-/// `refs/heads/{name}` (merge, checked-out guard) is always correct.
-fn resolve_local_branch(store: &EventStore, arg: &str) -> Result<(String, git2::Oid), CliError> {
+/// other `refs/` namespaces, `HEAD`, and names git does not accept.
+fn canonical_branch(arg: &str) -> Result<&str, CliError> {
     let name = arg.strip_prefix("refs/heads/").unwrap_or(arg);
-    let full = format!("refs/heads/{name}");
-    let message = || {
-        format!("'{arg}' is not a canonical local branch; use a plain branch name (tags, remote-tracking refs, OIDs, and revision expressions are rejected)")
-    };
     if name.is_empty()
         || (arg.starts_with("refs/") && !arg.starts_with("refs/heads/"))
-        || !git2::Reference::is_valid_name(&full)
+        || !git2::Reference::is_valid_name(&format!("refs/heads/{name}"))
         || name == "HEAD"
     {
-        return Err(CliError::invalid(message()));
+        return Err(CliError::invalid(not_canonical(arg)));
     }
+    Ok(name)
+}
+
+/// Resolve a `--source`/`--base` argument to its canonical bare local branch
+/// name and OID; rejects tags, remote-tracking refs, OIDs, and revision
+/// expressions. The returned name is always the bare branch name, so
+/// downstream construction of `refs/heads/{name}` (merge, checked-out guard)
+/// is always correct.
+fn resolve_local_branch(store: &EventStore, arg: &str) -> Result<(String, git2::Oid), CliError> {
+    let name = canonical_branch(arg)?;
+    let full = format!("refs/heads/{name}");
+    let message = || not_canonical(arg);
     let reference = store.repo().find_reference(&full).map_err(|error| {
         let bare_oid =
             arg == name && name.len() == 40 && name.bytes().all(|byte| byte.is_ascii_hexdigit());
@@ -145,7 +157,8 @@ pub(crate) fn cmd_pr_create(args: &[String]) -> Result<String, CliError> {
                 "",
             )
         })?;
-    // A pure argument check, decided before the repository is opened.
+    // Pure argument checks, decided before the repository is opened and
+    // before an idempotency replay.
     if source.is_empty() || base.is_empty() {
         return Err(CliError::usage("branch name must be non-empty", ""));
     }
@@ -153,6 +166,11 @@ pub(crate) fn cmd_pr_create(args: &[String]) -> Result<String, CliError> {
         return Err(CliError::usage(
             "PR title is required and must be non-empty",
             "",
+        ));
+    }
+    if canonical_branch(&source)? == canonical_branch(&base)? {
+        return Err(CliError::invalid(
+            "source and base branch must differ (no self-PR)",
         ));
     }
     let description = body.as_deref().filter(|b| !b.is_empty());
@@ -220,11 +238,6 @@ fn publish(
     }
     let (source, source_oid) = resolve_local_branch(store.store(), &input.source)?;
     let (base, base_oid) = resolve_local_branch(store.store(), &input.base)?;
-    if source == base {
-        return Err(CliError::invalid(
-            "source and base branch must differ (no self-PR)",
-        ));
-    }
     if source_oid == base_oid {
         return Err(CliError::invalid(
             "source and base branches resolve to the same commit (no self-PR)",

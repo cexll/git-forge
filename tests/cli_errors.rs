@@ -563,17 +563,7 @@ fn unresolvable_review_anchor_names_the_token() {
 fn argument_errors_precede_repository_access() {
     let dir = std::env::temp_dir().join(format!("gf-errors-norepo-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
-    let run = |args: &[&str]| {
-        Command::new(env!("CARGO_BIN_EXE_git-forge"))
-            .args(args)
-            .current_dir(&dir)
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_CEILING_DIRECTORIES", dir.parent().unwrap())
-            .env_remove("GIT_FORGE_ROLE")
-            .output()
-            .unwrap()
-    };
+    let run = |args: &[&str]| run_outside_repository(&dir, args);
     let anchor = "inline review requires --commit <hash> to anchor the comment (FR-005); add \
                   --commit or drop --file/--line";
     let cases: [(&[&str], &str); 5] = [
@@ -610,6 +600,97 @@ fn argument_errors_precede_repository_access() {
                 "{args:?}: {}",
                 String::from_utf8_lossy(&output.stdout).trim_end()
             ));
+        }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// Run the built CLI in `dir`, which is not inside any git repository.
+fn run_outside_repository(dir: &std::path::Path, args: &[&str]) -> Output {
+    Command::new(env!("CARGO_BIN_EXE_git-forge"))
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CEILING_DIRECTORIES", dir.parent().unwrap())
+        .env_remove("GIT_FORGE_ROLE")
+        .output()
+        .unwrap()
+}
+
+/// The `E_INVALID` checks that depend only on the arguments (branch-name
+/// format, a self-PR by name, a duplicate `--blocked-by`) are decided before
+/// the repository is opened and before an idempotency replay: run outside
+/// any git repository, each returns its own error, not the missing
+/// repository.
+#[test]
+fn argument_only_invalid_checks_precede_repository_access() {
+    let dir = std::env::temp_dir().join(format!("gf-errors-norepo-invalid-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let branch = |arg: &str| {
+        format!(
+            "'{arg}' is not a canonical local branch; use a plain branch name (tags, \
+             remote-tracking refs, OIDs, and revision expressions are rejected)"
+        )
+    };
+    let self_pr = "source and base branch must differ (no self-PR)".to_string();
+    let duplicate = "issue new: blocked_by: duplicate issue".to_string();
+    let create = |source: &'static str, base: &'static str, keyed: bool| {
+        let mut args = vec!["pr", "create", "--source", source, "--base", base, "t"];
+        if keyed {
+            args.extend(["--idempotency-key", "k"]);
+        }
+        args.push("--json");
+        args
+    };
+    let blocked = |keyed: bool| {
+        let mut args = vec![
+            "issue",
+            "new",
+            "t",
+            "--blocked-by",
+            "1",
+            "--blocked-by",
+            "1",
+        ];
+        if keyed {
+            args.extend(["--idempotency-key", "k"]);
+        }
+        args.push("--json");
+        args
+    };
+    let mut cases: Vec<(Vec<&str>, String, &str)> = Vec::new();
+    for keyed in [false, true] {
+        cases.push((create("bad name", "main", keyed), branch("bad name"), ""));
+        cases.push((
+            create("f", "refs/tags/v1", keyed),
+            branch("refs/tags/v1"),
+            "",
+        ));
+        cases.push((create("f", "HEAD", keyed), branch("HEAD"), ""));
+        cases.push((
+            create("main", "refs/heads/main", keyed),
+            self_pr.clone(),
+            "",
+        ));
+        cases.push((blocked(keyed), duplicate.clone(), "blocked_by"));
+    }
+    let mut failures = Vec::new();
+    for (args, message, input) in &cases {
+        let output = run_outside_repository(&dir, args);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let error = serde_json::from_str::<serde_json::Value>(stdout.trim_end())
+            .unwrap_or_default()["error"]
+            .clone();
+        if output.status.code() != Some(1)
+            || String::from_utf8_lossy(&output.stderr) != format!("git-forge: {message}\n")
+            || error["code"] != "E_INVALID"
+            || error["message"] != message.as_str()
+            || error["input"] != *input
+            || error["retryable"] != false
+        {
+            failures.push(format!("{args:?}: {}", stdout.trim_end()));
         }
     }
     std::fs::remove_dir_all(&dir).unwrap();

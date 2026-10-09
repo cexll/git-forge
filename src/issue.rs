@@ -131,6 +131,19 @@ fn cmd_new(args: &[String]) -> Result<String, CliError> {
         .get(1)
         .map(|d| d.trim().to_string())
         .filter(|d| !d.is_empty());
+    // A pure argument check, decided before the repository is opened and
+    // before an idempotency replay.
+    let mut sorted = blocked_by.clone();
+    sorted.sort_unstable();
+    if sorted.windows(2).any(|w| w[0] == w[1]) {
+        return Err(CliError::new(
+            "E_INVALID",
+            "issue new: blocked_by: duplicate issue",
+            "blocked_by",
+            "Remove duplicate blocking issue identifiers.",
+            false,
+        ));
+    }
     let request = crate::idempotency::issue_new_request(
         key.as_deref(),
         &title,
