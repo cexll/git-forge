@@ -405,9 +405,12 @@ returns the first result instead of a second Issue, PR or comment.
   `inputs` is the git blob id of the canonical inputs. `json` and `text`
   are the exact `--json` and human results of the recorded mutation, so a
   replay prints them byte for byte in either mode.
-- **Atomicity**: the record ref is created (expected absent) in the same
-  `git update-ref --stdin` transaction as the mutation's refs. Either both
-  are published or neither is. When the transaction fails and a record for
+- **Atomicity**: the record ref is created (expected absent, with
+  `option no-deref`) in the same `git update-ref --stdin` transaction as
+  the mutation's refs. Either both are published or neither is. After
+  `prepare` locks every ref, the record ref must still not exist in any
+  form; a symbolic ref there, even one inserted after the lookup, aborts
+  the whole transaction, so nothing is written through it. When the transaction fails and a record for
   the key exists, a concurrent call with the same key committed first; the
   command answers from that record instead of retrying.
 - **Replay**: the command reads the record before it resolves its identity
@@ -428,9 +431,13 @@ returns the first result instead of a second Issue, PR or comment.
   failure.
 
 A record ref that exists but is not well formed is `E_INVALID`
-(`malformed idempotency record <ref>`): a symbolic ref, a target that is
-not a commit, or a commit without a valid record blob for its key. Only an
-absent ref means a new key. Commands without the flag read and write no
+(`malformed idempotency record <ref>`), never a new key, a conflict or an
+internal error: an unreadable ref file, a symbolic ref, a target that is
+missing or not a commit, a missing tree, a missing or non-blob record
+entry, or a blob that is not a well-formed record for its key (exactly the
+seven fields, `v` 1, matching `command` and `key`, `inputs` exactly 40
+lowercase hex digits, `id` a positive integer, `json` and `text` strings).
+Only an absent ref means a new key. Commands without the flag read and write no
 record.
 
 ### Ref Layout

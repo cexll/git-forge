@@ -113,10 +113,10 @@ impl BoundEventStore {
             let old = expected.map_or_else(|| ZERO_OID.into(), |tip| tip.to_string());
             lines.push(format!("update {} {tip} {old}", issue_ref(*id)));
             if let Some((_, claim)) = claim.filter(|(claimed, _)| claimed == id) {
-                lines.push(self.claim_line(claim, *id, tip)?);
+                lines.extend(self.claim_lines(claim, *id, tip)?);
             }
         }
-        match self.inner.run_update_ref_stdin(&lines) {
+        match self.run_claimed(&lines, claim.map(|(_, claim)| claim)) {
             Ok(()) => Ok(Claimed::Written(())),
             Err(error) => match self.existing_claim(claim.map(|(_, claim)| claim))? {
                 Some(record) => Ok(Claimed::Existing(record)),

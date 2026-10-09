@@ -57,6 +57,17 @@ key is recorded" and "the mutation is applied" therefore cannot exist: both
 are one transaction, with the same guarantee the existing counter-plus-entity
 allocation relies on. A failed transaction publishes neither.
 
+The record line carries `option no-deref`, and the transaction is driven
+interactively: after `prepare: ok` every ref is locked, the record ref
+must still be absent in any form, and only then is `commit` sent;
+otherwise `abort`. `option no-deref` alone is not enough: with git 2.48 an
+expected-absent no-deref update over a dangling symbolic ref commits and
+replaces the symbolic ref, and without no-deref git writes through it to
+its target. The check sits where the lock is held, and `git symbolic-ref`
+needs the same lock, so a symbolic ref inserted after the lookup can no
+longer let the mutation commit while its record lands elsewhere
+(`run_claimed`, `run_update_ref_transaction`).
+
 **Concurrency.** A keyed command looks its record up with a read-only store
 before it resolves its identity, which is where the test-only write barrier
 parks a command. Two concurrent first calls can both pass the lookup. Both
@@ -80,10 +91,17 @@ deleted source branch, a deleted Issue ref) cannot turn the loser's replay
 into `E_NOT_FOUND` or `E_INVALID`. This also covers identity resolution: a
 loser with an invalid `GIT_FORGE_ROLE` replays the recorded result.
 
-**Malformed records.** Only an absent ref means "no record". A symbolic
-ref at a record path is malformed (`E_INVALID`): treating it as absent let
-the claim line write through it to its target. A non-commit target or a
-commit without a valid record blob is malformed too. It precedes domain
+**Malformed records.** Only an absent ref means "no record". One validator,
+`EventStore::idempotency_record`, maps every other record ref state to
+`E_INVALID` `malformed idempotency record <ref>`: an unreadable ref file, a
+symbolic ref (treating it as absent let the claim line write through it), a
+missing or non-commit target, a missing tree, a missing or non-blob record
+entry, and any blob that is not exactly the seven typed fields for this
+command and key. `inputs` must be exactly 40 lowercase hex digits:
+`Oid::from_str` also accepts short hex (zero-padded) and uppercase, which
+turned a damaged digest into a false `E_CONFLICT` or a false replay. The
+ticket #39 failure-mode table is the test table in
+`src/store/idempotency/tests.rs`. It precedes domain
 validation, so a replay succeeds after the Issue was closed, the PR
 abandoned, or a branch moved or deleted. A key reused with different inputs
 fails with `E_CONFLICT`, `retryable: false` (a retry with the same key cannot

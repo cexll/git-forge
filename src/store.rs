@@ -223,7 +223,22 @@ impl EventStore {
     /// Returns Ok(()) when every command applied atomically, Err otherwise
     /// (stderr included in the error). Never swallows failures.
     pub(crate) fn run_update_ref_stdin(&self, lines: &[String]) -> Result<(), StoreError> {
-        use std::io::Write;
+        self.run_update_ref_transaction(lines, &[])
+    }
+
+    /// [`Self::run_update_ref_stdin`] that also requires each ref in
+    /// `absent` to still not exist once `prepare` holds every lock. An
+    /// expected-absent `option no-deref` update accepts a dangling symbolic
+    /// ref and replaces it, so the check runs between `prepare` and
+    /// `commit`: the lock on each ref is held there, and any other git writer
+    /// needs that same lock. A present ref aborts the whole transaction.
+    pub(crate) fn run_update_ref_transaction(
+        &self,
+        lines: &[String],
+        absent: &[String],
+    ) -> Result<(), StoreError> {
+        use std::io::{BufRead, Write};
+        let command_error = |e: std::io::Error| StoreError::Command(e.to_string());
         let mut child = Command::new("git")
             .arg("--git-dir")
             .arg(&self.git_dir)
@@ -234,25 +249,51 @@ impl EventStore {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             .spawn()
-            .map_err(|e| StoreError::Command(e.to_string()))?;
+            .map_err(command_error)?;
         let mut stdin = child.stdin.take().unwrap();
         let mut buf = String::from("start\n");
         for l in lines {
             buf.push_str(l);
             buf.push('\n');
         }
-        buf.push_str("prepare\ncommit\n");
-        let _ = stdin.write_all(buf.as_bytes());
+        buf.push_str("prepare\n");
+        // A write error means git already exited; its status reports why.
+        let _ = stdin.write_all(buf.as_bytes()).and_then(|()| stdin.flush());
+        let mut stdout = std::io::BufReader::new(child.stdout.take().unwrap());
+        let mut reply = String::new();
+        let mut prepared = false;
+        while !prepared && stdout.read_line(&mut reply).map_err(command_error)? > 0 {
+            prepared = reply == "prepare: ok\n";
+            reply.clear();
+        }
+        let present = absent
+            .iter()
+            .find(|name| prepared && self.ref_present(name));
+        let finish: &[u8] = if present.is_some() {
+            b"abort\n"
+        } else {
+            b"commit\n"
+        };
+        let _ = stdin.write_all(finish);
         drop(stdin);
-        let out = child
-            .wait_with_output()
-            .map_err(|e| StoreError::Command(e.to_string()))?;
+        let out = child.wait_with_output().map_err(command_error)?;
+        if let Some(name) = present {
+            return Err(StoreError::Command(format!(
+                "{name} exists at commit time; transaction aborted"
+            )));
+        }
         if out.status.success() {
             Ok(())
         } else {
             let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
             Err(StoreError::Command(stderr))
         }
+    }
+
+    /// Whether `name` exists in any form: direct, symbolic (even dangling),
+    /// or an unreadable ref file.
+    fn ref_present(&self, name: &str) -> bool {
+        !matches!(self.repo.find_reference(name), Err(e) if e.code() == git2::ErrorCode::NotFound)
     }
 
     /// CAS one ref: move `entity_ref` from `expected` to `new_oid` atomically.
@@ -899,9 +940,9 @@ impl BoundEventStore {
                 lines.push(format!("update {r} {oid} {ZERO_OID}"));
             }
             if let Some(claim) = claim {
-                lines.push(self.claim_line(claim, next, ci_oid)?);
+                lines.extend(self.claim_lines(claim, next, ci_oid)?);
             }
-            match self.inner.run_update_ref_stdin(&lines) {
+            match self.run_claimed(&lines, claim) {
                 Ok(()) => return Ok(Claimed::Written(next)),
                 Err(e) => {
                     // A same-key record explains the failure before any retry:

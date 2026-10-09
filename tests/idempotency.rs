@@ -924,7 +924,6 @@ fn commands_without_a_key_write_no_record_and_repeat_the_mutation() {
 #[test]
 fn a_present_but_malformed_record_ref_is_invalid() {
     let record = record_ref("issue-new", "k");
-    let message = format!("invalid store state: malformed idempotency record {record}");
     type Corrupt = fn(&Repo, &str);
     let corrupt: [(&str, Corrupt); 3] = [
         ("symbolic ref", |repo, record| {
@@ -954,25 +953,214 @@ fn a_present_but_malformed_record_ref_is_invalid() {
             &["issue", "new", "t", "--idempotency-key", "k", "--json"][..],
             &["issue", "new", "t", "--idempotency-key", "k"][..],
         ] {
-            let output = repo.run(args);
-            assert_eq!(output.status.code(), Some(1), "{case}");
-            assert_eq!(stderr(&output), format!("git-forge: {message}\n"), "{case}");
-            if args.contains(&"--json") {
-                assert_eq!(
-                    json(&stdout(&output)),
-                    serde_json::json!({"error": {
-                        "code": "E_INVALID", "message": message, "input": "",
-                        "hint": "Correct the repository state before retrying.",
-                        "retryable": false,
-                    }}),
-                    "{case}"
-                );
-            } else {
-                assert_eq!(stdout(&output), "", "{case}");
-            }
+            assert_malformed(&repo.run(args), &record, args.contains(&"--json"), case);
             assert_eq!(repo.forge_refs(), refs, "{case}");
         }
     }
+}
+
+/// Exit 1 with the malformed-record `E_INVALID` for `record`: the stderr
+/// line, and the complete JSON error on stdout when `json_mode`.
+fn assert_malformed(output: &Output, record: &str, json_mode: bool, case: &str) {
+    let message = format!("invalid store state: malformed idempotency record {record}");
+    assert_eq!(output.status.code(), Some(1), "{case}: {}", stderr(output));
+    assert_eq!(stderr(output), format!("git-forge: {message}\n"), "{case}");
+    if json_mode {
+        assert_eq!(
+            json(&stdout(output)),
+            serde_json::json!({"error": {
+                "code": "E_INVALID", "message": message, "input": "",
+                "hint": "Correct the repository state before retrying.",
+                "retryable": false,
+            }}),
+            "{case}"
+        );
+    } else {
+        assert_eq!(stdout(output), "", "{case}");
+    }
+}
+
+/// Point `record` at a new root commit whose `.forge/idempotency.json` is
+/// `content`; returns the commit.
+fn forge_record(repo: &Repo, record: &str, content: &str) -> String {
+    let path = repo.0.with_extension("record.json");
+    std::fs::write(&path, content).unwrap();
+    let blob = repo.git(&["hash-object", "-w", &path.to_string_lossy()]);
+    std::fs::remove_file(&path).unwrap();
+    let index = repo.0.with_extension("record-index");
+    let index = index.to_string_lossy();
+    let output = Command::new("git")
+        .args(["update-index", "--add", "--cacheinfo"])
+        .arg(format!("100644,{blob},.forge/idempotency.json"))
+        .current_dir(&repo.0)
+        .env("GIT_INDEX_FILE", index.as_ref())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let tree = Command::new("git")
+        .arg("write-tree")
+        .current_dir(&repo.0)
+        .env("GIT_INDEX_FILE", index.as_ref())
+        .output()
+        .unwrap();
+    std::fs::remove_file(index.as_ref()).unwrap();
+    let tree = String::from_utf8(tree.stdout).unwrap().trim().to_string();
+    let commit = repo.git(&["commit-tree", &tree, "-m", "forged"]);
+    repo.git(&["update-ref", record, &commit]);
+    commit
+}
+
+/// The record blob `record` holds, parsed.
+fn record_json(repo: &Repo, record: &str) -> serde_json::Value {
+    json(&repo.git(&[
+        "cat-file",
+        "blob",
+        &format!("{record}:.forge/idempotency.json"),
+    ]))
+}
+
+/// r3: a record whose `inputs` digest is not exactly 40 lowercase hex is
+/// malformed. libgit2 zero-pads short hex and accepts uppercase, so a short
+/// digest used to read as different inputs (E_CONFLICT) and an uppercase one
+/// as the same inputs (a replay).
+#[test]
+fn a_record_inputs_digest_that_is_not_40_lowercase_hex_is_invalid() {
+    let args = ["issue", "new", "t", "--idempotency-key", "k", "--json"];
+    let record = record_ref("issue-new", "k");
+    let mut failures = Vec::new();
+    for case in ["short", "uppercase", "long"] {
+        let repo = Repo::new();
+        repo.branches();
+        repo.ok(&args);
+        let mut content = record_json(&repo, &record);
+        let digest = content["inputs"].as_str().unwrap().to_string();
+        content["inputs"] = match case {
+            "short" => digest[..1].into(),
+            "uppercase" => digest.to_uppercase().into(),
+            _ => format!("{digest}0").into(),
+        };
+        forge_record(&repo, &record, &content.to_string());
+        let refs = repo.forge_refs();
+        let output = repo.run(&args);
+        if output.status.code() != Some(1) || !stdout(&output).contains("E_INVALID") {
+            failures.push(format!(
+                "{case}: {:?} {}",
+                output.status.code(),
+                stdout(&output)
+            ));
+            continue;
+        }
+        assert_malformed(&output, &record, true, case);
+        assert_eq!(repo.forge_refs(), refs, "{case}");
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}
+
+/// r3: a record commit whose tree entry names a missing blob is malformed,
+/// not an internal error.
+#[test]
+fn a_record_entry_pointing_at_a_missing_blob_is_invalid() {
+    let repo = Repo::new();
+    repo.branches();
+    let args = ["issue", "new", "t", "--idempotency-key", "k", "--json"];
+    repo.ok(&args);
+    let record = record_ref("issue-new", "k");
+    let blob = repo.git(&["rev-parse", &format!("{record}:.forge/idempotency.json")]);
+    let objects = repo.0.join(".git/objects");
+    std::fs::remove_file(objects.join(&blob[..2]).join(&blob[2..])).unwrap();
+    let refs = repo.forge_refs();
+    for json_mode in [true, false] {
+        let args = if json_mode { &args[..] } else { &args[..5] };
+        assert_malformed(&repo.run(args), &record, json_mode, "missing blob");
+        assert_eq!(repo.forge_refs(), refs);
+    }
+}
+
+/// r3: a symbolic record ref inserted after the record lookup (at the write
+/// barrier) fails the whole publishing transaction for every keyed command:
+/// no mutation, no write through the symbolic ref, and the loser recheck
+/// reports the malformed record.
+#[test]
+fn a_symbolic_record_ref_inserted_at_the_write_barrier_writes_nothing() {
+    let cases: [(&str, &[&str]); 4] = [
+        (
+            "issue-new",
+            &["issue", "new", "t", "--idempotency-key", "k", "--json"],
+        ),
+        (
+            "pr-create",
+            &[
+                "pr",
+                "create",
+                "--source",
+                "feature",
+                "--base",
+                "main",
+                "p",
+                "--idempotency-key",
+                "k",
+                "--json",
+            ],
+        ),
+        (
+            "issue-comment",
+            &[
+                "issue",
+                "comment",
+                "1",
+                "c",
+                "--idempotency-key",
+                "k",
+                "--json",
+            ],
+        ),
+        (
+            "pr-comment",
+            &[
+                "pr",
+                "comment",
+                "2",
+                "c",
+                "--idempotency-key",
+                "k",
+                "--json",
+            ],
+        ),
+    ];
+    let target = "refs/forge/race-target";
+    let mut failures = Vec::new();
+    for (kind, args) in cases {
+        let repo = Repo::new();
+        repo.branches();
+        repo.ok(&["issue", "new", "one"]);
+        repo.ok(&["pr", "create", "--source", "other", "--base", "main", "q"]);
+        let record = record_ref(kind, "k");
+        let refs = repo.forge_refs();
+        let barrier = repo.0.with_extension("barrier");
+        let child = spawn_parked(&repo, args, &barrier);
+        repo.git(&["symbolic-ref", &record, target]);
+        let output = release(child, &barrier);
+        let _ = std::fs::remove_dir_all(&barrier);
+        let target_exists = Command::new("git")
+            .args(["rev-parse", "-q", "--verify", target])
+            .current_dir(&repo.0)
+            .output()
+            .unwrap()
+            .status
+            .success();
+        if output.status.code() != Some(1) || target_exists {
+            failures.push(format!(
+                "{kind}: exit {:?}, {target} written: {target_exists}, refs {:?}",
+                output.status.code(),
+                repo.forge_ref_names()
+            ));
+            continue;
+        }
+        assert_malformed(&output, &record, true, kind);
+        assert_eq!(repo.forge_refs(), refs, "{kind}");
+        assert_eq!(repo.git(&["symbolic-ref", &record]), target, "{kind}");
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
 }
 
 /// A same-key loser that resumes after the winner committed must answer from
