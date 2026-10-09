@@ -1056,6 +1056,32 @@ fn a_record_inputs_digest_that_is_not_40_lowercase_hex_is_invalid() {
     assert!(failures.is_empty(), "{failures:#?}");
 }
 
+/// A record ref must point at a root commit: a one-parent commit with the
+/// record's own tree is malformed, not a replay.
+#[test]
+fn a_record_commit_with_a_parent_is_invalid() {
+    let repo = Repo::new();
+    repo.branches();
+    let args = ["issue", "new", "t", "--idempotency-key", "k", "--json"];
+    repo.ok(&args);
+    let record = record_ref("issue-new", "k");
+    let root = repo.git(&["rev-parse", &record]);
+    let tree = repo.git(&["rev-parse", &format!("{record}^{{tree}}")]);
+    let child = repo.git(&["commit-tree", &tree, "-p", &root, "-m", "child"]);
+    repo.git(&["update-ref", &record, &child]);
+    let refs = repo.forge_refs();
+    for json_mode in [true, false] {
+        let args = if json_mode { &args[..] } else { &args[..5] };
+        assert_malformed(
+            &repo.run(args),
+            &record,
+            json_mode,
+            "one-parent record commit",
+        );
+        assert_eq!(repo.forge_refs(), refs);
+    }
+}
+
 /// r3: a record commit whose tree entry names a missing blob is malformed,
 /// not an internal error.
 #[test]

@@ -374,6 +374,31 @@ fn record_commit(store: &BoundEventStore, blob: &[u8]) -> Oid {
         .unwrap()
 }
 
+/// A commit over `good`'s tree reshaped by `reshape` (root tree builder,
+/// `.forge` tree builder), with `good` as its parent when `child`.
+fn reshaped(
+    store: &BoundEventStore,
+    good: Oid,
+    child: bool,
+    reshape: fn(&Repository, &mut TreeBuilder<'_>, &mut TreeBuilder<'_>),
+) -> Oid {
+    let repo = store.repo();
+    let good = repo.find_commit(good).unwrap();
+    let tree = good.tree().unwrap();
+    let forge_id = tree.get_name(".forge").unwrap().id();
+    let mut forge = repo
+        .treebuilder(Some(&repo.find_tree(forge_id).unwrap()))
+        .unwrap();
+    let mut root = repo.treebuilder(Some(&tree)).unwrap();
+    reshape(repo, &mut root, &mut forge);
+    root.insert(".forge", forge.write().unwrap(), 0o040000)
+        .unwrap();
+    let tree = repo.find_tree(root.write().unwrap()).unwrap();
+    let sig = Signature::now("Test", "test@example.com").unwrap();
+    let parents: Vec<&git2::Commit<'_>> = if child { vec![&good] } else { vec![] };
+    repo.commit(None, &sig, &sig, "m", &tree, &parents).unwrap()
+}
+
 fn loose_object(store: &BoundEventStore, oid: Oid) -> std::path::PathBuf {
     let hex = oid.to_string();
     store
@@ -444,26 +469,10 @@ fn prepare(store: &BoundEventStore, name: &str, good: &str, setup: &Setup) {
     }
 }
 
-/// Every record failure mode in the ticket #39 table: each present but
-/// malformed record ref is `InvalidState("malformed idempotency record
-/// <ref>")`, never an absent key, a conflict, or an internal error.
-#[test]
-fn every_malformed_record_failure_mode_is_invalid_state() {
-    let req = request(IdempotentCommand::IssueNew, "k", "{}");
-    let name = req.ref_name();
-    let good = record_blob(&req, &result(1, Oid::zero()));
-    let digest = req.inputs.to_string();
-    let edit = |from: &str, to: &str| {
-        assert!(good.contains(from), "{from}");
-        Setup::Content(good.replacen(from, to, 1).into_bytes())
-    };
-    let inputs = |value: &str| {
-        edit(
-            &format!("\"inputs\":\"{digest}\""),
-            &format!("\"inputs\":{value}"),
-        )
-    };
-    let rows: Vec<(&str, Setup)> = vec![
+/// The ref-level rows and the content rows about the record's objects
+/// (commit, tree shape, blob presence) of the ticket #39 table.
+fn object_rows() -> Vec<(&'static str, Setup)> {
+    vec![
         // Ref level.
         (
             "R3 symbolic, dangling",
@@ -518,6 +527,63 @@ fn every_malformed_record_failure_mode_is_invalid_state() {
                     .id()
             }),
         ),
+        (
+            "C12 record commit has a parent (same tree)",
+            Setup::Direct(false, |s, c| reshaped(s, c, true, |_, _, _| {})),
+        ),
+        (
+            "C13 extra root tree entry",
+            Setup::Direct(false, |s, c| {
+                reshaped(s, c, false, |repo, root, _| {
+                    root.insert("x", repo.blob(b"x").unwrap(), 0o100644)
+                        .unwrap();
+                })
+            }),
+        ),
+        (
+            "C13 extra .forge tree entry",
+            Setup::Direct(false, |s, c| {
+                reshaped(s, c, false, |repo, _, forge| {
+                    forge
+                        .insert("event.json", repo.blob(b"{}").unwrap(), 0o100644)
+                        .unwrap();
+                })
+            }),
+        ),
+        (
+            "C13 record entry executable",
+            Setup::Direct(false, |s, c| {
+                reshaped(s, c, false, |_, _, forge| {
+                    let id = forge.get("idempotency.json").unwrap().unwrap().id();
+                    forge.insert("idempotency.json", id, 0o100755).unwrap();
+                })
+            }),
+        ),
+    ]
+}
+
+/// Every record failure mode in the ticket #39 table: each present but
+/// malformed record ref is `InvalidState("malformed idempotency record
+/// <ref>")`, never an absent key, a conflict, or an internal error.
+#[test]
+fn every_malformed_record_failure_mode_is_invalid_state() {
+    let req = request(IdempotentCommand::IssueNew, "k", "{}");
+    let name = req.ref_name();
+    let good = record_blob(&req, &result(1, Oid::zero()));
+    let digest = req.inputs.to_string();
+    let edit = |from: &str, to: &str| {
+        assert!(good.contains(from), "{from}");
+        Setup::Content(good.replacen(from, to, 1).into_bytes())
+    };
+    let inputs = |value: &str| {
+        edit(
+            &format!("\"inputs\":\"{digest}\""),
+            &format!("\"inputs\":{value}"),
+        )
+    };
+    let mut rows = object_rows();
+    rows.extend([
+        // Content level: the blob.
         ("C5 not UTF-8", Setup::Content(b"{\"v\":1,\xff}".to_vec())),
         ("C5 not JSON", Setup::Content(b"not json".to_vec())),
         ("C5 not an object", Setup::Content(b"[1]".to_vec())),
@@ -571,7 +637,7 @@ fn every_malformed_record_failure_mode_is_invalid_state() {
             "C11 text null",
             edit("\"text\":\"did #1\"", "\"text\":null"),
         ),
-    ];
+    ]);
     let expected = format!("malformed idempotency record {name}");
     let mut failures = Vec::new();
     for (row, setup) in &rows {

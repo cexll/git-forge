@@ -66,7 +66,12 @@ replaces the symbolic ref, and without no-deref git writes through it to
 its target. The check sits where the lock is held, and `git symbolic-ref`
 needs the same lock, so a symbolic ref inserted after the lookup can no
 longer let the mutation commit while its record lands elsewhere
-(`run_claimed`, `run_update_ref_transaction`).
+(`run_claimed`, `run_update_ref_transaction`). Because the runner waits
+for `prepare: ok` on stdout, a thread drains stderr from spawn onward: a
+`reference-transaction` hook that writes more than a pipe buffer to stderr
+would otherwise stall git before it answers, with the locks held. Every exit
+path closes stdin (git aborts and removes its `.lock` files) and reaps the
+child, also on a panic or an early return (`store/update_ref.rs`).
 
 **Concurrency.** A keyed command looks its record up with a read-only store
 before it resolves its identity, which is where the test-only write barrier
@@ -95,8 +100,9 @@ loser with an invalid `GIT_FORGE_ROLE` replays the recorded result.
 `EventStore::idempotency_record`, maps every other record ref state to
 `E_INVALID` `malformed idempotency record <ref>`: an unreadable ref file, a
 symbolic ref (treating it as absent let the claim line write through it), a
-missing or non-commit target, a missing tree, a missing or non-blob record
-entry, and any blob that is not exactly the seven typed fields for this
+missing target or one that is not a root commit, a missing tree, a tree with
+any entry besides `.forge/idempotency.json`, a missing or non-regular-file
+record blob, and any blob that is not exactly the seven typed fields for this
 command and key. `inputs` must be exactly 40 lowercase hex digits:
 `Oid::from_str` also accepts short hex (zero-padded) and uppercase, which
 turned a damaged digest into a false `E_CONFLICT` or a false replay. The

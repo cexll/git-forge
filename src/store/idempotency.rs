@@ -3,8 +3,8 @@
 //!
 //! Ref: `refs/forge/idempotency/<command>/<hex>`, where `<hex>` is the
 //! lowercase hex of the key's bytes (injective and always a legal ref
-//! component). Target: a root commit whose tree holds one blob,
-//! `.forge/idempotency.json`:
+//! component). Target: a root commit whose tree holds only one regular-file
+//! blob, `.forge/idempotency.json`:
 //! `{"v":1,"command":..,"key":..,"inputs":<digest>,"id":..,"json":..,"text":..}`.
 //! `inputs` is the git blob id of the command's canonical inputs; `json` and
 //! `text` are the exact `--json` and human results of the recorded mutation.
@@ -175,6 +175,12 @@ fn full_blob_id(text: &str) -> Option<Oid> {
     canonical.then(|| Oid::from_str(text).ok()).flatten()
 }
 
+/// The id of `tree`'s only entry, when it is `name` with mode `mode`.
+fn sole_entry(tree: &git2::Tree<'_>, name: &str, mode: git2::FileMode) -> Option<Oid> {
+    let entry = tree.get(0).filter(|_| tree.len() == 1)?;
+    (entry.name() == Some(name) && entry.filemode() == i32::from(mode)).then(|| entry.id())
+}
+
 impl EventStore {
     /// The record for `request`'s command kind and key, if one exists.
     /// Absent is the only "no record" answer; every other record ref that is
@@ -198,17 +204,27 @@ impl EventStore {
             .ok_or_else(|| StoreError::InvalidState(format!("malformed idempotency record {name}")))
     }
 
-    /// The record behind a present record ref: a direct ref to a commit
-    /// whose tree holds the record blob, which is a well-formed record for
-    /// `request`. Any missing or wrongly typed object on the way is `None`.
+    /// The record behind a present record ref: a direct ref to a root
+    /// commit whose tree holds only `.forge/idempotency.json`, a regular-file
+    /// blob that is a well-formed record for `request`. Any other shape, and
+    /// any missing or wrongly typed object on the way, is `None`.
     fn read_record(
         &self,
         request: &IdempotencyRequest,
         reference: &git2::Reference<'_>,
     ) -> Option<IdempotencyRecord> {
         let commit = self.repo.find_commit(reference.target()?).ok()?;
-        let entry = commit.tree().ok()?.get_path(Path::new(RECORD_PATH)).ok()?;
-        let blob = entry.to_object(&self.repo).ok()?.into_blob().ok()?;
+        if commit.parent_count() != 0 {
+            return None;
+        }
+        let (dir, leaf) = RECORD_PATH.split_once('/')?;
+        let forge = sole_entry(&commit.tree().ok()?, dir, git2::FileMode::Tree)?;
+        let blob = sole_entry(
+            &self.repo.find_tree(forge).ok()?,
+            leaf,
+            git2::FileMode::Blob,
+        )?;
+        let blob = self.repo.find_blob(blob).ok()?;
         parse_record(request, std::str::from_utf8(blob.content()).ok()?)
     }
 }

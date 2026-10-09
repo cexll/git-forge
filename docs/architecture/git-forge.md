@@ -94,6 +94,7 @@ git-forge/
 │   ├── issue_apply.rs   # snapshot + atomic apply/new graph publication
 │   ├── store/issue_batch.rs # snapshot/CAS batch ref transaction
 │   ├── store/idempotency.rs # idempotency record refs, published in the mutation's transaction
+│   ├── store/update_ref.rs  # the one `git update-ref --stdin` transaction runner
 │   ├── idempotency.rs   # --idempotency-key parsing, canonical inputs, replay
 │   ├── pr_merge.rs      # cmd_pr_merge: merge-gate predicate + orchestration (temp worktree, pending result, atomic finalize)
 │   └── store.rs         # refs read/write via git2
@@ -433,8 +434,9 @@ returns the first result instead of a second Issue, PR or comment.
 A record ref that exists but is not well formed is `E_INVALID`
 (`malformed idempotency record <ref>`), never a new key, a conflict or an
 internal error: an unreadable ref file, a symbolic ref, a target that is
-missing or not a commit, a missing tree, a missing or non-blob record
-entry, or a blob that is not a well-formed record for its key (exactly the
+missing or not a root commit, a missing tree, a tree with any entry besides
+`.forge/idempotency.json`, a missing record blob or one that is not a
+regular file (mode `100644`), or a blob that is not a well-formed record for its key (exactly the
 seven fields, `v` 1, matching `command` and `key`, `inputs` exactly 40
 lowercase hex digits, `id` a positive integer, `json` and `text` strings).
 Only an absent ref means a new key. Commands without the flag read and write no
