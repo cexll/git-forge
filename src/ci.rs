@@ -406,6 +406,15 @@ fn tighten_ci_env(cmd: &mut std::process::Command) {
 /// tool there is no separate-principal boundary to cross. An install not found
 /// is a spawn failure (honest), never a caller-resolved binary.
 fn resolve_just() -> Result<std::path::PathBuf, String> {
+    const NOT_FOUND: &str = "no trusted `just` found in system or operator install locations";
+    // Debug-only test seam: `GIT_FORGE_TEST_NO_TRUSTED_JUST=1` makes every
+    // trusted location unavailable, so the spawn-failure path is testable
+    // whatever the host has installed. Inert in release builds and when the
+    // env var is unset.
+    #[cfg(debug_assertions)]
+    if std::env::var("GIT_FORGE_TEST_NO_TRUSTED_JUST").as_deref() == Ok("1") {
+        return Err(NOT_FOUND.to_string());
+    }
     // Phase 1 — system install locations (this probe reads no caller env). If
     // no runnable `just` is found here, fall through to the operator's own
     // `~/.cargo/bin` / `~/.local/bin` below. An install found nowhere is a
@@ -449,7 +458,7 @@ fn resolve_just() -> Result<std::path::PathBuf, String> {
             return Ok(p);
         }
     }
-    Err("no trusted `just` found in system or operator install locations".to_string())
+    Err(NOT_FOUND.to_string())
 }
 
 /// Run the repo CI plan inside the temp worktree (the PR's own commits).

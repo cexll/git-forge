@@ -310,14 +310,14 @@ fn surviving_background_process_is_cleanup_failed() {
     });
 }
 
+/// No trusted `just` install: the debug-only seam makes every trusted
+/// location unavailable, independent of what the host has installed.
 #[test]
 fn missing_trusted_just_is_spawn_failed() {
-    let home = std::env::temp_dir().join(format!("gf-ci-diag-home-{}", std::process::id()));
-    std::fs::create_dir_all(&home).unwrap();
     run_case(Case {
         name: "spawn",
         files: vec![("justfile", Plan::Bytes(b"check:\n    echo hi\n".to_vec()))],
-        env: vec![("HOME", home.to_str().unwrap().into())],
+        env: vec![("GIT_FORGE_TEST_NO_TRUSTED_JUST", "1".into())],
         failure: "CI run for PR #1 failed (just check): no trusted `just` found in system or \
                   operator install locations"
             .into(),
@@ -325,7 +325,6 @@ fn missing_trusted_just_is_spawn_failed() {
         tail: String::new(),
         plan: Some("just check"),
     });
-    std::fs::remove_dir_all(&home).unwrap();
 }
 
 #[test]
