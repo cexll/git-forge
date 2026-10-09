@@ -1337,3 +1337,136 @@ fn a_same_key_loser_replays_even_when_its_validation_inputs_changed() {
     }
     assert!(failures.is_empty(), "{failures:#?}");
 }
+
+/// Install a `reference-transaction` hook in `hooks` that, on `prepared`,
+/// touches `held` and then waits for `go`, so the first transaction to
+/// prepare keeps every ref lock it took until the test releases it.
+fn hold_prepared_hook(hooks: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(hooks).unwrap();
+    let dir = hooks.display();
+    let hook = hooks.join("reference-transaction");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\ncat >/dev/null\n[ \"$1\" = prepared ] || exit 0\n: > '{dir}/held'\n\
+             while [ ! -e '{dir}/go' ]; do sleep 0.02; done\n"
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Wait until `path` exists while `child` keeps running.
+fn wait_for(child: &mut std::process::Child, path: &Path, what: &str) {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !path.exists() {
+        assert!(child.try_wait().unwrap().is_none(), "{what}: exited early");
+        assert!(std::time::Instant::now() < deadline, "{what}: timed out");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+/// A same-key loser whose transaction meets the winner's ref locks while the
+/// winner is prepared but not yet committed finds no record to replay. It
+/// returns a retryable `E_CONFLICT`, never an internal error; once the
+/// winner commits, the same call replays the winner's result.
+#[test]
+fn a_same_key_loser_blocked_by_a_prepared_winner_gets_a_retryable_conflict() {
+    let cases: [(&str, &[&str]); 4] = [
+        (
+            "issue new",
+            &["issue", "new", "t", "--idempotency-key", "k", "--json"],
+        ),
+        (
+            "pr create",
+            &[
+                "pr",
+                "create",
+                "--source",
+                "feature",
+                "--base",
+                "main",
+                "p",
+                "--idempotency-key",
+                "k",
+                "--json",
+            ],
+        ),
+        (
+            "issue comment",
+            &[
+                "issue",
+                "comment",
+                "1",
+                "c",
+                "--idempotency-key",
+                "k",
+                "--json",
+            ],
+        ),
+        (
+            "pr comment",
+            &[
+                "pr",
+                "comment",
+                "2",
+                "c",
+                "--idempotency-key",
+                "k",
+                "--json",
+            ],
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (case, args) in cases {
+        let repo = Repo::new();
+        repo.branches();
+        repo.ok(&["issue", "new", "one"]);
+        repo.ok(&["pr", "create", "--source", "other", "--base", "main", "q"]);
+        let a = repo.0.with_extension("barrier-a");
+        let b = repo.0.with_extension("barrier-b");
+        let hooks = repo.0.with_extension("hooks");
+        hold_prepared_hook(&hooks);
+        // The winner alone runs the hook: only its environment names it.
+        let mut winner = repo
+            .command(args)
+            .env("GIT_FORGE_TEST_WRITE_BARRIER", &a)
+            .env("GIT_CONFIG_COUNT", "1")
+            .env("GIT_CONFIG_KEY_0", "core.hooksPath")
+            .env("GIT_CONFIG_VALUE_0", &hooks)
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        wait_for(&mut winner, &a.join("ready"), case);
+        let loser = spawn_parked(&repo, args, &b);
+        std::fs::write(a.join("release"), "release").unwrap();
+        wait_for(&mut winner, &hooks.join("held"), case);
+        let lost = release(loser, &b);
+        let winner_prepared = winner.try_wait().unwrap().is_none();
+        std::fs::write(hooks.join("go"), "go").unwrap();
+        let won = winner.wait_with_output().unwrap();
+        for dir in [&a, &b, &hooks] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+        assert!(winner_prepared, "{case}: the winner committed too early");
+        let won = success(&won);
+        let error =
+            serde_json::from_str::<serde_json::Value>(stdout(&lost).trim_end()).unwrap_or_default();
+        if lost.status.code() != Some(1)
+            || error["error"]["code"] != "E_CONFLICT"
+            || error["error"]["retryable"] != true
+        {
+            failures.push(format!(
+                "{case}: exit {:?}, stdout {}, stderr {}",
+                lost.status.code(),
+                stdout(&lost),
+                stderr(&lost)
+            ));
+            continue;
+        }
+        assert_eq!(success(&repo.run(args)), won, "{case}: replay");
+    }
+    assert!(failures.is_empty(), "{failures:#?}");
+}

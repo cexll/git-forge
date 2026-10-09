@@ -298,6 +298,11 @@ impl BoundEventStore {
                     if let Some(record) = self.existing_claim(Some(claim))? {
                         return Ok(Claimed::Existing(record));
                     }
+                    // A same-key winner may hold the locks, prepared but not
+                    // yet committed: its record is not readable yet.
+                    if super::issue_batch::lock_contended(&error, &lines) {
+                        return Err(StoreError::CasConflict);
+                    }
                     let fresh = self.inner.current_tip(entity_ref)?;
                     if fresh == tip {
                         return Err(error);

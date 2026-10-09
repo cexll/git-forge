@@ -879,6 +879,11 @@ impl BoundEventStore {
                     if self.inner.current_tip(COUNTER_REF)? != counter_tip {
                         continue;
                     }
+                    // A same-key winner may hold the locks, prepared but not
+                    // yet committed: its record is not readable yet.
+                    if claim.is_some() && issue_batch::lock_contended(&e, &lines) {
+                        return Err(StoreError::CasConflict);
+                    }
                     // Counter unchanged (batch rolled back): a pre-existing PR
                     // ref is the stale-collision case.
                     let mut any_preexisting = false;

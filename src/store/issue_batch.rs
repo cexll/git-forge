@@ -120,7 +120,11 @@ impl BoundEventStore {
             Ok(()) => Ok(Claimed::Written(())),
             Err(error) => match self.existing_claim(claim.map(|(_, claim)| claim))? {
                 Some(record) => Ok(Claimed::Existing(record)),
-                None if expected_value_rejected(&error, &lines) => Err(StoreError::CasConflict),
+                None if expected_value_rejected(&error, &lines)
+                    || (claim.is_some() && lock_contended(&error, &lines)) =>
+                {
+                    Err(StoreError::CasConflict)
+                }
                 None => Err(error),
             },
         }
@@ -172,6 +176,27 @@ pub(crate) fn expected_value_rejected(error: &StoreError, lines: &[String]) -> b
                 rejected == expected && actual != expected && Oid::from_str(actual).is_ok()
             })
     })
+}
+
+/// Whether `error` is git's lock-file contention on a ref this transaction
+/// names: another transaction holds `<ref>.lock` (for example a same-key
+/// winner that is prepared but not yet committed). Recognized only from the
+/// exact `prepare` diagnostic; every other failure stays fatal.
+pub(super) fn lock_contended(error: &StoreError, lines: &[String]) -> bool {
+    let StoreError::Command(stderr) = error else {
+        return false;
+    };
+    lines
+        .iter()
+        .filter_map(|line| line.split_whitespace().nth(1))
+        .any(|reference| {
+            let prefix =
+                format!("fatal: prepare: cannot lock ref '{reference}': Unable to create '");
+            stderr
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.split_once("': File exists."))
+                .is_some_and(|(path, _)| path.ends_with(&format!("/{reference}.lock")))
+        })
 }
 
 #[cfg(test)]
@@ -498,5 +523,38 @@ mod tests {
             store.store().current_tip(COUNTER_REF).unwrap(),
             snapshot.counter_tip
         );
+    }
+
+    /// Lock-file contention is recognized only from git's exact `prepare`
+    /// diagnostic for a ref the transaction names.
+    #[test]
+    fn lock_contention_is_recognized_only_for_a_named_ref() {
+        let lines = vec![
+            format!("update {COUNTER_REF} {} {ZERO_OID}", "1".repeat(40)),
+            "option no-deref".to_string(),
+            format!("update refs/forge/issues/1 {} {ZERO_OID}", "2".repeat(40)),
+        ];
+        let held = |reference: &str| {
+            StoreError::Command(format!(
+                "fatal: prepare: cannot lock ref '{reference}': Unable to create \
+                 '/tmp/r/.git//{reference}.lock': File exists.\n\nAnother git process \
+                 seems to be running in this repository"
+            ))
+        };
+        assert!(lock_contended(&held(COUNTER_REF), &lines));
+        assert!(lock_contended(&held("refs/forge/issues/1"), &lines));
+        assert!(!lock_contended(&held("refs/forge/issues/2"), &lines));
+        let moved = StoreError::Command(format!(
+            "fatal: prepare: cannot lock ref '{COUNTER_REF}': is at {} but expected {}",
+            "3".repeat(40),
+            "1".repeat(40)
+        ));
+        assert!(!lock_contended(&moved, &lines));
+        let other_lock = StoreError::Command(format!(
+            "fatal: prepare: cannot lock ref '{COUNTER_REF}': Unable to create \
+             '/tmp/r/.git/packed-refs.lock': File exists."
+        ));
+        assert!(!lock_contended(&other_lock, &lines));
+        assert!(!lock_contended(&StoreError::CasConflict, &lines));
     }
 }
