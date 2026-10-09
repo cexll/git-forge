@@ -381,22 +381,38 @@ fn pr_update_refuses_a_base_moved_after_its_check() {
     assert_eq!(shown["generation"], 0, "{shown}");
 }
 
-/// A base deleted in the same window keeps the missing-branch refusal and
-/// publishes no generation.
+/// A base deleted in the same window is a moved base: `E_BASE_MOVED` with
+/// `current_base` null, and no generation is published.
 #[test]
 fn pr_update_refuses_a_base_deleted_after_its_check() {
     let f = fixture("race-deleted", "main");
     let repo = &f.repo;
+    let snapshot_base = repo.rev("refs/heads/main");
     let source = repo.child_of(&repo.rev("refs/heads/feature"), "source advance");
     repo.git(&["update-ref", "refs/heads/feature", &source]);
     let (code, stdout, stderr) = update_racing(&f, |repo| {
         repo.git(&["update-ref", "-d", "refs/heads/main"]);
     });
+    let message = expected_message("main");
     assert_eq!(code, 1, "{stdout} {stderr}");
-    assert_eq!(stderr, "git-forge: branch 'main' does not exist");
+    assert_eq!(stderr, format!("git-forge: {message}"));
     let actual: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    assert_eq!(actual["error"]["code"], "E_NOT_FOUND", "{actual}");
-    assert_eq!(actual["error"]["input"], "main", "{actual}");
+    assert_eq!(
+        actual,
+        serde_json::json!({"error": {
+            "code": "E_BASE_MOVED",
+            "message": message,
+            "input": "main",
+            "hint": HINT,
+            "retryable": false,
+            "data": {
+                "pr": 1,
+                "base": "main",
+                "snapshot_base": snapshot_base,
+                "current_base": null,
+            }
+        }})
+    );
     let forge_refs = repo.git(&["for-each-ref", "--format=%(refname)", "refs/forge/prs/1/"]);
     assert!(
         !forge_refs.contains("/gen/1/"),

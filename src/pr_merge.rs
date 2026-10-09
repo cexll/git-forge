@@ -842,7 +842,7 @@ pub(crate) fn cmd_pr_update(args: &[String]) -> Result<String, CliError> {
     let new_source = resolve_tip(&source_ref)?;
     let new_base = resolve_tip(&base_ref)?;
     if new_base != old_base {
-        return Err(base_moved_error(id, &base_ref, old_base, new_base));
+        return Err(base_moved_error(id, &base_ref, old_base, Some(new_base)));
     }
     if new_source == old_source {
         return Err(CliError::invalid(format!("PR #{id} source branch tip is already the snapshot source_head ({old_source}); nothing to update")));
@@ -864,11 +864,12 @@ pub(crate) fn cmd_pr_update(args: &[String]) -> Result<String, CliError> {
             &actor,
         )
         // The transaction verifies the base tip checked above: a base that
-        // moved or was deleted since then is reported as such.
+        // moved or was deleted since then is a moved base (a deleted one has
+        // no current tip).
         .map_err(|error| match resolve_tip(&base_ref) {
             Ok(current) if current == new_base => CliError::from(error),
-            Ok(current) => base_moved_error(id, &base_ref, old_base, current),
-            Err(missing) => missing,
+            Ok(current) => base_moved_error(id, &base_ref, old_base, Some(current)),
+            Err(_) => base_moved_error(id, &base_ref, old_base, None),
         })?;
     if json {
         return Ok(crate::machine::pr_update_json(
@@ -890,8 +891,14 @@ pub(crate) fn cmd_pr_update(args: &[String]) -> Result<String, CliError> {
 /// The `pr update` moved-base refusal (`E_BASE_MOVED`): the gated remedies
 /// (spec #33) are to prepare a candidate for the existing snapshot or to
 /// replace the PR. `<s>` stays literal because update has no strategy to
-/// name.
-fn base_moved_error(id: u64, base_ref: &str, old_base: git2::Oid, current: git2::Oid) -> CliError {
+/// name. `current` is the live base tip, `None` for a base deleted after
+/// the check (`data.current_base` is then null).
+fn base_moved_error(
+    id: u64,
+    base_ref: &str,
+    old_base: git2::Oid,
+    current: Option<git2::Oid>,
+) -> CliError {
     let shown = crate::cli::sanitize_terminal(base_ref);
     let mut error = CliError::new(
         "E_BASE_MOVED",
@@ -917,7 +924,9 @@ fn base_moved_error(id: u64, base_ref: &str, old_base: git2::Oid, current: git2:
         ),
         (
             "current_base",
-            crate::event::JsonValue::String(current.to_string()),
+            current.map_or(crate::event::JsonValue::Null, |current| {
+                crate::event::JsonValue::String(current.to_string())
+            }),
         ),
     ];
     error

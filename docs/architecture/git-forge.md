@@ -270,19 +270,20 @@ base branch '<base_ref>' has moved since PR #<n> was created; run git forge pr p
   `Inspect the current base and PR snapshot before proceeding.`
 - `data` keys, in order: `pr` (number), `base` (the base branch name),
   `snapshot_base` (the snapshot base commit), and `current_base` (the live
-  base tip).
+  base tip, or `null` when the base was deleted after the check).
 
 ```json
 {"error":{"code":"E_BASE_MOVED","message":"base branch 'main' has moved since PR #1 was created; run git forge pr prepare 1 --strategy <s> to merge the existing snapshot, or create a replacement PR from the updated source with the same --closes and abandon PR #1","input":"main","hint":"Inspect the current base and PR snapshot before proceeding.","retryable":false,"data":{"pr":1,"base":"main","snapshot_base":"<40-hex>","current_base":"<40-hex>"}}}
 ```
 
-A deleted base branch is not a moved base: `pr update` keeps its
-`branch '<base_ref>' does not exist` refusal with `E_NOT_FOUND`.
+A base branch already deleted when `pr update` checks it is not a moved
+base: `pr update` keeps its `branch '<base_ref>' does not exist` refusal
+with `E_NOT_FOUND`.
 
 The update transaction verifies that the base branch still points at the
 tip the check read. A base that moves or is deleted after the check and
-before publication returns the same `E_BASE_MOVED` (with the moved tip as
-`current_base`) or `E_NOT_FOUND`, and publishes no generation.
+before publication returns the same `E_BASE_MOVED` and publishes no
+generation. `current_base` is the moved tip, or `null` for a deleted base.
 
 #### CI failure
 

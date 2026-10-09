@@ -29,9 +29,17 @@ the git-forge skill. The branch name in the message passes through
 with `pr`, `base`, `snapshot_base`, and `current_base`. The exact contract is
 in `docs/architecture/git-forge.md`, "Moved base".
 
-A deleted base branch is not a moved base. It keeps the existing
-`branch '<b>' does not exist` refusal with `E_NOT_FOUND`, because the missing
-branch check runs first and the spec default keeps uncovered behavior.
+A base branch already deleted at the check is not a moved base. It keeps
+the existing `branch '<b>' does not exist` refusal with `E_NOT_FOUND`,
+because the missing branch check runs first and the spec default keeps
+uncovered behavior.
+
+The update transaction verifies the base tip that the check read. A base
+that moves or is deleted after the check fails that verify, and the refusal
+is `E_BASE_MOVED` with the same message (user decision on #33,
+2026-10-09: a base moved or deleted after the check is a moved base). A deleted base has no
+live tip, so `data.current_base` is `null`; the key stays present so that
+the `data` shape does not change.
 
 ## Alternatives considered
 
@@ -49,7 +57,8 @@ moved-base path: the base advanced, rewritten, or reset to an ancestor; the
 source and base both moved; the base moved after an earlier update; and a
 base name with a C1 control character. Each row asserts exit 1, the exact
 stderr, the complete JSON error, and unchanged refs. A characterization test
-pins the deleted-base `E_NOT_FOUND` refusal. `store.update_pr` does not
-compare the base branch ref, so no second moved-base refusal exists inside
-the update transaction. The "recreate the PR" texts in `pr merge` and
+pins the deleted-base `E_NOT_FOUND` refusal. `store.update_pr` verifies the
+base branch ref in its transaction; two race tests move or delete the base
+after the check and assert `E_BASE_MOVED` (with `current_base` null for the
+deleted base) and no published generation. The "recreate the PR" texts in `pr merge` and
 `pr prepare` are other commands and are unchanged.
