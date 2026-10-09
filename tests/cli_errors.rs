@@ -492,3 +492,126 @@ fn missing_leading_dash_branch_is_invalid() {
         );
     }
 }
+
+/// A repository with `main`, a `feature` branch one commit ahead, and PR #1
+/// from `feature` into `main`.
+fn pr_repo() -> Repo {
+    let repo = Repo::new();
+    for args in [
+        vec!["config", "user.name", "Test"],
+        vec!["config", "user.email", "test@example.com"],
+        vec!["commit", "--allow-empty", "-qm", "base"],
+        vec!["branch", "-M", "main"],
+        vec!["checkout", "-qb", "feature"],
+        vec!["commit", "--allow-empty", "-qm", "source"],
+        vec!["checkout", "-q", "main"],
+    ] {
+        assert!(Command::new("git")
+            .args(args)
+            .current_dir(&repo.0)
+            .status()
+            .unwrap()
+            .success());
+    }
+    assert!(repo
+        .run(&["pr", "create", "--source", "feature", "--base", "main", "PR"])
+        .status
+        .success());
+    repo
+}
+
+/// An inline-review anchor that does not name a commit is the caller's
+/// input error and names the token: a well-formed revision that resolves to
+/// nothing or to a non-commit is `E_INVALID`, a malformed revision is
+/// `E_USAGE`. The review writes nothing.
+#[test]
+fn unresolvable_review_anchor_names_the_token() {
+    let repo = pr_repo();
+    let before = repo.run(&["pr", "show", "1", "--json"]).stdout;
+    for (token, code) in [
+        ("not-a-revision", "E_INVALID"),
+        ("HEAD^{tree}", "E_INVALID"),
+        ("main..feature", "E_USAGE"),
+    ] {
+        let message = format!(
+            "inline review --commit '{token}' does not resolve to a commit (FR-005 anchor must \
+             be a real commit)"
+        );
+        assert_error(
+            &repo.run(&[
+                "pr",
+                "review",
+                "1",
+                "--approve",
+                "--commit",
+                token,
+                "--json",
+            ]),
+            code,
+            &message,
+            token,
+            false,
+        );
+    }
+    assert_eq!(repo.run(&["pr", "show", "1", "--json"]).stdout, before);
+}
+
+/// Pure argument errors are decided before the repository is opened: run
+/// outside any git repository, each is `E_USAGE`, not the missing-repository
+/// `E_INVALID`.
+#[test]
+fn argument_errors_precede_repository_access() {
+    let dir = std::env::temp_dir().join(format!("gf-errors-norepo-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_git-forge"))
+            .args(args)
+            .current_dir(&dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CEILING_DIRECTORIES", dir.parent().unwrap())
+            .env_remove("GIT_FORGE_ROLE")
+            .output()
+            .unwrap()
+    };
+    let anchor = "inline review requires --commit <hash> to anchor the comment (FR-005); add \
+                  --commit or drop --file/--line";
+    let cases: [(&[&str], &str); 5] = [
+        (
+            &["pr", "review", "1", "--approve", "--file", "f", "--json"],
+            anchor,
+        ),
+        (
+            &["pr", "review", "1", "--reject", "--line", "3", "--json"],
+            anchor,
+        ),
+        (
+            &["pr", "merge", "1", "--force", "--json"],
+            "--force requires --recycle-worktree",
+        ),
+        (
+            &[
+                "pr", "create", "--source", "", "--base", "main", "t", "--json",
+            ],
+            "branch name must be non-empty",
+        ),
+        (
+            &["pr", "create", "--source", "f", "--base", "", "t", "--json"],
+            "branch name must be non-empty",
+        ),
+    ];
+    let mut failures = Vec::new();
+    for (args, message) in cases {
+        let output = run(args);
+        if std::panic::catch_unwind(|| assert_error(&output, "E_USAGE", message, "", false))
+            .is_err()
+        {
+            failures.push(format!(
+                "{args:?}: {}",
+                String::from_utf8_lossy(&output.stdout).trim_end()
+            ));
+        }
+    }
+    std::fs::remove_dir_all(&dir).unwrap();
+    assert!(failures.is_empty(), "{failures:#?}");
+}

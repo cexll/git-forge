@@ -215,6 +215,11 @@ pub(crate) fn cmd_pr_merge(args: &[String]) -> Result<String, CliError> {
             "",
         )
     })?)?;
+    // `--force` only unlocks a dirty recycle target: a pure argument check,
+    // decided before the repository is opened.
+    if force && recycle.is_none() {
+        return Err(CliError::usage("--force requires --recycle-worktree", ""));
+    }
     let store = crate::cli::open_store()?;
     let head = crate::store::pr_head_ref(id);
     // Bind the gate decision to the EXACT PR-head OID it validated (F-007):
@@ -375,15 +380,13 @@ pub(crate) fn cmd_pr_merge(args: &[String]) -> Result<String, CliError> {
     // path must be a registered worktree on the PR source branch) and the
     // dirty check (--force is the only unlock) run HERE, before any merge
     // side effect — refused-not-contained / refused-dirty exit non-zero with
-    // nothing touched. `--force` without `--recycle-worktree` is a usage
+    // nothing touched.
     if let Some(target) = &recycle {
         let source_ref = state
             .source_ref
             .as_deref()
             .ok_or("--recycle-worktree requires a PR with a source branch")?;
         crate::merge_state::validate_recycle_target(&repo_dir, source_ref, target, force)?;
-    } else if force {
-        return Err(CliError::usage("--force requires --recycle-worktree", ""));
     }
     // Resolve the event actor NOW, before any merge side effects (worktree
     // reservation, pending-result ref, execution). Identity resolution is

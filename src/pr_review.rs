@@ -9,6 +9,27 @@ use crate::identity::open_mutation_store;
 /// Value-taking options of `pr review`.
 pub(crate) const REVIEW_VALUES: &[&str] = &["--file", "--line", "--commit"];
 
+/// The commit an inline-review `--commit` token names, as its full OID. A
+/// malformed revision is `E_USAGE`; a well-formed one that names nothing or
+/// a non-commit is `E_INVALID`. Both name the token.
+fn anchor_commit(repo: &git2::Repository, token: &str) -> Result<String, CliError> {
+    let message = format!(
+        "inline review --commit '{token}' does not resolve to a commit (FR-005 anchor must be \
+         a real commit)"
+    );
+    let object = repo.revparse_single(token).map_err(|error| {
+        if error.code() == git2::ErrorCode::InvalidSpec {
+            CliError::usage(message.as_str(), token)
+        } else {
+            CliError::invalid(message.as_str()).with_input(token)
+        }
+    })?;
+    object
+        .peel_to_commit()
+        .map(|commit| commit.id().to_string())
+        .map_err(|_| CliError::invalid(message.as_str()).with_input(token))
+}
+
 /// `git forge pr review <n> --approve|--reject [--file <f> --line <l> --commit <c>]`
 pub(crate) fn cmd_pr_review(args: &[String]) -> Result<String, CliError> {
     const USAGE: &str =
@@ -44,6 +65,13 @@ pub(crate) fn cmd_pr_review(args: &[String]) -> Result<String, CliError> {
         i += 1;
     }
     let decision = decision.ok_or_else(|| CliError::usage(USAGE, ""))?;
+    // FR-005: inline review comments anchor to a commit hash. --file/--line
+    // are only meaningful as inline comments, so they require the anchor;
+    // an unanchored inline review would not reference anything immutable.
+    // A pure argument check: decided before the repository is opened.
+    if (file.is_some() || line.is_some()) && commit.is_none() {
+        return Err(CliError::usage("inline review requires --commit <hash> to anchor the comment (FR-005); add --commit or drop --file/--line", ""));
+    }
     // Read-only path first: PR existence and terminality are validated WITHOUT
     // resolving the mutable identity, so every refusal resolves nothing and
     // writes nothing. The append below reopens the store bound to the actor.
@@ -65,33 +93,14 @@ pub(crate) fn cmd_pr_review(args: &[String]) -> Result<String, CliError> {
         )));
     }
     let (store, actor) = open_mutation_store()?;
-    // FR-005: inline review comments anchor to a commit hash. --file/--line
-    // are only meaningful as inline comments, so they require the anchor;
-    // an unanchored inline review would not reference anything immutable.
-    if (file.is_some() || line.is_some()) && commit.is_none() {
-        return Err(CliError::usage("inline review requires --commit <hash> to anchor the comment (FR-005); add --commit or drop --file/--line", ""));
-    }
     // The anchor must resolve to a real commit object. It is intentionally NOT
     // constrained to the PR snapshot: spec.md explicitly permits inline
     // comments on commits outside the PR snapshot (anchored reference). The
     // resolved commit OID is what gets stored — never the raw input — so a
     // mutable ref like `main` cannot smuggle a moving anchor into the event.
-    let commit = match commit {
-        Some(c) => Some(
-            store
-                .repo()
-                .revparse_single(&c)
-                .and_then(|o| o.peel_to_commit())
-                .map(|c| c.id().to_string())
-                .map_err(|_| {
-                    format!(
-                        "inline review --commit '{c}' does not resolve to a commit \
-                         (FR-005 anchor must be a real commit)"
-                    )
-                })?,
-        ),
-        None => None,
-    };
+    let commit = commit
+        .map(|token| anchor_commit(store.repo(), &token))
+        .transpose()?;
     let mut body = HashMap::new();
     body.insert("decision".into(), json_str(&decision));
     if let Some(f) = file {

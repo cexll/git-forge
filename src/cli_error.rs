@@ -64,6 +64,11 @@ impl CliError {
             false,
         )
     }
+    /// The same failure naming `input` as the offending argument.
+    pub(crate) fn with_input(mut self, input: impl Into<String>) -> Self {
+        self.input = input.into();
+        self
+    }
     /// Render one JSON error document with the shared wire escaping.
     pub fn to_json(&self) -> String {
         let escape = crate::event::json_escape_for_machine;

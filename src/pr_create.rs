@@ -13,9 +13,6 @@ use crate::store::{EventStore, IdempotencyRequest};
 /// name is always the bare branch name, so downstream construction of
 /// `refs/heads/{name}` (merge, checked-out guard) is always correct.
 fn resolve_local_branch(store: &EventStore, arg: &str) -> Result<(String, git2::Oid), CliError> {
-    if arg.is_empty() {
-        return Err(CliError::usage("branch name must be non-empty", ""));
-    }
     let name = arg.strip_prefix("refs/heads/").unwrap_or(arg);
     let full = format!("refs/heads/{name}");
     let message = || {
@@ -148,6 +145,10 @@ pub(crate) fn cmd_pr_create(args: &[String]) -> Result<String, CliError> {
                 "",
             )
         })?;
+    // A pure argument check, decided before the repository is opened.
+    if source.is_empty() || base.is_empty() {
+        return Err(CliError::usage("branch name must be non-empty", ""));
+    }
     if title.trim().is_empty() {
         return Err(CliError::usage(
             "PR title is required and must be non-empty",
