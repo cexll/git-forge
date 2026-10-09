@@ -239,20 +239,22 @@ fn cmd_show(args: &[String]) -> Result<String, CliError> {
     )?;
     let store = open_store()?;
     let r = crate::store::issue_ref(id);
-    if !store_has_ref(&store, &r) {
-        return Err(CliError::not_found(
-            format!("issue #{id} does not exist"),
-            id.to_string(),
-        ));
+    match store.repo().find_reference(&r) {
+        Ok(_) => {}
+        Err(e) if e.code() == git2::ErrorCode::NotFound => {
+            return Err(CliError::not_found(
+                format!("issue #{id} does not exist"),
+                id.to_string(),
+            ));
+        }
+        Err(e) => return Err(CliError::invalid(format!("cannot read {r}: {e}"))),
     }
-    let chain = store.read_chain(&r).map_err(CliError::from)?;
-    if chain.is_empty() {
-        return Err((format!("issue #{id} has no events")).into());
-    }
-    let state = crate::event::fold(&chain).issue;
     let all = machine::fold_all_issues(&store)?;
+    let state = all.iter().find(|state| state.id == id).ok_or_else(|| {
+        CliError::not_found(format!("issue #{id} does not exist"), id.to_string())
+    })?;
     if json {
-        return Ok(machine::issue_json(&state, &all));
+        return Ok(machine::issue_json(state, &all));
     }
     let mut out = format!(
         "#{} {} — {}\n",

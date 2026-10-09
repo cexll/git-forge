@@ -12,7 +12,8 @@ Must-not-haves (L1): web UI, single-file export, GitHub bridge, accounts/permiss
 
 - Git protocol only; no second protocol, no daemon.
 - Ordinary repository (not bare) is the L1 shape; bare receiving remote is L2.
-- Forge refs are git-managed; may be packed by gc; read via ref APIs only.
+- Forge refs are git-managed and may be packed by gc. Read targets via ref APIs;
+  supplement Issue-name discovery with loose directory entries to detect corruption.
 - Single mutable ref tip per entity; convergence is L2 (DAG merge, remote-tracking namespace, refspec wiring; `remote.<name>.push` must never be modified).
 - Rust + libgit2 (`git2`); history-level operations shell out to the `git` binary.
 - MIT license.
@@ -172,6 +173,11 @@ keeps its current schema-1 shapes; it has no common envelope.
 | `E_CI_FAILED` | CI execution or cleanup fails |
 | `E_INVALID` | Domain validation rejects input or repository state |
 | `E_INTERNAL` | Unclassified storage, process, or internal failure |
+
+Invalid counters, counter exhaustion, unreadable canonical Issue refs, and
+Issue chains without a usable matching creation event return `E_INVALID`.
+These failures reject repository state, not an absent requested entity.
+An absent requested Issue remains `E_NOT_FOUND`.
 
 Known limitation: preparation classifies failures from the unmerged index before
 cleanup. A failing hook that leaves unmerged index entries returns
@@ -474,13 +480,22 @@ refs/forge/idempotency/<command>/<hex>   # idempotency record (immutable): <comm
 refs/remotes/<remote>/forge/*            # remote-tracking mirror; never local-authoritative
 ```
 
-- Entity ID is sequential integer. `refs/forge/meta/counter` is a ref to a versioned counter commit whose tree contains `.forge/counter.json` `{v:1, next: <u64>}`; each allocation appends a new counter commit and updates the ref.
+- Entity ID is a sequential integer in `1..=i64::MAX`. `refs/forge/meta/counter`
+  points to a versioned counter commit containing `.forge/counter.json`
+  `{v:1, next: <integer>}`. Each allocation appends a counter commit.
+- Counter and event JSON readers accept JSON whitespace around keys, colons,
+  values and separators. Writers retain the compact JSON format. Counter values
+  outside `1..=i64::MAX` fail with `InvalidState` naming the counter ref.
+- All allocation paths refuse `next == i64::MAX` with a clean exhaustion error
+  before publication. The advanced counter must remain within the signed range.
+  Exhaustion leaves every ref unchanged, including when a multi-Issue plan
+  crosses the limit partway through preparation.
 - **Lazy initialization**: the first allocation (`issue new`/`pr create`) atomically creates entity `#1` and a counter commit `{next:2}` in one ref transaction; `git forge init` is optional and only pre-creates the counter. A clean repo needs no setup step before `#1`.
 - Allocation is atomic: one `git update-ref --stdin` transaction performs (1) CAS on `refs/forge/meta/counter` (expected old counter commit, new counter commit) and (2) `create` of the entity ref with **expected absence** — Issue: `refs/forge/issues/<n>`; PR: `refs/forge/prs/<n>/head`, `.../meta`, `.../source` (→ `source_head`), and `.../base` (→ `base_head`) all in the same transaction. A concurrent allocator or a pre-existing entity ref fails the transaction (retry with fresh read for counter collision; reject if the entity ref already exists). L1 requires a concurrent-allocation test proving two simultaneous `issue new` calls receive distinct `#n`, a stale-counter/preexisting-entity collision test, and a PR first-allocation collision test.
 - PR uses `pr.created` as the **authoritative** base/source snapshot; `refs/forge/prs/<n>/meta` is a convenience pointer only. `pr.created` records `base_ref`, `base_head`, `source_ref`, `source_head`, and `merge_base` (= `git merge-base(base_head, source_head)` at creation).
 - **Review content**: the PR patch is `merge_base..source_head` (equivalently `git diff base_head...source_head`). An approval authorizes exactly this patch; it never includes base-only commits or their reversions.
 - **Immutable snapshot refs, per generation (t1)**: `refs/forge/prs/<n>/source` and `/base` pin generation 0's `source_head`/`base_head`; `pr update` bumps the generation and pins the new snapshot under `refs/forge/prs/<n>/gen/<k>/source` and `refs/forge/prs/<n>/gen/<k>/base`. Every generation's refs are immutable git refs; they keep the PR's commits reachable even after base/source branches are deleted or rebased, so `git gc` cannot prune them. A branch-delete plus `git gc` PR diff/merge test is required.
-- All per-entity refs have exactly one mutable tip and are git-managed; read via ref APIs.
+- All per-entity refs have exactly one mutable tip and are git-managed; read targets via ref APIs.
 
 ### Event Commit Layout
 
@@ -660,6 +675,17 @@ with `LC_ALL=C`; unrecognized diagnostics fail closed without retrying.
 - `issue list [--parent <n>] [--state open|closed|all] [--json]` filters by direct
   parent and state; the default state filter is `all` (preserves existing list
   behavior). `issue show <n> [--json]` displays one Issue.
+- Issue display discovers actual `refs/forge/issues/*` names, independent of the
+  counter. Git ref enumeration preserves packed refs. Immediate loose entries
+  in the common Git directory supplement discovery because libgit2 skips
+  malformed loose refs. Only canonical positive decimal `u64` suffixes identify
+  Issues; unrelated names, leading-zero aliases, and signed names are ignored
+  before resolving targets. All target and chain reads use Git APIs. Display
+  requires readable chain objects, parseable event JSON, and an `issue.created`
+  event whose entity and id match the canonical Issue ref. It also requires a
+  matching folded Issue id and title. Both list and show render the same validated
+  collection. A failing canonical ref makes prose and JSON display exit non-zero
+  with the ref name, even when another Issue is healthy.
 - JSON keeps the existing fields and adds `key` (string or null), `parent`
   (Issue id or null), `blocked_by` (Issue ids), and `blocked` (boolean). Show
   also adds `children` (direct child Issue ids). Compute `blocked` against the

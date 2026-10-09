@@ -97,6 +97,42 @@ fn parse_counter_next_reads_and_rejects() {
 }
 
 #[test]
+fn counter_json_accepts_spacing_and_signed_event_range() {
+    for content in [
+        r#"{"v": 1, "next": 3}"#,
+        "\r\n{\t\"next\" \r:\n 3, \"v\" : 1 }\t",
+    ] {
+        assert_eq!(parse_counter_next(content).unwrap(), 3, "{content}");
+    }
+    assert_eq!(
+        parse_counter_next(r#"{"v":1,"next":9223372036854775807}"#).unwrap(),
+        i64::MAX as u64
+    );
+}
+
+#[test]
+fn counter_json_rejects_malformed_documents_and_non_u64_values() {
+    for content in [
+        r#"{"v":1,"next":3} trailing"#,
+        r#"{"v":1,"next":03}"#,
+        r#"{"v":1,"next":3.5}"#,
+        r#"{"v":1,"next":3e0}"#,
+        r#"{"v":1,"next":-3}"#,
+        r#"{"v":1,"next":"3"}"#,
+        r#"{"v":1,"next":true}"#,
+        r#"{"v":1,"next":null}"#,
+        r#"{"v":1,"next":0}"#,
+        r#"{"v":1,"next":9223372036854775808}"#,
+        r#"{"v":1,"next":18446744073709551615}"#,
+        r#"{"v":1,"next":18446744073709551616}"#,
+        r#"{"v":1,"nested":{"next":3}}"#,
+        r#"[{"v":1,"next":3}]"#,
+    ] {
+        assert!(parse_counter_next(content).is_err(), "accepted {content}");
+    }
+}
+
+#[test]
 fn current_tip_absent_entity_is_none_not_error() {
     // An entity ref that does not exist reads as None (fresh entity), not
     // an error — this is how lazy first allocation starts.

@@ -699,7 +699,11 @@ impl BoundEventStore {
                     let next = self.inner.read_counter_next(counter_tip)?;
                     // Versioned chain: the new counter commit's sole parent is
                     // the observed counter tip (wire contract).
-                    let counter_new = self.write_counter_commit(next + 1, Some(counter_tip))?;
+                    let following = next
+                        .checked_add(1)
+                        .filter(|n| *n <= i64::MAX as u64)
+                        .ok_or_else(|| StoreError::InvalidState("counter exhausted".into()))?;
+                    let counter_new = self.write_counter_commit(following, Some(counter_tip))?;
                     let genesis = self.genesis_oid()?;
                     let lines = vec![
                         format!("update {COUNTER_REF} {counter_new} {counter_tip}"),
@@ -809,9 +813,13 @@ impl BoundEventStore {
                     ),
                     Some(ct) => {
                         let next = self.inner.read_counter_next(ct)?;
+                        let following = next
+                            .checked_add(1)
+                            .filter(|n| *n <= i64::MAX as u64)
+                            .ok_or_else(|| StoreError::InvalidState("counter exhausted".into()))?;
                         (
                             Some(ct),
-                            self.write_counter_commit(next + 1, Some(ct))?,
+                            self.write_counter_commit(following, Some(ct))?,
                             next,
                             self.genesis_oid()?,
                         )
@@ -1009,18 +1017,17 @@ impl BoundEventStore {
     }
 }
 
-/// Parse `{"v":1,"next":<u64>}` (tolerates whitespace).
+/// Read the positive counter value within the event model's signed range.
 fn parse_counter_next(content: &str) -> Result<u64, StoreError> {
-    let trimmed = content.trim();
-    let key = "\"next\":";
-    let idx = trimmed
-        .find(key)
-        .ok_or_else(|| StoreError::InvalidState("counter.json missing next".into()))?;
-    let rest = &trimmed[idx + key.len()..];
-    let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits
-        .parse::<u64>()
-        .map_err(|_| StoreError::InvalidState("counter next not a u64".into()))
+    let value: serde_json::Value = serde_json::from_str(content)
+        .map_err(|e| StoreError::InvalidState(format!("invalid counter.json: {e}")))?;
+    value
+        .get("next")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|next| (1..=i64::MAX as u64).contains(next))
+        .ok_or_else(|| {
+            StoreError::InvalidState(format!("{COUNTER_REF} next must be in 1..=i64::MAX"))
+        })
 }
 
 #[cfg(test)]

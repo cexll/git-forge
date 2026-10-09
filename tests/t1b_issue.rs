@@ -849,11 +849,301 @@ fn git_out(dir: &PathBuf, args: &[&str]) -> (i32, String) {
     )
 }
 
+/// A failure has no success result; JSON mode emits the schema-1 error only.
+fn invalid_failure_output(args: &[&str], out: &str, err: &str) -> bool {
+    if !args.contains(&"--json") {
+        return out.is_empty();
+    }
+    serde_json::from_str::<serde_json::Value>(out)
+        .ok()
+        .is_some_and(|document| {
+            let Some(root) = document.as_object() else {
+                return false;
+            };
+            let Some(error) = root.get("error").and_then(serde_json::Value::as_object) else {
+                return false;
+            };
+            root.len() == 1
+                && error.len() == 5
+                && error.get("code").and_then(serde_json::Value::as_str) == Some("E_INVALID")
+                && error.get("retryable").and_then(serde_json::Value::as_bool) == Some(false)
+                && error.get("input").is_some_and(serde_json::Value::is_string)
+                && error.get("hint").is_some_and(serde_json::Value::is_string)
+                && error
+                    .get("message")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|message| err == format!("git-forge: {message}"))
+        })
+}
+
+/// Publish an independently authored JSON fixture through git object/ref APIs.
+fn publish_json(dir: &Path, reference: &str, file: &str, content: &str) {
+    let repo = git2::Repository::open(dir).unwrap();
+    let blob = repo.blob(content.as_bytes()).unwrap();
+    let mut files = repo.treebuilder(None).unwrap();
+    files.insert(file, blob, 0o100644).unwrap();
+    let files = files.write().unwrap();
+    let mut root = repo.treebuilder(None).unwrap();
+    root.insert(".forge", files, 0o040000).unwrap();
+    let tree = repo.find_tree(root.write().unwrap()).unwrap();
+    let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+    repo.commit(
+        Some(reference),
+        &signature,
+        &signature,
+        "fixture",
+        &tree,
+        &[],
+    )
+    .unwrap();
+}
+
 #[test]
-fn issue_list_tolerates_gap_and_eventless_ref() {
-    // cli.rs:159 (absent ref inside the counter bound -> continue) and
-    // cli.rs:163 (ref present but chain has no event blob -> continue). A GC'd
-    // or rewritten ref must never abort `issue list`; it is skipped.
+fn issue_new_accepts_standard_json_counter_spacing() {
+    let dir = tmpdir("spaced-counter-new");
+    init_repo(&dir);
+    publish_json(
+        &dir,
+        "refs/forge/meta/counter",
+        "counter.json",
+        r#"{"v": 1, "next": 3}"#,
+    );
+    let (code, out, err) = forge(&dir, &["issue", "new", "Third issue"]);
+    assert_eq!(code, 0, "spaced counter allocation failed: {err}");
+    assert!(out.contains("#3"), "wrong allocation: {out}");
+    let (code, out, err) = forge(&dir, &["issue", "show", "3"]);
+    assert_eq!(code, 0, "show failed: {err}");
+    assert!(out.contains("#3 Third issue"), "show: {out}");
+}
+
+#[test]
+fn issue_apply_accepts_standard_json_counter_spacing() {
+    let dir = tmpdir("spaced-counter-apply");
+    init_repo(&dir);
+    publish_json(
+        &dir,
+        "refs/forge/meta/counter",
+        "counter.json",
+        r#"{"v": 1, "next": 3}"#,
+    );
+    let plan = dir.join("plan.md");
+    std::fs::write(
+        &plan,
+        "---\nkey: third\ntitle: Applied third issue\n---\nBody\n",
+    )
+    .unwrap();
+    let (code, out, err) = forge(&dir, &["issue", "apply", plan.to_str().unwrap()]);
+    assert_eq!(code, 0, "spaced counter apply failed: {err}");
+    assert!(out.contains("#3"), "wrong allocation: {out}");
+    let (code, out, err) = forge(&dir, &["issue", "show", "3"]);
+    assert_eq!(code, 0, "show failed: {err}");
+    assert!(out.contains("#3 Applied third issue"), "show: {out}");
+}
+
+#[test]
+fn issue_new_and_apply_reject_spaced_exhausted_counters_without_changing_refs() {
+    for next in [
+        u64::MAX,
+        i64::MAX as u64 + 1,
+        i64::MAX as u64,
+        i64::MAX as u64 - 1,
+        0,
+    ] {
+        let dir = tmpdir("issue-counter-exhausted");
+        init_repo(&dir);
+        assert_eq!(forge(&dir, &["issue", "new", "Existing issue"]).0, 0);
+        assert_eq!(
+            git_out(&dir, &["update-ref", "-d", "refs/forge/meta/counter"]).0,
+            0
+        );
+        publish_json(
+            &dir,
+            "refs/forge/meta/counter",
+            "counter.json",
+            &format!(r#"{{"v": 1, "next": {next}}}"#),
+        );
+        let plans = dir.join("plans");
+        std::fs::create_dir(&plans).unwrap();
+        for key in ["first", "second"] {
+            std::fs::write(
+                plans.join(format!("{key}.md")),
+                format!("---\nkey: {key}\ntitle: {key}\n---\nBody\n"),
+            )
+            .unwrap();
+        }
+        let refs = ["for-each-ref", "--format=%(refname) %(objectname)"];
+        let before = git_out(&dir, &refs);
+        assert_eq!(before.0, 0);
+        let mut commands = vec![
+            vec!["issue", "apply", plans.to_str().unwrap()],
+            vec![
+                "issue",
+                "apply",
+                plans.to_str().unwrap(),
+                "--dry-run",
+                "--json",
+            ],
+        ];
+        if next >= i64::MAX as u64 || next == 0 {
+            commands.push(vec!["issue", "new", "Exhausted"]);
+        }
+        for args in commands {
+            let (code, out, err) = forge(&dir, &args);
+            assert_eq!(code, 1, "{next}: {args:?}: {err}");
+            if next > i64::MAX as u64 || next == 0 {
+                assert!(err.contains("refs/forge/meta/counter"), "{next}: {err}");
+            } else {
+                assert!(err.contains("counter exhausted"), "{next}: {err}");
+            }
+            assert!(
+                invalid_failure_output(&args, &out, &err),
+                "exhausted batch reported success: {out}"
+            );
+            assert_eq!(git_out(&dir, &refs), before, "{next}: changed refs");
+        }
+    }
+}
+
+#[test]
+fn pr_create_rejects_spaced_exhausted_counter_without_changing_refs() {
+    for next in [i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX, 0] {
+        let dir = tmpdir("pr-counter-exhausted");
+        init_repo(&dir);
+        assert_eq!(git_out(&dir, &["checkout", "-q", "-b", "main"]).0, 0);
+        assert_eq!(
+            git_out(&dir, &["commit", "--allow-empty", "-q", "-m", "base"]).0,
+            0
+        );
+        assert_eq!(git_out(&dir, &["checkout", "-q", "-b", "feature"]).0, 0);
+        assert_eq!(
+            git_out(&dir, &["commit", "--allow-empty", "-q", "-m", "feature"]).0,
+            0
+        );
+        publish_json(
+            &dir,
+            "refs/forge/meta/counter",
+            "counter.json",
+            &format!(r#"{{"v": 1, "next": {next}}}"#),
+        );
+        let refs = ["for-each-ref", "--format=%(refname) %(objectname)"];
+        let before = git_out(&dir, &refs);
+        assert_eq!(before.0, 0);
+        let (code, out, err) = forge(
+            &dir,
+            &[
+                "pr",
+                "create",
+                "--source",
+                "feature",
+                "--base",
+                "main",
+                "Exhausted",
+            ],
+        );
+        assert_eq!(code, 1, "expected clean exhaustion error: {err}");
+        if next == i64::MAX as u64 {
+            assert!(err.contains("counter exhausted"), "{err}");
+        } else {
+            assert!(err.contains("refs/forge/meta/counter"), "{next}: {err}");
+        }
+        assert!(out.is_empty(), "failed create reported success: {out}");
+        assert_eq!(git_out(&dir, &refs), before, "exhaustion changed refs");
+    }
+}
+
+#[test]
+fn pr_list_rejects_invalid_counters_with_ref_name() {
+    for next in [i64::MAX as u64 + 1, 0] {
+        let dir = tmpdir("pr-list-invalid-counter");
+        init_repo(&dir);
+        assert_eq!(git_out(&dir, &["checkout", "-q", "-b", "main"]).0, 0);
+        assert_eq!(
+            git_out(&dir, &["commit", "--allow-empty", "-q", "-m", "base"]).0,
+            0
+        );
+        assert_eq!(git_out(&dir, &["checkout", "-q", "-b", "feature"]).0, 0);
+        assert_eq!(
+            git_out(&dir, &["commit", "--allow-empty", "-q", "-m", "feature"]).0,
+            0
+        );
+        assert_eq!(
+            forge(
+                &dir,
+                &[
+                    "pr",
+                    "create",
+                    "--source",
+                    "feature",
+                    "--base",
+                    "main",
+                    "Existing PR"
+                ]
+            )
+            .0,
+            0
+        );
+        for args in [vec!["pr", "list"], vec!["pr", "list", "--json"]] {
+            let (code, out, err) = forge(&dir, &args);
+            assert_eq!(code, 0, "healthy list failed: {err}");
+            assert!(out.contains("Existing PR"), "missing healthy PR: {out}");
+        }
+        assert_eq!(
+            git_out(&dir, &["update-ref", "-d", "refs/forge/meta/counter"]).0,
+            0
+        );
+        publish_json(
+            &dir,
+            "refs/forge/meta/counter",
+            "counter.json",
+            &format!(r#"{{"v": 1, "next": {next}}}"#),
+        );
+        for args in [vec!["pr", "list"], vec!["pr", "list", "--json"]] {
+            let (code, out, err) = forge(&dir, &args);
+            assert_eq!(
+                code, 1,
+                "invalid counter silently hid PR ({next}, {args:?}): {out}"
+            );
+            assert!(
+                err.contains("refs/forge/meta/counter"),
+                "missing counter ref: {err}"
+            );
+            assert!(
+                invalid_failure_output(&args, &out, &err),
+                "partial PR list: {out}"
+            );
+        }
+    }
+}
+
+#[test]
+fn issue_list_and_show_read_standard_json_event_spacing_without_counter() {
+    let dir = tmpdir("spaced-event");
+    init_repo(&dir);
+    publish_json(
+        &dir,
+        "refs/forge/issues/2",
+        "event.json",
+        r#"
+        {
+            "v" : 1, "id": "517b19a7-9f70-469a-b1f3-ff646b730f83",
+            "kind": "issue.created", "entity": "issue", "entity_id": 2,
+            "ts": "2026-09-21T02:36:01Z", "actor": "test@example.com",
+            "body": { "title": "Earlier issue", "description": "Earlier body" }
+        }
+    "#,
+    );
+    for args in [
+        vec!["issue", "list", "--state", "all"],
+        vec!["issue", "show", "2"],
+    ] {
+        let (code, out, err) = forge(&dir, &args);
+        assert_eq!(code, 0, "spaced event read failed: {err}");
+        assert!(out.contains("#2 Earlier issue"), "missing issue: {out}");
+    }
+}
+
+#[test]
+fn issue_list_tolerates_missing_ref_gap() {
     let dir = tmpdir("listgap");
     init_repo(&dir);
     git_out(&dir, &["commit", "--allow-empty", "-q", "-m", "base"]);
@@ -871,38 +1161,256 @@ fn issue_list_tolerates_gap_and_eventless_ref() {
         !o1.contains("two"),
         "deleted issue must not be listed: {o1}"
     );
-
-    // Eventless: #2's ref points at a plain commit with no event blob.
-    let base = git_out(&dir, &["rev-parse", "HEAD"]).1;
-    let (cr, _) = git_out(&dir, &["update-ref", "refs/forge/issues/2", &base]);
-    assert_eq!(cr, 0, "setup: repoint issue 2 at a plain commit");
-    let (c2, o2, e2) = forge(&dir, &["forge", "issue", "list"]);
-    assert_eq!(c2, 0, "list with an eventless ref must succeed: {e2}");
-    assert!(o2.contains("one"), "eventless list output: {o2}");
-    assert!(
-        !o2.contains("two"),
-        "eventless issue must not be listed: {o2}"
-    );
 }
 
 #[test]
-fn issue_show_eventless_ref_is_clean_error() {
-    // cli.rs:189 — a ref that exists but carries no event blob is "has no
-    // events", not a libgit2 internals leak.
-    let dir = tmpdir("shownoevent");
+fn issue_list_and_show_ignore_noncanonical_refs() {
+    for suffix in [
+        "archive",
+        "01",
+        "+1",
+        "0",
+        "18446744073709551616",
+        "archive/2",
+    ] {
+        let dir = tmpdir("noncanonical-issue-ref");
+        init_repo(&dir);
+        assert_eq!(forge(&dir, &["issue", "new", "Healthy issue"]).0, 0);
+        publish_json(
+            &dir,
+            &format!("refs/forge/issues/{suffix}"),
+            "event.json",
+            "not JSON",
+        );
+        let loose = dir.join(format!(".git/refs/forge/issues/{suffix}"));
+        std::fs::write(&loose, "garbage\n").unwrap();
+        for args in [
+            vec!["issue", "list"],
+            vec!["issue", "list", "--json"],
+            vec!["issue", "show", "1"],
+            vec!["issue", "show", "1", "--json"],
+        ] {
+            let (code, out, err) = forge(&dir, &args);
+            assert_eq!(code, 0, "{suffix}: {args:?}: {err}");
+            if args.contains(&"--json") {
+                let value: serde_json::Value = serde_json::from_str(&out).unwrap();
+                let issue = if args[1] == "list" {
+                    let issues = value.as_array().unwrap();
+                    assert_eq!(issues.len(), 1, "noncanonical ref listed: {out}");
+                    &issues[0]
+                } else {
+                    &value
+                };
+                assert_eq!(issue["id"], 1);
+                assert_eq!(issue["title"], "Healthy issue");
+            } else {
+                assert!(out.contains("#1 Healthy issue"), "{suffix}: {out}");
+            }
+        }
+    }
+}
+
+#[test]
+fn issue_list_and_show_reject_broken_loose_refs_with_ref_name() {
+    for contents in ["garbage\n", "1111111111111111111111111111111111111111\n"] {
+        for storage in ["loose", "packed-shadow", "linked-worktree"] {
+            let dir = tmpdir("broken-loose-issue-ref");
+            init_repo(&dir);
+            assert_eq!(forge(&dir, &["issue", "new", "Healthy issue"]).0, 0);
+            let mut invoking_dir = dir.clone();
+            if storage != "loose" {
+                assert_eq!(forge(&dir, &["issue", "new", "Second issue"]).0, 0);
+                assert_eq!(git_out(&dir, &["pack-refs", "--all", "--prune"]).0, 0);
+            }
+            if storage == "linked-worktree" {
+                assert_eq!(
+                    git_out(&dir, &["commit", "--allow-empty", "-q", "-m", "base"]).0,
+                    0
+                );
+                invoking_dir = dir.join("linked");
+                assert_eq!(
+                    git_out(
+                        &dir,
+                        &[
+                            "worktree",
+                            "add",
+                            "--detach",
+                            invoking_dir.to_str().unwrap()
+                        ]
+                    )
+                    .0,
+                    0
+                );
+            }
+            let broken = dir.join(".git/refs/forge/issues/2");
+            std::fs::create_dir_all(broken.parent().unwrap()).unwrap();
+            std::fs::write(&broken, contents).unwrap();
+            for args in [
+                vec!["issue", "list"],
+                vec!["issue", "list", "--json"],
+                vec!["issue", "show", "1"],
+                vec!["issue", "show", "1", "--json"],
+                vec!["issue", "show", "2"],
+                vec!["issue", "show", "2", "--json"],
+            ] {
+                let (code, out, err) = forge(&invoking_dir, &args);
+                assert_eq!(
+                    code, 1,
+                    "broken loose ref silently skipped ({storage}, {contents:?}, {args:?}): {out}"
+                );
+                assert!(
+                    err.contains("refs/forge/issues/2"),
+                    "missing ref name: {err}"
+                );
+                assert!(
+                    invalid_failure_output(&args, &out, &err),
+                    "partial display: {out}"
+                );
+                assert_eq!(std::fs::read_to_string(&broken).unwrap(), contents);
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum IssueChainFault {
+    UnparseableJson,
+    MissingObject,
+    NoCreation,
+    WrongCreationId,
+}
+
+fn assert_issue_chain_fault_rejected(fault: IssueChainFault) {
+    use git_forge::event::{Event, EventKind, JsonValue};
+    use git_forge::store::EventStore;
+
+    let dir = tmpdir("issue-chain-validity");
     init_repo(&dir);
-    git_out(&dir, &["commit", "--allow-empty", "-q", "-m", "base"]);
-    assert_eq!(forge(&dir, &["forge", "issue", "new", "T"]).0, 0);
-    let base = git_out(&dir, &["rev-parse", "HEAD"]).1;
-    let (cr, _) = git_out(&dir, &["update-ref", "refs/forge/issues/1", &base]);
-    assert_eq!(cr, 0, "setup: repoint issue 1 at a plain commit");
-    let (c, _o, e) = forge(&dir, &["forge", "issue", "show", "1"]);
-    assert_ne!(c, 0, "eventless show must fail");
-    assert!(e.contains("issue #1 has no events"), "show: {e}");
-    assert!(
-        !e.contains("class=Object") && !e.contains("could not find"),
-        "must not leak libgit2 internals: {e}"
-    );
+    assert_eq!(forge(&dir, &["issue", "new", "Healthy issue"]).0, 0);
+    for args in [
+        vec!["issue", "list"],
+        vec!["issue", "list", "--json"],
+        vec!["issue", "show", "1"],
+        vec!["issue", "show", "1", "--json"],
+    ] {
+        let (code, out, err) = forge(&dir, &args);
+        assert_eq!(code, 0, "healthy control {args:?}: {err}");
+        assert!(out.contains("Healthy issue"), "healthy control: {out}");
+    }
+    let reference = "refs/forge/issues/2";
+    match fault {
+        IssueChainFault::UnparseableJson => {
+            publish_json(&dir, reference, "event.json", "not JSON");
+        }
+        IssueChainFault::MissingObject => {
+            std::fs::write(
+                dir.join(".git/refs/forge/issues/2"),
+                "1111111111111111111111111111111111111111\n",
+            )
+            .unwrap();
+        }
+        IssueChainFault::NoCreation | IssueChainFault::WrongCreationId => {
+            let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+            let store = EventStore::open(&dir).unwrap().bind_signature(signature);
+            if matches!(fault, IssueChainFault::WrongCreationId) {
+                let created = Event::new(
+                    EventKind::IssueCreated,
+                    "issue",
+                    3,
+                    "test@example.com",
+                    [("title".into(), JsonValue::String("Wrong issue".into()))].into(),
+                );
+                store.append_event(reference, &created).unwrap();
+            }
+            let updated = Event::new(
+                EventKind::IssueUpdated,
+                "issue",
+                2,
+                "test@example.com",
+                [("title".into(), JsonValue::String("Orphan".into()))].into(),
+            );
+            store.append_event(reference, &updated).unwrap();
+        }
+    }
+    let mut failures = Vec::new();
+    for args in [
+        vec!["issue", "list"],
+        vec!["issue", "list", "--json"],
+        vec!["issue", "show", "2"],
+        vec!["issue", "show", "2", "--json"],
+        vec!["issue", "show", "1"],
+        vec!["issue", "show", "1", "--json"],
+    ] {
+        let (code, out, err) = forge(&dir, &args);
+        if code != 1 || !err.contains(reference) || !invalid_failure_output(&args, &out, &err) {
+            failures.push(format!(
+                "{fault:?} {args:?}: exit={code}, stdout={out:?}, stderr={err:?}"
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+#[test]
+fn issue_chain_validity_rejects_unparseable_json() {
+    assert_issue_chain_fault_rejected(IssueChainFault::UnparseableJson);
+}
+
+#[test]
+fn issue_chain_validity_rejects_missing_object() {
+    assert_issue_chain_fault_rejected(IssueChainFault::MissingObject);
+}
+
+#[test]
+fn issue_chain_validity_rejects_no_creation() {
+    assert_issue_chain_fault_rejected(IssueChainFault::NoCreation);
+}
+
+#[test]
+fn issue_chain_validity_rejects_wrong_creation_id() {
+    assert_issue_chain_fault_rejected(IssueChainFault::WrongCreationId);
+}
+
+#[test]
+fn issue_list_rejects_unreadable_refs_with_ref_name() {
+    for (tag, payload) in [
+        ("invalid-json", Some("not JSON")),
+        ("wrong-shape", Some(r#"{"v": 1}"#)),
+        ("eventless", None),
+    ] {
+        let dir = tmpdir(tag);
+        init_repo(&dir);
+        if let Some(payload) = payload {
+            publish_json(&dir, "refs/forge/issues/2", "event.json", payload);
+        } else {
+            assert_eq!(
+                git_out(&dir, &["commit", "--allow-empty", "-q", "-m", "base"]).0,
+                0
+            );
+            let base = git_out(&dir, &["rev-parse", "HEAD"]).1;
+            assert_eq!(
+                git_out(&dir, &["update-ref", "refs/forge/issues/2", &base]).0,
+                0
+            );
+        }
+        for args in [
+            vec!["issue", "list", "--state", "all"],
+            vec!["issue", "list", "--state", "all", "--json"],
+            vec!["issue", "show", "2"],
+            vec!["issue", "show", "2", "--json"],
+        ] {
+            let (code, out, err) = forge(&dir, &args);
+            assert_ne!(code, 0, "unreadable ref silently skipped ({tag}): {out}");
+            assert!(
+                err.contains("refs/forge/issues/2"),
+                "missing ref name ({tag}): {err}"
+            );
+            assert!(
+                invalid_failure_output(&args, &out, &err),
+                "partial list ({tag}): {out}"
+            );
+        }
+    }
 }
 
 #[test]

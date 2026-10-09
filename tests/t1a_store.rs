@@ -134,6 +134,45 @@ fn bound(dir: &Path) -> BoundEventStore {
 }
 
 #[test]
+fn allocate_id_rejects_spaced_exhausted_counter_without_changing_refs() {
+    for next in [i64::MAX as u64, i64::MAX as u64 + 1, u64::MAX, 0] {
+        let dir = tmpdir("counter-exhausted");
+        let store = bound(&dir);
+        let repo = store.repo();
+        let blob = repo
+            .blob(format!(r#"{{"v": 1, "next": {next}}}"#).as_bytes())
+            .unwrap();
+        let mut files = repo.treebuilder(None).unwrap();
+        files.insert("counter.json", blob, 0o100644).unwrap();
+        let mut root = repo.treebuilder(None).unwrap();
+        root.insert(".forge", files.write().unwrap(), 0o040000)
+            .unwrap();
+        let tree = repo.find_tree(root.write().unwrap()).unwrap();
+        let sig = test_signature();
+        repo.commit(Some(COUNTER_REF), &sig, &sig, "fixture", &tree, &[])
+            .unwrap();
+        let refs = || {
+            let output = Command::new("git")
+                .args(["for-each-ref", "--format=%(refname) %(objectname)"])
+                .current_dir(&dir)
+                .output()
+                .unwrap();
+            assert!(output.status.success());
+            output.stdout
+        };
+        let before = refs();
+        let error = store.allocate_id().unwrap_err();
+        assert!(matches!(error, StoreError::InvalidState(_)), "{error}");
+        if next == i64::MAX as u64 {
+            assert!(error.to_string().contains("counter exhausted"), "{error}");
+        } else {
+            assert!(error.to_string().contains(COUNTER_REF), "{next}: {error}");
+        }
+        assert_eq!(refs(), before, "invalid allocation must not change any ref");
+    }
+}
+
+#[test]
 fn lazy_first_allocation_is_atomic() {
     let dir = tmpdir("lazy");
     let store = bound(&dir);

@@ -12,7 +12,8 @@ Must-not-haves (L1): web UI, single-file export, GitHub bridge, accounts/permiss
 
 - Git protocol only; no second protocol, no daemon.
 - Ordinary repository (not bare) is the L1 shape; bare receiving remote is L2.
-- Forge refs are git-managed; may be packed by gc; read via ref APIs only.
+- Forge refs are git-managed and may be packed by gc. Read targets via ref APIs;
+  supplement Issue-name discovery with loose directory entries to detect corruption.
 - Single mutable ref tip per entity; convergence is L2 (DAG merge, remote-tracking namespace, refspec wiring; `remote.<name>.push` must never be modified).
 - Rust + libgit2 (`git2`); history-level operations shell out to the `git` binary.
 - MIT license.
@@ -303,13 +304,15 @@ refs/forge/idempotency/<command>/<hex>   # idempotency record (immutable): <comm
 refs/remotes/<remote>/forge/*            # remote-tracking mirror; never local-authoritative
 ```
 
-- Entity ID is sequential integer. `refs/forge/meta/counter` is a ref to a versioned counter commit whose tree contains `.forge/counter.json` `{v:1, next: <u64>}`; each allocation appends a new counter commit and updates the ref.
+- Entity IDs and counter `next` values are integers in `1..=i64::MAX`.
+  Counter and event readers accept standard JSON whitespace; writers stay compact.
+  Invalid or exhausted counters return `E_INVALID` without changing any ref.
 - **Lazy initialization**: the first allocation (`issue new`/`pr create`) atomically creates entity `#1` and a counter commit `{next:2}` in one ref transaction; `git forge init` is optional and only pre-creates the counter. A clean repo needs no setup step before `#1`.
 - Allocation is atomic: one `git update-ref --stdin` transaction performs (1) CAS on `refs/forge/meta/counter` (expected old counter commit, new counter commit) and (2) `create` of the entity ref with **expected absence** — Issue: `refs/forge/issues/<n>`; PR: `refs/forge/prs/<n>/head`, `.../meta`, `.../source` (→ `source_head`), and `.../base` (→ `base_head`) all in the same transaction. A concurrent allocator or a pre-existing entity ref fails the transaction (retry with fresh read for counter collision; reject if the entity ref already exists). L1 requires a concurrent-allocation test proving two simultaneous `issue new` calls receive distinct `#n`, a stale-counter/preexisting-entity collision test, and a PR first-allocation collision test.
 - PR uses `pr.created` as the **authoritative** base/source snapshot; `refs/forge/prs/<n>/meta` is a convenience pointer only. `pr.created` records `base_ref`, `base_head`, `source_ref`, `source_head`, and `merge_base` (= `git merge-base(base_head, source_head)` at creation).
 - **Review content**: the PR patch is `merge_base..source_head` (equivalently `git diff base_head...source_head`). An approval authorizes exactly this patch; it never includes base-only commits or their reversions.
 - **Immutable snapshot refs, per generation (t1)**: `refs/forge/prs/<n>/source` and `/base` pin generation 0's `source_head`/`base_head`; `pr update` bumps the generation and pins the new snapshot under `refs/forge/prs/<n>/gen/<k>/source` and `refs/forge/prs/<n>/gen/<k>/base`. Every generation's refs are immutable git refs; they keep the PR's commits reachable even after base/source branches are deleted or rebased, so `git gc` cannot prune them. A branch-delete plus `git gc` PR diff/merge test is required.
-- All per-entity refs have exactly one mutable tip and are git-managed; read via ref APIs.
+- All per-entity refs have exactly one mutable tip and are git-managed; read targets via ref APIs.
 
 ### Event Commit Layout
 
@@ -450,6 +453,18 @@ new Issue refs require expected absence. Allocation advances the shared counter
 in that transaction; without allocations the observed counter is still verified.
 The counter also protects against concurrent allocations introducing graph
 members after the snapshot. An absent counter is verified as absent.
+
+Snapshot reads bracket Issue enumeration with counter-tip reads. A moved counter
+discards the snapshot and retries within the three-attempt limit; exhaustion
+returns a CAS conflict.
+
+Issue display discovers canonical positive decimal `u64` ref suffixes, including
+packed refs and corrupt loose refs in the common Git directory. It ignores
+noncanonical names before resolving targets and does not depend on the counter.
+Unreadable canonical refs and chains without a matching usable creation event
+return `E_INVALID` with the full ref name. Missing requested Issues are
+`E_NOT_FOUND`. JSON failures print only the schema-1 error object; human failures
+leave stdout empty. Graph snapshots retain eventless tips for CAS validation.
 
 A moved dependency, changed Issue tip, counter conflict or occupied new ref
 fails the entire transaction: no partial Issue refs or counter advancement.
