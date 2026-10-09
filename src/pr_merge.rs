@@ -839,35 +839,7 @@ pub(crate) fn cmd_pr_update(args: &[String]) -> Result<String, CliError> {
     let new_source = resolve_tip(&source_ref)?;
     let new_base = resolve_tip(&base_ref)?;
     if new_base != old_base {
-        // The remedies are the gated ones (spec #33): prepare a candidate
-        // for the existing snapshot, or replace the PR. `<s>` stays literal
-        // because update has no strategy to name.
-        let shown = crate::cli::sanitize_terminal(&base_ref);
-        let mut error = CliError::new(
-            "E_BASE_MOVED",
-            format!(
-                "base branch '{shown}' has moved since PR #{id} was created; run git forge pr \
-                 prepare {id} --strategy <s> to merge the existing snapshot, or create a \
-                 replacement PR from the updated source with the same --closes and abandon \
-                 PR #{id}"
-            ),
-            &base_ref,
-            "Inspect the current base and PR snapshot before proceeding.",
-            false,
-        );
-        error.data = vec![
-            ("pr", crate::event::JsonValue::Number(id as i64)),
-            ("base", crate::event::JsonValue::String(base_ref.clone())),
-            (
-                "snapshot_base",
-                crate::event::JsonValue::String(old_base.to_string()),
-            ),
-            (
-                "current_base",
-                crate::event::JsonValue::String(new_base.to_string()),
-            ),
-        ];
-        return Err(error);
+        return Err(base_moved_error(id, &base_ref, old_base, new_base));
     }
     if new_source == old_source {
         return Err(CliError::invalid(format!("PR #{id} source branch tip is already the snapshot source_head ({old_source}); nothing to update")));
@@ -903,6 +875,42 @@ pub(crate) fn cmd_pr_update(args: &[String]) -> Result<String, CliError> {
         "PR #{id} updated to snapshot generation {generation} \
          (source {source_ref} -> {new_source})"
     ))
+}
+
+/// The `pr update` moved-base refusal (`E_BASE_MOVED`): the gated remedies
+/// (spec #33) are to prepare a candidate for the existing snapshot or to
+/// replace the PR. `<s>` stays literal because update has no strategy to
+/// name.
+fn base_moved_error(id: u64, base_ref: &str, old_base: git2::Oid, current: git2::Oid) -> CliError {
+    let shown = crate::cli::sanitize_terminal(base_ref);
+    let mut error = CliError::new(
+        "E_BASE_MOVED",
+        format!(
+            "base branch '{shown}' has moved since PR #{id} was created; run git forge pr \
+             prepare {id} --strategy <s> to merge the existing snapshot, or create a \
+             replacement PR from the updated source with the same --closes and abandon \
+             PR #{id}"
+        ),
+        base_ref,
+        "Inspect the current base and PR snapshot before proceeding.",
+        false,
+    );
+    error.data = vec![
+        ("pr", crate::event::JsonValue::Number(id as i64)),
+        (
+            "base",
+            crate::event::JsonValue::String(base_ref.to_string()),
+        ),
+        (
+            "snapshot_base",
+            crate::event::JsonValue::String(old_base.to_string()),
+        ),
+        (
+            "current_base",
+            crate::event::JsonValue::String(current.to_string()),
+        ),
+    ];
+    error
 }
 
 pub(crate) fn pr_merge_help() -> String {
