@@ -27,7 +27,9 @@ Requests tabs stay unused. A web view is deferred L2 roadmap.
   immutable snapshot and records the outcome as a `ci.check` Forge Event. A
   regular `.forge/ci.sh` runs; the `just check` fallback runs only when
   `.forge/ci.sh` is absent; a present symlink or other non-regular entry is
-  refused up front without appending a Check result.
+  refused up front: it never runs and no worktree is created, but the command
+  appends a failed Check with reason `plan_invalid` and exits 1 with
+  `E_CI_FAILED`.
 - **Merge strategies**: `--merge` (default, merge commit), `--squash`
   (single commit), `--rebase` (linear replay onto the base tip), and `--ff`
   (fast-forward the base to the source; requires the source to sit directly
