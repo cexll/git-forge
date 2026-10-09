@@ -2,7 +2,12 @@
 //! `pr comment`, at the built CLI boundary. Every case asserts the exit code,
 //! stdout, stderr, the complete JSON document, and the exact set of forge refs
 //! after the command.
-use std::path::{Path, PathBuf};
+//!
+//! Tests that drive a debug-only `GIT_FORGE_TEST_*` seam are compiled only
+//! with `debug_assertions`: a release build ignores the seam.
+#[cfg(debug_assertions)]
+use std::path::Path;
+use std::path::PathBuf;
 use std::process::{Command, Output};
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -639,11 +644,13 @@ fn replay_after_the_entity_changed_returns_the_original_result() {
 
 /// Start `args` with a write barrier at `barrier` and wait until it parks
 /// there: its record lookup has run and it has written nothing yet.
+#[cfg(debug_assertions)]
 fn spawn_parked(repo: &Repo, args: &[&str], barrier: &Path) -> std::process::Child {
     spawn_parked_with(repo, args, barrier, &[])
 }
 
 /// [`spawn_parked`] with extra environment variables.
+#[cfg(debug_assertions)]
 fn spawn_parked_with(
     repo: &Repo,
     args: &[&str],
@@ -674,6 +681,7 @@ fn spawn_parked_with(
 }
 
 /// Release a parked command and wait for it to exit.
+#[cfg(debug_assertions)]
 fn release(child: std::process::Child, barrier: &Path) -> Output {
     std::fs::write(barrier.join("release"), "release").unwrap();
     child.wait_with_output().unwrap()
@@ -683,6 +691,7 @@ fn release(child: std::process::Child, barrier: &Path) -> Output {
 /// either writes (both park at the write barrier). The first one released
 /// commits; the second one's transaction fails on the record ref it expected
 /// to be absent, and it prints the first one's result.
+#[cfg(debug_assertions)]
 fn race(repo: &Repo, args: &[&str]) -> (String, String) {
     let (first, second) = race_then(repo, args, |_| {});
     (success(&first), success(&second))
@@ -690,6 +699,7 @@ fn race(repo: &Repo, args: &[&str]) -> (String, String) {
 
 /// [`race`] that runs `between` after the first call committed and before
 /// the second one, parked past its record lookup, resumes.
+#[cfg(debug_assertions)]
 fn race_then(repo: &Repo, args: &[&str], between: impl Fn(&Repo)) -> (Output, Output) {
     let a = repo.0.with_extension("barrier-a");
     let b = repo.0.with_extension("barrier-b");
@@ -703,6 +713,7 @@ fn race_then(repo: &Repo, args: &[&str], between: impl Fn(&Repo)) -> (Output, Ou
     (first, second)
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn concurrent_same_key_calls_create_one_record_and_return_one_result() {
     let repo = Repo::new();
@@ -781,6 +792,7 @@ fn concurrent_same_key_calls_create_one_record_and_return_one_result() {
 
 /// Two concurrent calls with the same key and DIFFERENT inputs: the first
 /// released wins and the second fails with E_CONFLICT naming its entity.
+#[cfg(debug_assertions)]
 #[test]
 fn concurrent_same_key_calls_with_different_inputs_conflict() {
     let repo = Repo::new();
@@ -1117,6 +1129,7 @@ fn a_record_entry_pointing_at_a_missing_blob_is_invalid() {
 /// barrier) fails the whole publishing transaction for every keyed command:
 /// no mutation, no write through the symbolic ref, and the loser recheck
 /// reports the malformed record.
+#[cfg(debug_assertions)]
 #[test]
 fn a_symbolic_record_ref_inserted_at_the_write_barrier_writes_nothing() {
     let cases: [(&str, &[&str]); 4] = [
@@ -1203,6 +1216,7 @@ fn a_symbolic_record_ref_inserted_at_the_write_barrier_writes_nothing() {
 /// A same-key loser that resumes after the winner committed must answer from
 /// the winner's record even when the state its own validation reads changed
 /// in between (a deleted branch, Issue, PR, parent or blocker).
+#[cfg(debug_assertions)]
 #[test]
 fn a_same_key_loser_replays_even_when_its_validation_inputs_changed() {
     type Change = fn(&Repo);
@@ -1352,6 +1366,7 @@ fn a_same_key_loser_replays_even_when_its_validation_inputs_changed() {
 /// Install a `reference-transaction` hook in `hooks` that, on `prepared`,
 /// touches `held` and then waits for `go`, so the first transaction to
 /// prepare keeps every ref lock it took until the test releases it.
+#[cfg(debug_assertions)]
 fn hold_prepared_hook(hooks: &Path) {
     use std::os::unix::fs::PermissionsExt;
     std::fs::create_dir_all(hooks).unwrap();
@@ -1369,6 +1384,7 @@ fn hold_prepared_hook(hooks: &Path) {
 }
 
 /// Wait until `path` exists while `child` keeps running.
+#[cfg(debug_assertions)]
 fn wait_for(child: &mut std::process::Child, path: &Path, what: &str) {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while !path.exists() {
@@ -1382,6 +1398,7 @@ fn wait_for(child: &mut std::process::Child, path: &Path, what: &str) {
 /// winner is prepared but not yet committed finds no record to replay. It
 /// returns a retryable `E_CONFLICT`, never an internal error; once the
 /// winner commits, the same call replays the winner's result.
+#[cfg(debug_assertions)]
 #[test]
 fn a_same_key_loser_blocked_by_a_prepared_winner_gets_a_retryable_conflict() {
     loser_blocked_by_a_prepared_winner(&[]);
@@ -1389,6 +1406,7 @@ fn a_same_key_loser_blocked_by_a_prepared_winner_gets_a_retryable_conflict() {
 
 /// The same with git tracing on: trace lines precede git's lock diagnostic
 /// on stderr, and the loser still gets the retryable conflict.
+#[cfg(debug_assertions)]
 #[test]
 fn a_same_key_loser_blocked_by_a_prepared_winner_under_git_trace_gets_a_retryable_conflict() {
     loser_blocked_by_a_prepared_winner(&[("GIT_TRACE", "1")]);
@@ -1396,6 +1414,7 @@ fn a_same_key_loser_blocked_by_a_prepared_winner_under_git_trace_gets_a_retryabl
 
 /// Run every keyed command as a prepared winner and a blocked loser, both
 /// with `env` set.
+#[cfg(debug_assertions)]
 fn loser_blocked_by_a_prepared_winner(env: &[(&str, &str)]) {
     let cases: [(&str, &[&str]); 4] = [
         (

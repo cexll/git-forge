@@ -312,6 +312,7 @@ fn surviving_background_process_is_cleanup_failed() {
 
 /// No trusted `just` install: the debug-only seam makes every trusted
 /// location unavailable, independent of what the host has installed.
+#[cfg(debug_assertions)]
 #[test]
 fn missing_trusted_just_is_spawn_failed() {
     run_case(Case {
@@ -325,6 +326,28 @@ fn missing_trusted_just_is_spawn_failed() {
         tail: String::new(),
         plan: Some("just check"),
     });
+}
+
+/// A release build ignores the debug-only seam: `ci run` ends the same way
+/// with and without `GIT_FORGE_TEST_NO_TRUSTED_JUST=1`, whatever `just` the
+/// host has. Runs only under `cargo test --release`.
+#[cfg(not(debug_assertions))]
+#[test]
+fn release_build_ignores_the_no_trusted_just_seam() {
+    let run = |env: &[(&str, &str)]| {
+        let repo = Repo::new("seam-release");
+        repo.pr_with(&[("justfile", Plan::Bytes(b"check:\n    echo hi\n".to_vec()))]);
+        let output = repo.forge(&["ci", "run", "1", "--json"], env);
+        let body = repo.head_body();
+        (
+            output.status.code(),
+            body["status"].clone(),
+            body["reason"].clone(),
+        )
+    };
+    let without = run(&[]);
+    let with = run(&[("GIT_FORGE_TEST_NO_TRUSTED_JUST", "1")]);
+    assert_eq!(with, without);
 }
 
 #[test]

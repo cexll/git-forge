@@ -3063,6 +3063,7 @@ fn merge_refused_when_not_approved() {
 /// `pr.merge` commit to that failed-Check tip and advance the base. This holds
 /// the merge in the barrier window, appends a failed Check, releases, and
 /// asserts the base/head do NOT receive a merge and the CI gate is named.
+#[cfg(debug_assertions)]
 #[test]
 fn merge_refused_when_head_moves_to_failed_ci_during_finalize() {
     let dir = tmpdir("merge-ci-race");
@@ -3190,6 +3191,7 @@ fn merge_refused_when_head_moves_to_failed_ci_during_finalize() {
 }
 
 /// Extract the `"id"` field value from a serialized event JSON string.
+#[cfg(debug_assertions)]
 fn event_uuid(json: &str) -> Option<String> {
     let key = "\"id\":\"";
     let start = json.find(key)? + key.len();
@@ -3200,6 +3202,7 @@ fn event_uuid(json: &str) -> Option<String> {
 
 /// OIDs of every unreachable/dangling commit reported by `git fsck`, with the
 /// locale forced to C so the diagnostic lines are stable to parse.
+#[cfg(debug_assertions)]
 fn unreachable_commits(dir: &PathBuf) -> Vec<String> {
     let out = Command::new("git")
         .args(["fsck", "--unreachable", "--no-reflogs"])
@@ -3226,6 +3229,7 @@ fn unreachable_commits(dir: &PathBuf) -> Vec<String> {
 /// The UUID of the single unreachable `pr.merge` event commit for PR `pr`.
 /// Returns None when no such dangling commit exists (the finalize retry did not
 /// write an unreachable first-attempt commit).
+#[cfg(debug_assertions)]
 fn dangling_pr_merge_uuid(dir: &PathBuf, pr: u64) -> Option<String> {
     for oid in unreachable_commits(dir) {
         let (c, ev, _) = git(dir, &["show", &format!("{oid}:.forge/event.json")]);
@@ -3248,6 +3252,7 @@ fn dangling_pr_merge_uuid(dir: &PathBuf, pr: u64) -> Option<String> {
 /// proves the new tip is a valid first-parent extension of the gate head on PR
 /// #1's chain before retrying; a cross-PR tip is a genuine transaction failure
 /// → refs unchanged, pending result ref left in place.
+#[cfg(debug_assertions)]
 #[test]
 #[allow(clippy::cognitive_complexity)]
 fn merge_refuses_when_head_moved_to_foreign_green_pr_during_finalize() {
@@ -3393,6 +3398,7 @@ fn merge_refuses_when_head_moved_to_foreign_green_pr_during_finalize() {
 /// We locate the dangling first-attempt `pr.merge` commit (unreachable after
 /// the failed CAS) and the reachable final `pr.merge` commit, and assert their
 /// event UUIDs match.
+#[cfg(debug_assertions)]
 #[test]
 #[allow(clippy::cognitive_complexity)]
 fn merge_retry_after_green_append_keeps_event_uuid() {
@@ -3514,6 +3520,7 @@ fn merge_retry_after_green_append_keeps_event_uuid() {
 /// (`head_expected`, = A after the first adoption); B does not extend A, so it
 /// is a genuine transaction failure → base unchanged, pending result ref left
 /// in place, exit nonzero.
+#[cfg(debug_assertions)]
 #[test]
 #[allow(clippy::cognitive_complexity)]
 fn merge_refuses_sibling_rewrite_after_green_append_during_finalize() {
@@ -3874,6 +3881,7 @@ fn merge_refuses_masquerading_foreign_chain_at_entry() {
 /// tip is a valid first-parent extension of the GATE-VALIDATED tip on PR #1's
 /// chain before retrying (F-008); a rewrite is a genuine transaction failure →
 /// base unchanged, pending result ref left in place, exit nonzero.
+#[cfg(debug_assertions)]
 #[test]
 #[allow(clippy::cognitive_complexity)]
 fn merge_refuses_rewrite_to_unproven_tip_between_read_and_cas() {
@@ -4099,6 +4107,7 @@ fn merge_refuses_forged_same_id_creation_chain_at_entry() {
 /// PR #1's authoritative `pr.created` before retrying (F-008); a forged /
 /// replacement `pr.created` is a genuine transaction failure → base unchanged,
 /// pending result ref left in place, exit nonzero.
+#[cfg(debug_assertions)]
 #[test]
 #[allow(clippy::cognitive_complexity)]
 fn merge_refuses_forged_same_id_creation_chain_during_finalize() {
@@ -4482,6 +4491,7 @@ fn ci_run_fails_when_descendant_survives_leader_exit() {
     );
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn ci_run_removes_worktree_when_add_fails_after_registration() {
     // git.rs worktree_add_ci seam + cli.rs failure-path cleanup (F3 review):

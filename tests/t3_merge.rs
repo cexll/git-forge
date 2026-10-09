@@ -606,6 +606,7 @@ fn checked_out_ignored_only_base_merges() {
     assert_eq!(c, 0, "ignored-only dirt must not refuse: {e} {o}");
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn refresh_failure_rolls_refs_back_and_reports_leftover() {
     // VAL-107: with the refresh seam injected, the merge exits non-zero, the
@@ -659,6 +660,7 @@ fn refresh_failure_rolls_refs_back_and_reports_leftover() {
     assert!(!os.contains("merged:"), "no pr.merge recorded: {os}");
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn refresh_failure_with_closes_rolls_all_refs_back() {
     // VAL-107 sibling (F-001): with a `--closes` PR, the refresh-failure
@@ -1061,6 +1063,7 @@ fn merge_flag_parser_accepts_explicit_and_rejects_conflicts() {
     );
 }
 
+#[cfg(debug_assertions)]
 #[test]
 #[allow(clippy::cognitive_complexity)]
 fn worktree_removal_failure_reports_and_cleans_pending_ref() {
@@ -1136,6 +1139,7 @@ fn worktree_removal_failure_reports_and_cleans_pending_ref() {
     }
 }
 
+#[cfg(debug_assertions)]
 #[test]
 #[allow(clippy::cognitive_complexity)]
 fn seam_lock_failure_releases_lock_and_cleans_pending_ref() {
@@ -1465,6 +1469,7 @@ fn pr_events_carry_user_email_when_only_email_is_configured() {
     );
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn barrier_holds_pending_ref_through_gc() {
     let dir = tmpdir("barrier");
@@ -1632,6 +1637,7 @@ fn assert_no_temp_worktree_pr(dir: &Path, pr: u64) {
 /// "0", the first retry with "1", ...). Content-matching makes multi-round
 /// tests unambiguous: a round-0 ready that the merge has since consumed (and
 /// whose round-1 ready is already up) cannot be mistaken for the next round.
+#[cfg(debug_assertions)]
 fn wait_issue_barrier_round(dir: &Path, round: u32, deadline: Instant, tag: &str) {
     let expected = round.to_string();
     let mut seen = String::new();
@@ -1653,6 +1659,7 @@ fn wait_issue_barrier_round(dir: &Path, round: u32, deadline: Instant, tag: &str
 
 /// Create the atomic `release` sentinel that unpauses one issue-stage barrier
 /// round.
+#[cfg(debug_assertions)]
 fn release_issue_barrier(dir: &Path) {
     let release_path = dir.join("release");
     use std::io::Write as _;
@@ -1664,6 +1671,7 @@ fn release_issue_barrier(dir: &Path) {
     let _ = f.write_all(b"go\n");
 }
 
+#[cfg(debug_assertions)]
 fn assert_finalize_json_error(
     output: &std::process::Output,
     code: &str,
@@ -1699,6 +1707,7 @@ fn assert_finalize_json_error(
 /// is deleted and the base, PR head, and linked Issue are updated. Therefore
 /// created/expected-absent cells are structurally unreachable here; pending-ref
 /// creation and entity allocation belong to other transactions, not this matrix.
+#[cfg(debug_assertions)]
 #[test]
 #[allow(clippy::cognitive_complexity, clippy::too_many_lines)]
 fn finalize_ref_failure_matrix_preserves_json_and_atomicity() {
@@ -1848,6 +1857,7 @@ fn finalize_ref_failure_matrix_preserves_json_and_atomicity() {
     }
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn finalize_retry_gate_refusal_preserves_json_classification() {
     let dir = tmpdir("finalize-retry-gate");
@@ -1894,6 +1904,7 @@ fn finalize_retry_gate_refusal_preserves_json_classification() {
     assert_no_temp_worktree(&dir);
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn finalize_retry_candidate_change_preserves_gate_classification() {
     let dir = tmpdir("finalize-candidate-change");
@@ -2484,6 +2495,7 @@ fn worktree_still_registered_after_removal_reported() {
     assert_no_temp_worktree(&dir);
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn pending_result_ref_left_in_place_reported_on_cleanup_failure() {
     // pr_merge.rs:362 + 365 — the cleanup's CAS delete of the pending ref
@@ -2548,6 +2560,7 @@ fn pending_result_ref_left_in_place_reported_on_cleanup_failure() {
     assert!(dr == 0, "drop moved pending ref: {der}");
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn finalize_failure_after_barrier_leaves_refs_unchanged() {
     // pr_merge.rs:333 + 337 — while the merge is parked in the test barrier
@@ -2692,6 +2705,7 @@ fn worktree_list_failure_is_clean_error() {
     );
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn merge_barrier_deadline_cleans_pending_ref_and_leaves_refs_unchanged() {
     // pr_merge.rs:400-402 + 324 — the test-only barrier's 30s deadline with
@@ -2751,6 +2765,7 @@ fn merge_barrier_deadline_cleans_pending_ref_and_leaves_refs_unchanged() {
     assert_no_temp_worktree(&dir);
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn merge_barrier_deadline_reports_leftover_pending_ref() {
     // pr_merge.rs:400-402 + 320-322 — the test-only barrier's 30s deadline:
@@ -2882,6 +2897,7 @@ fn merge_help_usage_and_strategies() {
     assert!(o2.contains("usage: git forge pr merge"), "-h: {o2}");
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn merge_refuses_when_head_ref_disappears_during_barrier() {
     // pr_merge.rs:384-388 — if the PR head ref is DELETED while the merge is
@@ -3081,6 +3097,7 @@ fn merge_with_closes_on_already_closed_issue_is_noop() {
 /// barrier window (pending result ref moved) while a `--closes` target is
 /// staged must leave the issue ref untouched — no partial `issue.close`
 /// event, issue folds open, base and PR head unchanged.
+#[cfg(debug_assertions)]
 #[test]
 fn finalize_cas_failure_leaves_linked_issue_open() {
     let dir = tmpdir("mcloses-fail");
@@ -3184,6 +3201,7 @@ fn finalize_cas_failure_leaves_linked_issue_open() {
 /// the first transaction CASes a stale issue tip and fails, the loop
 /// re-stages at the moved tip (same event, one close event in the final
 /// chain) and the merge still succeeds.
+#[cfg(debug_assertions)]
 #[test]
 fn merge_retries_when_issue_moves_during_finalize() {
     let dir = tmpdir("mcloses-move");
@@ -3257,6 +3275,7 @@ fn merge_retries_when_issue_moves_during_finalize() {
 /// A vanished linked-issue ref is a hard refusal, never a silent skip: the
 /// close cannot be anchored to a real chain, so the merge aborts with refs
 /// unchanged and the pending result ref left in place.
+#[cfg(debug_assertions)]
 #[test]
 fn merge_refuses_when_linked_issue_ref_disappears_during_barrier() {
     let dir = tmpdir("mcloses-vanish");
@@ -3573,6 +3592,7 @@ fn merge_conflict_with_closes_keeps_issue_open() {
 /// issue.close event, the PR head chain has no pr.merge, base/head refs are
 /// unchanged, the pending result ref is cleaned up, and the temp worktree
 /// was already gone before the finalize phase.
+#[cfg(debug_assertions)]
 #[test]
 #[allow(clippy::cognitive_complexity)]
 fn merge_issue_cas_exhaustion_keeps_issue_open() {
@@ -3984,6 +4004,7 @@ fn ff_non_ffable_pr_rejected_naming_rebase_remedy() {
     assert!(!os.contains("merged:"), "PR must remain unmerged: {os}");
 }
 
+#[cfg(debug_assertions)]
 #[test]
 #[allow(clippy::cognitive_complexity)]
 fn ff_finalize_base_cas_clash_leaves_no_partial_write() {
@@ -4414,6 +4435,7 @@ fn recycle_branch_deletion_follows_strategy_ancestry() {
     }
 }
 
+#[cfg(debug_assertions)]
 #[test]
 fn recycle_partial_leftover_on_removal_failure_base_untouched() {
     // VAL-112: partial-removal injection — a locked source worktree makes
@@ -5009,6 +5031,7 @@ fn live_base_merge_refuses_then_passes_after_fresh_gate() {
 /// window — fails the base CAS, the whole completion transaction aborts
 /// (refs unchanged, no partial write), and the pending result ref is left
 /// in place per the failure contract.
+#[cfg(debug_assertions)]
 #[test]
 #[allow(clippy::cognitive_complexity)]
 fn live_base_finalize_cas_conflict_leaves_no_partial_write() {
@@ -5767,6 +5790,7 @@ fn update_invalidates_prepared_candidate_and_strategy_mismatch_refuses() {
 /// revalidates the tip (gate passes) but must REFUSE — the result was built
 /// from the OLD generation — cleaning the pending ref (F-004) and leaving
 /// base/head/issue untouched, with no pr.merge event.
+#[cfg(debug_assertions)]
 #[test]
 fn finalize_refuses_snapshot_change_during_pending_window() {
     let dir = tmpdir("f003");

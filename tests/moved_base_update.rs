@@ -304,6 +304,7 @@ fn pr_update_deleted_base_keeps_not_found() {
 
 /// Run `pr update 1 --json` parked at the test-only write barrier (after its
 /// moved-base check, before its transaction), run `between`, then release it.
+#[cfg(debug_assertions)]
 fn update_racing(f: &Fixture, between: impl Fn(&Repo)) -> (i32, String, String) {
     let repo = &f.repo;
     let barrier = repo.0.with_extension("barrier");
@@ -339,6 +340,7 @@ fn update_racing(f: &Fixture, between: impl Fn(&Repo)) -> (i32, String, String) 
 /// A base that moves after `pr update` checked it and before its transaction
 /// publishes still refuses with `E_BASE_MOVED` (the transaction verifies the
 /// observed base tip), naming the moved tip, and publishes no generation.
+#[cfg(debug_assertions)]
 #[test]
 fn pr_update_refuses_a_base_moved_after_its_check() {
     let f = fixture("race", "main");
@@ -383,6 +385,7 @@ fn pr_update_refuses_a_base_moved_after_its_check() {
 
 /// A base deleted in the same window is a moved base: `E_BASE_MOVED` with
 /// `current_base` null, and no generation is published.
+#[cfg(debug_assertions)]
 #[test]
 fn pr_update_refuses_a_base_deleted_after_its_check() {
     let f = fixture("race-deleted", "main");

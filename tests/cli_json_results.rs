@@ -656,6 +656,7 @@ fn help_tokens_consumed_as_option_values_are_data_under_json() {
 /// writes to the repository, then the command resumes. If the command never
 /// parks, `concurrent` still runs after it, so a result that was not derived
 /// at the command's own appended event shows the pre-write state.
+#[cfg(debug_assertions)]
 fn run_with_concurrent_write(repo: &Repo, args: &[&str], concurrent: fn(&Repo)) -> Output {
     let barrier = PathBuf::from(format!("{}-barrier", repo.0.display()));
     let mut child = Command::new(env!("CARGO_BIN_EXE_git-forge"))
@@ -692,10 +693,12 @@ fn run_with_concurrent_write(repo: &Repo, args: &[&str], concurrent: fn(&Repo)) 
     output
 }
 
+#[cfg(debug_assertions)]
 fn abandon(repo: &Repo) {
     repo.ok(&["pr", "abandon", "1", "--reason", "concurrent"]);
 }
 
+#[cfg(debug_assertions)]
 const REVIEW_KEYS: [&str; 6] = [
     "id",
     "state",
@@ -708,6 +711,7 @@ const REVIEW_KEYS: [&str; 6] = [
 /// `pr review --json` reports the PR state at its own appended event: an
 /// abandon that lands between the review's snapshot read and its append is
 /// folded in, while the captured generation and candidate stay as reviewed.
+#[cfg(debug_assertions)]
 #[test]
 fn pr_review_json_state_folds_a_concurrent_abandon() {
     let repo = Repo::new();
@@ -727,6 +731,7 @@ fn pr_review_json_state_folds_a_concurrent_abandon() {
 }
 
 /// `pr prepare --json` reports the PR state at its own appended event.
+#[cfg(debug_assertions)]
 #[test]
 fn pr_prepare_json_state_folds_a_concurrent_abandon() {
     let repo = Repo::new();
@@ -757,6 +762,7 @@ fn pr_prepare_json_state_folds_a_concurrent_abandon() {
 
 /// `pr update --json` reports the PR state at its own appended event, not a
 /// fixed `open`.
+#[cfg(debug_assertions)]
 #[test]
 fn pr_update_json_state_folds_a_concurrent_abandon() {
     let repo = Repo::new();
@@ -786,6 +792,7 @@ fn pr_update_json_state_folds_a_concurrent_abandon() {
 /// `pr abandon --json` reports the PR state at its own appended event: a
 /// merge that lands between the abandon's terminality check and its append
 /// leaves the PR merged.
+#[cfg(debug_assertions)]
 #[test]
 fn pr_abandon_json_state_folds_a_concurrent_merge() {
     let repo = Repo::new();
@@ -806,6 +813,7 @@ fn pr_abandon_json_state_folds_a_concurrent_merge() {
 }
 
 /// The comment commands report the state at their own appended event.
+#[cfg(debug_assertions)]
 #[test]
 fn comment_json_state_folds_a_concurrent_terminal_event() {
     let repo = Repo::new();
