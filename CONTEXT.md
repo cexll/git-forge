@@ -40,7 +40,7 @@
 
 **CI Run** — an on-demand execution of a configured shell plan whose result is written back as a Forge Event. No server or daemon is involved. _Avoid_: pipeline, job service.
 
-**CI Check** — a Forge Event recording the outcome of a CI Run on a pull request (`status`: pending/success/failed). The Merge Gate requires the latest CI Check to be green (shipped in L1). _Avoid_: pipeline, CI gate, job.
+**CI Check** — a Forge Event recording the outcome of a CI Run on a pull request (`status`: pending/success/failed). A failed Check written by `ci run` also records its `reason` and the last 4 KiB of output (`tail`). The Merge Gate requires the latest CI Check to be green (shipped in L1). _Avoid_: pipeline, CI gate, job.
 
 **Abandoned PR** — a PR in the terminal state set by a `pr.abandoned` event, carrying the required abandonment `reason`. No mutator opens it again: merge, review, and CI run refuse it, naming the reason, and a second abandon refuses with the original reason; there is no reopen — a reopened PR is a new entity. _Avoid_: cancelled PR, dropped PR, closed PR.
 

@@ -553,3 +553,55 @@ fn fold_carries_latest_pr_abandon_reason() {
     let st3 = fold(&[]);
     assert_eq!(st3.pr.abandoned, None);
 }
+
+/// #38: a failed `ci.check` folds its `reason` and exact `tail` (control
+/// bytes and non-ASCII survive the wire), and a later Check written without
+/// them — a green run, or a record from an older version — clears both, so
+/// `pr show --json` renders `null` instead of a stale reason.
+#[test]
+fn fold_ci_reason_and_tail_follow_the_latest_check() {
+    let mk = |id: u64, fields: Vec<(&str, &str)>| {
+        let json = Event::new_with_id(
+            &format!("55555555-5555-4555-8555-{id:012x}"),
+            EventKind::CiCheck,
+            "pr",
+            3,
+            "ci@example.com",
+            body_with(
+                fields
+                    .into_iter()
+                    .map(|(k, v)| (k, JsonValue::String(v.into())))
+                    .collect(),
+            ),
+        )
+        .unwrap()
+        .to_json();
+        Event::from_json(&json).expect("ci.check parses")
+    };
+    let tail = "é \u{1b}[31m\u{0}\"\\\n";
+    let failed = mk(
+        1,
+        vec![("status", "failed"), ("reason", "timeout"), ("tail", tail)],
+    );
+    let state = fold(std::slice::from_ref(&failed)).pr;
+    assert_eq!(state.ci_reason.as_deref(), Some("timeout"));
+    assert_eq!(state.ci_tail.as_deref(), Some(tail));
+    let shown = crate::machine::pr_json(&state);
+    assert!(
+        shown.contains(
+            "\"ci\":{\"status\":\"failed\",\"plan\":null,\"reason\":\"timeout\",\"tail\":\"é \\u001b[31m\\u0000\\\"\\\\\\n\"}"
+        ),
+        "{shown}"
+    );
+    let legacy = mk(2, vec![("status", "failed"), ("plan", ".forge/ci.sh")]);
+    let state = fold(&[failed, legacy]).pr;
+    assert_eq!(state.ci_reason, None);
+    assert_eq!(state.ci_tail, None);
+    assert!(
+        crate::machine::pr_json(&state).contains(
+            "\"ci\":{\"status\":\"failed\",\"plan\":\".forge/ci.sh\",\"reason\":null,\"tail\":null}"
+        ),
+        "{}",
+        crate::machine::pr_json(&state)
+    );
+}

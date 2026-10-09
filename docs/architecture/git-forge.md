@@ -26,7 +26,7 @@ Must-not-haves (L1): web UI, single-file export, GitHub bridge, accounts/permiss
 | `store` (git refs) | `EventStore`: `append_event`, `read_chain`, `create_pr`, `allocate_id` (versioned counter CAS); `append_event_claimed`, `create_pr_claimed`, `apply_issue_batch_claimed`, `idempotency_record` (idempotency records) | Ref naming under `refs/forge/*`, commit creation, packed-ref-safe reads, counter commit chain | Deep: hides all git plumbing; callers never touch refs directly |
 | `identity` (actor) | `resolve_identity`, `bind_identity`, `open_mutation_store` | The invoking repo's `user.email` resolved once per write via `crate::git::config_get_identity` (a safe `git config --null --get` child — never libgit2, VAL-115 stage A). Stage A (config-open fault) propagates a clean CLI error; stage B (absent/empty/non-UTF-8 email) falls back to `forge@localhost`. Signature + actor are bound before any write. | Shallow: never a libgit2 `repo.config()` read at write time (the VAL-115 SIGSEGV-on-corrupt-config path) |
 | `git` (adapter) | `worktree_add`/`worktree_remove`/`worktree_list`, `base_checked_out_elsewhere`, `execute_strategy`, `cleanup_failed_worktree`, `require_single_merge_base` | `git` binary shell-outs for merge execution and worktree plumbing. `git/strategy.rs` owns merge/squash/rebase execution and conflict classification before cleanup. | Deep: protocol correctness delegated to git itself; the merge-gate predicate stays in `merge_state` |
-| `ci` (runner) | `ci_timeout`, `snapshot_ci_plan`, `run_ci_plan` | Bounded CI plan execution in a disposable worktree: immutable-snapshot plan resolution/materialization, process-group kill+reap under a deadline, env tightening | Security-sensitive: isolates the plan subprocess (`/bin/bash` / `just`) and its environment |
+| `ci` (runner) | `ci_timeout`, `snapshot_ci_plan`, `run_ci_plan` | Bounded CI plan execution in a disposable worktree: immutable-snapshot plan resolution/materialization, process-group kill+reap under a deadline, env tightening, one failure `reason` per non-green run and the bounded 4 KiB output tail (`ci/output.rs`) | Security-sensitive: isolates the plan subprocess (`/bin/bash` / `just`) and its environment |
 | `merge_state` (merge gate + finalize) | `read_merge_gate`/`validate_merge_gate_at`, `finalize_pr_merge`, `run_finalize`, `create_pending_result_ref`/`delete_pending_result_ref` | Merge-gate predicate bound to the exact validated head OID, one-transaction completion, and pending-result lifecycle. `merge_state/finalize.rs` owns CAS retries and adopted-input revalidation. | Deep: gate and merge atomicity live here, not `cli` |
 | `pr_merge` (merge commands) | `cmd_pr_merge`, `pr_merge_help` | Merge orchestration (live-base resolution + moved-base candidate routing, checked-out-base guard, temp-worktree lifecycle, pending-result cleanup); gate + finalize delegated to `merge_state` | Deep: the orchestration boundary; `cli` dispatches to it |
 | `issue` (commands) | `run_issue` dispatch; issue `cmd_*` handlers | Issue command parsing + human-readable output; apply and new graph publication delegated to `issue_apply`; graph JSON derived from folded states | Shallow: command surface only |
@@ -84,6 +84,7 @@ git-forge/
 │   ├── cli.rs           # shared CLI plumbing + pr/ci command surfaces + dispatch; cmd_pr_diff git diff
 │   ├── ci.rs            # CI runner: plan resolution/materialization, bounded exec (bash/just), process-group kill
 │   ├── ci/validate.rs   # Just fallback closure validator (F-012) split out for the size gate
+│   ├── ci/output.rs     # bounded capture of the plan's combined output (last 4 KiB tail)
 │   ├── event.rs         # event model + JSON schema (pure)
 │   ├── fold.rs          # state derivation (pure)
 │   ├── git.rs           # git binary adapter: merge-execution shell-outs (worktree, strategies, cleanup, merge-base)
@@ -178,9 +179,8 @@ strategy conflicts. Hook and process failures without unmerged entries remain
 `E_INTERNAL`.
 
 The CLI preserves typed CAS failures as `E_CONFLICT` with `retryable: true`.
-Other failures are not automatically retryable. CI-diagnostic payloads are a
-separate command contract; the prepare-conflict and moved-base payloads are
-below.
+Other failures are not automatically retryable. The prepare-conflict,
+moved-base, and CI-failure payloads are below.
 
 Canonical local branch names that are absent return `E_NOT_FOUND` with the
 supplied branch argument as `input`. Malformed or noncanonical branch inputs
@@ -278,6 +278,47 @@ base branch '<base_ref>' has moved since PR #<n> was created; run git forge pr p
 A deleted base branch is not a moved base: `pr update` keeps its
 `branch '<base_ref>' does not exist` refusal with `E_NOT_FOUND`.
 
+#### CI failure
+
+A `ci run` that is not green records a `failed` Check with exactly one
+`reason` and the output `tail`, then exits 1 with `E_CI_FAILED`. The reason
+is the first cause in run order:
+
+| `reason` | Cause | Detail in the message |
+|---|---|---|
+| `plan_invalid` | The snapshot has no plan, the plan is a symlink or not a regular file, or the `just check` justfile fails validation | the refusal or validation text |
+| `spawn_failed` | The plan could not be started: plan materialization I/O, no trusted `just`, the output pipe, or the spawn | the start failure |
+| `timeout` | The plan exceeded `GIT_FORGE_CI_TIMEOUT` | `timed out` |
+| `nonzero_exit` | The plan exited non-zero or was terminated by a signal | `exited with status <c>` or `terminated by signal <s>` |
+| `cleanup_failed` | A background process survived the plan, the process group could not be proven empty, or the temporary worktree could not be removed after an otherwise green run | `left a background process running`, `could not prove the process group is empty`, or the worktree leftover |
+
+The message is `CI run for PR #<n> failed (<plan>): <detail>; reason:
+<reason>; output tail: <tail>`. `(<plan>)` is absent when no plan was
+selected. The tail clause is absent when the run printed nothing. A leftover
+worktree keeps its `CI run recorded <status> but temp worktree cleanup
+failed: <leftover>` message, followed by the same reason and tail clauses,
+and the hint `Inspect the reported worktree cleanup failure.`
+
+The tail is the last 4096 bytes of the plan's combined stdout and stderr.
+When the cut splits a UTF-8 character, the partial character is dropped. A
+split is proven only by a lead byte at most 3 bytes before the cut, followed
+only by continuation bytes, whose declared length reaches past the cut. Other
+bytes that are not valid UTF-8, including a standalone continuation byte at
+the cut, become U+FFFD, and the text is trimmed again
+so that the stored tail never exceeds 4096 bytes. `data.tail` and the stored
+`tail` are this exact text; the message shows it through the terminal escape
+(`\xNN` for control characters, so a newline is `\x0a`).
+
+```json
+{"error":{"code":"E_CI_FAILED","message":"CI run for PR #1 failed (.forge/ci.sh): exited with status 1; reason: nonzero_exit; output tail: MARKER\\x0a","input":"1","hint":"Fix the CI plan and run CI again.","retryable":false,"data":{"pr":1,"reason":"nonzero_exit","tail":"MARKER\n"}}}
+```
+
+Failures before or after the CI result are not Checks and keep their codes:
+a missing or abandoned PR, a missing snapshot ref, a temporary worktree that
+cannot be created, and a Check that cannot be appended. The merge gate still
+accepts only a `success` Check bound to the current generation and candidate;
+`reason` and `tail` never change a gate decision.
+
 Missing required positionals return usage errors, never panics. In particular,
 `pr show` and `pr diff` use `usage: git forge pr <verb> <n> [--json]`.
 
@@ -290,6 +331,10 @@ fixed per command.
 
 The existing shapes of `issue new|apply|list|show`, `pr create|list|show`,
 and `ci run` are unchanged; `tests/fixtures/json/` pins them byte for byte.
+The `ci` member of `pr create|show` is `null` or `{"status","plan","reason",
+"tail"}`: `reason` and `tail` are the latest Check's failure reason and output
+tail (CI failure, above), and `null` for a pending or green Check and for a
+Check recorded before these fields existed.
 
 Mutation results open with `id` (the Issue or PR number) and `state`, the
 entity state after the command: `open|closed` for an Issue and
@@ -451,7 +496,7 @@ Kinds and body fields:
 | `pr.review` | pr | `{decision: "approve"|"reject", generation, base_head, strategy?, result_commit?, result_tree?, body?, file?, line?, commit?}` |
 | `pr.merge` | pr | `{strategy: "merge"|"squash"|"rebase"|"ff", result_commit}` |
 | `pr.abandoned` | pr | `{reason}` |
-| `ci.check` | pr | `{status: "pending"|"success"|"failed", plan?, generation, base_head, strategy?, result_commit?, result_tree?}` |
+| `ci.check` | pr | `{status: "pending"|"success"|"failed", plan?, generation, base_head, strategy?, result_commit?, result_tree?, reason?, tail?}` |
 
 For `issue new`, an omitted or empty positional description leaves the created
 event's `description` field absent. Human `issue show` omits the description
@@ -462,7 +507,7 @@ description and remains stored as `""`.
 
 `pr.abandoned` makes the PR **terminal** (see PR Lifecycle): `reason` is the required abandonment text; the PR is then refused by `pr merge`, `pr review`, and `ci run` before any write, and no reopen exists — a reopened PR is a new entity.
 
-`ci.check` records an on-demand **CI Run** on a PR. Its `body` carries `status` (`pending` | `success` | `failed`) and, once a run has executed, `plan` (the plan that ran: `.forge/ci.sh`, or the `just check` fallback), plus the `generation` captured at run start and the live `base_head` (and the prepared-candidate identity when the run validated a candidate); the initial pending marker from `pr create` carries only `status: "pending"` — no plan executes at creation. The top-level `ts`/`actor` record when the Check was written and who invoked the run. Folding keeps the LATEST `ci.check` for the PR, so the merge gate reads a single current status and requires it to be `success` on the PR's CURRENT snapshot generation — a green Check from an older generation is stale (an in-flight run whose append lands after a concurrent `pr update` still carries its captured generation and never greens the new one).
+`ci.check` records an on-demand **CI Run** on a PR. Its `body` carries `status` (`pending` | `success` | `failed`) and, once a run has executed, `plan` (the plan that ran: `.forge/ci.sh`, or the `just check` fallback), plus the `generation` captured at run start and the live `base_head` (and the prepared-candidate identity when the run validated a candidate); the initial pending marker from `pr create` carries only `status: "pending"` — no plan executes at creation. A `failed` Check written by `ci run` also carries `reason` and `tail` (CI failure, above); `plan` is absent when the plan was refused before selection. Checks without these fields fold as `None`. The top-level `ts`/`actor` record when the Check was written and who invoked the run. Folding keeps the LATEST `ci.check` for the PR, so the merge gate reads a single current status and requires it to be `success` on the PR's CURRENT snapshot generation — a green Check from an older generation is stale (an in-flight run whose append lands after a concurrent `pr update` still carries its captured generation and never greens the new one).
 
 **Effective review decision (L1)**: the last reachable `pr.review` event in the entity chain's parent order (single local chain in L1) is the effective PR decision; the merge gate requires that decision to be `approve` AND bound to the PR's current snapshot generation — each `pr.review` stamps the `generation` captured at review time (plus the live `base_head`, and the prepared-candidate identity when one is current), and the gate compares that captured generation with the PR's CURRENT generation, so a pre-update approval is stale and refused with a re-review remedy. Repeated decisions by the same or different actors simply advance the effective decision; no per-actor union semantics. DAG linearization for multi-chain convergence is deferred to ADR-0004/L2. `approve → reject` and `reject → approve` transitions are first-class test cases.
 
@@ -674,3 +719,4 @@ Recorded in `docs/adr/`:
 - Identity is resolved through the `git` binary before any write, never a libgit2 `repo.config()` read — that path can SIGSEGV on a config corrupted after `Repository::open` (VAL-115). The trade-off is git-binary spawn cost per write.
 - `git forge pr merge` merges while `base_ref` is checked out only when every such worktree is clean (untracked counts as dirty, ignored does not); the clean worktree is refreshed to the result commit after the base CAS, and a refresh failure rolls the refs back and reports the worktree as a leftover. **Sparse-checkout and submodules in a base worktree are out of L1 scope**: behavior with either present is not covered by the clean/refresh contract (the porcelain cleanliness check and the bare `reset --hard` refresh make no promises about sparse index state or submodule contents) and may refuse or mis-refresh.
 - The test-only `GIT_FORGE_TEST_MERGE_BARRIER` and `GIT_FORGE_TEST_WRITE_BARRIER` seams exist only in test/debug builds and are ignored in release.
+- The CI output tail is diagnostic text, not an exact byte record: bytes that are not valid UTF-8 become U+FFFD, so distinct invalid bytes look the same. A plan descendant that leaves the process group (for example with `setsid`) can keep the output pipe open; `ci run` then waits at most about one second for the pipe to close and records the tail read so far.

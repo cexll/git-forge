@@ -679,26 +679,40 @@ pub(crate) fn prepare_pr(
 /// Build the `ci.check` body (status/plan/generation/base_head/candidate
 /// identity — the F-001 captured generation and the F-002 candidate binding)
 /// and append it to the PR head chain, then shape the stdout/err verdict.
+/// The Check is `success` only for a green run whose temporary worktree was
+/// removed (F-025); a failed Check also records its `reason` — the run's
+/// own, else `cleanup_failed` — and the bounded output `tail`. `plan_label`
+/// is `None` when no plan was selected (`plan_invalid`).
 /// Extracted from `cmd_ci_run` (clippy too_many_lines).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn record_and_report_ci_check(
     store: &crate::store::BoundEventStore,
     head: &str,
     id: u64,
-    status: &str,
-    plan_label: &str,
+    plan_label: Option<&str>,
     generation: u64,
     live_base: Option<JsonValue>,
     candidate_run: Option<&crate::event::PreparedCandidate>,
     leftover: Option<String>,
-    run_status: Option<i32>,
-    ran_out: bool,
-    run_detail: Option<String>,
+    run: &crate::ci::CiRun,
     actor: &str,
 ) -> Result<String, CliError> {
+    let failure = run.failure.clone().or_else(|| {
+        let reason = crate::ci::CiReason::CleanupFailed;
+        leftover
+            .as_ref()
+            .map(|l| crate::ci::CiFailure::new(reason, l.as_str()))
+    });
+    let status = if failure.is_some() {
+        "failed"
+    } else {
+        "success"
+    };
     let mut body = HashMap::new();
     body.insert("status".into(), crate::cli::json_str(status));
-    body.insert("plan".into(), crate::cli::json_str(plan_label));
+    if let Some(plan) = plan_label {
+        body.insert("plan".into(), crate::cli::json_str(plan));
+    }
     // Generation binding (F-001 regression): the Check validates the
     // snapshot generation it RAN against — captured at run start, never
     // re-read from a fresh fold after the run (an in-flight gen0 run whose
@@ -723,6 +737,13 @@ pub(crate) fn record_and_report_ci_check(
         );
         body.insert("result_tree".into(), crate::cli::json_str(&c.result_tree));
     }
+    if let Some(failure) = &failure {
+        body.insert(
+            "reason".into(),
+            crate::cli::json_str(failure.reason.as_str()),
+        );
+        body.insert("tail".into(), crate::cli::json_str(&run.tail));
+    }
     let ev = Event::new(EventKind::CiCheck, "pr", id, actor, body);
     // Record the outcome — a failing plan still appends a `failure` CI Check
     // (VAL-002) before the command exits nonzero.
@@ -736,37 +757,24 @@ pub(crate) fn record_and_report_ci_check(
         };
         return Err(error);
     }
-
-    if let Some(leftover) = leftover {
-        return Err(CliError::new(
-            "E_CI_FAILED",
-            format!("CI run recorded {status} but temp worktree cleanup failed: {leftover}"),
-            id.to_string(),
-            "Inspect the reported worktree cleanup failure.",
-            false,
-        ));
-    }
     append.map_err(|e| format!("CI run completed but recording the CI Check failed: {e}"))?;
-
-    if run_status == Some(0) && !ran_out {
-        Ok(format!("CI run for PR #{id} passed ({plan_label})"))
-    } else {
-        let detail = if ran_out {
-            ": timed out".to_string()
-        } else if let Some(d) = run_detail {
-            format!(": {d}")
-        } else {
-            run_status
-                .map(|c| format!(": exited with status {c}"))
-                .unwrap_or_default()
-        };
-        Err(CliError::new(
-            "E_CI_FAILED",
-            format!("CI run for PR #{id} failed ({plan_label}){detail}"),
-            id.to_string(),
+    let shown = plan_label.map(|p| format!(" ({p})")).unwrap_or_default();
+    match (failure, leftover) {
+        (None, _) => Ok(format!("CI run for PR #{id} passed{shown}")),
+        (Some(failure), Some(leftover)) => Err(crate::ci::failed_check_error(
+            id,
+            format!("CI run recorded {status} but temp worktree cleanup failed: {leftover}"),
+            failure.reason,
+            &run.tail,
+            "Inspect the reported worktree cleanup failure.",
+        )),
+        (Some(failure), None) => Err(crate::ci::failed_check_error(
+            id,
+            format!("CI run for PR #{id} failed{shown}: {}", failure.detail),
+            failure.reason,
+            &run.tail,
             "Fix the CI plan and run CI again.",
-            false,
-        ))
+        )),
     }
 }
 
