@@ -94,11 +94,18 @@ pub(crate) fn cmd_pr_diff(args: &[String]) -> Result<String, CliError> {
         .into());
     }
     if json {
+        // `diff` is byte for byte the human stdout: the entry point prints a
+        // non-empty result with one trailing newline and an empty one not at all.
+        let printed = if out.is_empty() {
+            out
+        } else {
+            format!("{out}\n")
+        };
         return Ok(crate::machine::pr_diff_json(
             &state,
             &base_oid.to_string(),
             &source_oid.to_string(),
-            &out,
+            &printed,
         ));
     }
     Ok(out)

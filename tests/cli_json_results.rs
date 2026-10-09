@@ -295,7 +295,36 @@ fn pr_diff_prints_base_head_and_diff_text() {
     assert_eq!(result["head"], tip(&repo, "feature"));
     let diff = result["diff"].as_str().unwrap();
     assert!(diff.contains("+++ b/feature.txt"), "{diff}");
-    assert_eq!(format!("{diff}\n"), plain);
+    assert_eq!(diff, plain);
+}
+
+/// `pr diff --json` `diff` is byte for byte the stdout of `pr diff`: with
+/// the final newline for a patch, and empty for an empty three-dot diff.
+#[test]
+fn pr_diff_json_diff_is_the_human_stdout_byte_for_byte() {
+    let patch = Repo::new();
+    patch.pr();
+    let empty = Repo::new();
+    empty.commit_file("base.txt", "base\n");
+    empty.git(&["branch", "-M", "main"]);
+    empty.git(&["checkout", "-q", "-b", "feature"]);
+    empty.git(&["commit", "-q", "--allow-empty", "-m", "no change"]);
+    empty.git(&["checkout", "-q", "main"]);
+    empty.ok(&[
+        "pr", "create", "--source", "feature", "--base", "main", "a PR",
+    ]);
+    for (case, repo) in [("patch", &patch), ("empty", &empty)] {
+        let human = repo.run(&["pr", "diff", "1"]);
+        assert_eq!(human.status.code(), Some(0), "{case}");
+        let result = json_result(
+            &repo.run(&["pr", "diff", "--json", "1"]),
+            &["id", "state", "generation", "base", "head", "diff"],
+        );
+        let diff = result["diff"].as_str().unwrap();
+        assert_eq!(diff.as_bytes(), human.stdout.as_slice(), "{case}");
+    }
+    assert!(patch.ok(&["pr", "diff", "1"]).ends_with('\n'));
+    assert!(empty.ok(&["pr", "diff", "1"]).is_empty());
 }
 
 const MERGE_KEYS: [&str; 7] = [

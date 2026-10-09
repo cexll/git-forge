@@ -364,8 +364,10 @@ command appended to the entity chain; `pr merge` has no `event` and returns
 | `pr diff <n>` (read only) | `id`, `state`, `generation`, `base`, `head`, `diff` |
 
 In `pr diff`, `base` and `head` are the commits of the current generation's
-snapshot, and `diff` is the exact `git diff base...head` text that the human
-form prints. Unlike `pr show`, `base` here is a commit, not a branch name.
+snapshot, and `diff` is byte for byte what the human form prints on stdout:
+the `git diff base...head` output with leading and trailing whitespace
+removed, followed by one newline, or the empty string when that output is
+empty. Unlike `pr show`, `base` here is a commit, not a branch name.
 
 ```json
 {"id":3,"state":"open","event":"5f0c..."}
