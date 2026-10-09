@@ -144,5 +144,5 @@ git forge issue close <n>                               # 8. close the loop on t
 
 ## Reference
 
-Normative wire contract (ref layout, event JSON schema v1, counter CAS, merge semantics): `docs/architecture/git-forge.md`. Glossary: `CONTEXT.md`. Legacy rationale: `docs/adr/`.
+Normative wire contract (ref layout, event JSON schema v1, counter CAS, merge semantics): `docs/architecture/git-forge.md`. CLI-facing summary (JSON errors and codes, success results, idempotency keys): `references/wire-contract.md` in this skill. Glossary: `CONTEXT.md`. Legacy rationale: `docs/adr/`.
 

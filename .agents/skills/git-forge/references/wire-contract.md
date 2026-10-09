@@ -120,6 +120,138 @@ flowchart LR
 
 This contract is normative for tickets and tests. Versions: schema version field is `v: 1` in every event; do not parse unversioned events.
 
+This reference covers the CLI-facing contract. Internals (module map, record
+format, transaction atomicity, retry classification, tail byte rules) are
+normative in `docs/architecture/git-forge.md`; when the two differ, that file
+wins.
+
+### CLI Failure Contract (schema 1)
+
+Every command failure exits 1. Without `--json`, stdout is empty and stderr
+prints `git-forge: <message>`. With a bare `--json` token, stdout holds one
+JSON error object and stderr keeps the same line. A bare `--json` is a
+standalone token: not the value of a value-taking option (`--label --json`
+labels the Issue `--json`) and not after `--`. A command that has no JSON
+success result rejects `--json` the same way, with `E_USAGE`.
+
+```json
+{"error":{"code":"E_USAGE","message":"usage: git forge pr show <n> [--json]","input":"","hint":"Run the command with --help and correct its arguments.","retryable":false}}
+```
+
+`code`, `message`, `input` and `hint` are strings; `retryable` is a boolean.
+`input` is the offending argument, or empty when an argument is missing or
+no single value is at fault. `hint` names the next action. Use `code`; never
+parse the message. Command-specific errors add `data`. Missing positionals
+are usage errors, never panics: `pr show` and `pr diff` use
+`usage: git forge pr <verb> <n> [--json]`.
+
+| Code | Meaning |
+|---|---|
+| `E_USAGE` | Missing or malformed command arguments, or unknown options |
+| `E_NOT_FOUND` | Referenced Issue, PR, or branch does not exist |
+| `E_CONFLICT` | Compare-and-swap conflict, exhausted CAS retries, or stale snapshot; read current state before retrying. Also an idempotency key reused with different inputs (`retryable: false`) |
+| `E_BASE_MOVED` | Base movement prevents the requested operation |
+| `E_PREPARE_CONFLICT` | Candidate preparation encounters a merge conflict |
+| `E_GATE` | Merge gate refuses the operation |
+| `E_CI_FAILED` | CI execution or cleanup fails |
+| `E_INVALID` | Domain validation rejects input or repository state |
+| `E_INTERNAL` | Unclassified storage, process, or internal failure |
+
+Only typed CAS failures are retryable (`E_CONFLICT`, `retryable: true`).
+An absent canonical branch is `E_NOT_FOUND` with the branch as `input`; a
+malformed branch name is `E_INVALID`.
+
+Errors with `data` (keys in order):
+
+| Code | Command | `input` | `data` | `hint` |
+|---|---|---|---|---|
+| `E_PREPARE_CONFLICT` | `pr prepare` (merge, squash, rebase) | PR id | `pr`, `strategy`, `base` (base tip the candidate was built on), `source` (snapshot source commit), `paths` (every conflicted path, git-quoted) | ``Merge the base branch into the source branch, resolve the conflicts, then run `git forge pr update <n>` or create a replacement PR.`` |
+| `E_BASE_MOVED` | `pr update` | base branch name | `pr`, `base` (branch name), `snapshot_base`, `current_base` (live tip, or `null` when the base was deleted after the check) | `Inspect the current base and PR snapshot before proceeding.` |
+| `E_CI_FAILED` | `ci run` | PR id | `pr`, `reason`, `tail` | `Fix the CI plan and run CI again.` |
+| `E_CONFLICT` | keyed command, key reused with different inputs | the key | `command`, `key`, `id` (recorded result id) | `Repeat the original inputs to read the recorded result, or use a new idempotency key.` |
+
+- **Prepare conflict** message: `PR #<n> cannot be prepared with strategy
+  <s>: source <source> conflicts with base '<base_ref>' at <base> in <k>
+  path(s): <p1>, ...; merge '<base_ref>' into the source branch
+  '<source_ref>', resolve the conflicts, then run `git forge pr update <n>`
+  or create a replacement PR; <cleanup outcome>`. It lists at most 20 paths,
+  then ` (and <m> more)`; `data.paths` is never cut. Refs are unchanged. A
+  failure without unmerged entries stays `E_INTERNAL`.
+- **Moved base** message: `base branch '<base_ref>' has moved since PR #<n>
+  was created; run git forge pr prepare <n> --strategy <s> to merge the
+  existing snapshot, or create a replacement PR from the updated source with
+  the same --closes and abandon PR #<n>` (`<s>` is literal). Nothing is
+  written. A base already deleted at the check is `E_NOT_FOUND`.
+- **CI failure**: a non-green `ci run` records a `failed` Check with one
+  `reason` and the output `tail`, then fails with the message `CI run for PR
+  #<n> failed (<plan>): <detail>; reason: <reason>; output tail: <tail>`.
+  `reason` is the first cause in run order: `plan_invalid` (no plan, a
+  symlinked or irregular plan, or a `just check` justfile that fails
+  validation), `spawn_failed`, `timeout`, `nonzero_exit`, `cleanup_failed`.
+  `tail` is the last 4096 bytes of combined stdout and stderr as UTF-8 text;
+  the message shows it with control characters escaped (`\x0a`). `reason`
+  and `tail` never change a merge-gate decision.
+
+### CLI Success Results (schema 1)
+
+Every command that accepts `--json` prints one JSON object or array on
+stdout on success, exit 0, with nothing on stderr. Without `--json` the
+human output is unchanged. There is no common envelope; key order is fixed
+per command. The shapes of `issue new|apply|list|show`, `pr create|list|show`
+and `ci run` are unchanged; the `ci` member of `pr create|show` is `null` or
+`{"status","plan","reason","tail"}`, where `reason` and `tail` are `null`
+for a pending or green Check.
+
+Mutation results open with `id` and `state` (`open|closed` for an Issue,
+`open|merged|abandoned` for a PR), folded up to the event the command wrote.
+`event` is the commit the command appended. Commit ids are full 40-hex.
+
+| Command | Result object (keys in order) |
+|---|---|
+| `issue comment <n> <body>` | `id`, `state`, `event` |
+| `issue close <n>` / `issue reopen <n>` | `id`, `state`, `event` |
+| `pr comment <n> <body>` | `id`, `state`, `event` |
+| `pr review <n> --approve\|--reject` | `id`, `state`, `decision`, `generation`, `candidate` (or `null`), `event` |
+| `pr update <n>` | `id`, `state`, `generation`, `source_head`, `base_head`, `merge_base`, `event` |
+| `pr prepare <n> --strategy <s>` | `id`, `state`, `strategy`, `generation`, `candidate`, `result_tree`, `base_head`, `event` |
+| `pr merge [<n>]` | `id`, `state` (`merged`), `strategy`, `base` (branch name), `generation`, `merge_commit`, `recycle` (outcome line or `null`) |
+| `pr abandon <n> --reason <text>` | `id`, `state`, `reason`, `event` |
+| `pr diff <n>` (read only) | `id`, `state`, `generation`, `base`, `head`, `diff` |
+
+In `pr diff`, `base` and `head` are snapshot commits, not branch names, and
+`diff` is byte for byte what the human form prints on stdout: the
+`git diff base...head` output with leading and trailing whitespace removed,
+followed by one newline, or the empty string when that output is empty.
+
+Help has no JSON result: a help request with `--json` is `E_USAGE` and
+writes nothing. A `pr merge --recycle-worktree` whose recycle step fails
+after the merge is final exits 1; it prints no success result.
+
+### Idempotency Keys (schema 1)
+
+`issue new`, `pr create`, `issue comment` and `pr comment` accept
+`--idempotency-key <k>`. A retry with the same key and the same inputs
+returns the first result (same `--json` or human output, exit 0) and writes
+nothing.
+
+- **Key**: non-empty, at most 100 bytes, compared byte for byte. A missing,
+  empty, longer or repeated key is `E_USAGE` before any read or write.
+- **Scope**: per repository and per command kind; keys never expire.
+- **Same inputs**: `issue new` title, description, labels in order, parent,
+  blocking Issues as a set; `pr create` title, source and base branch names
+  (not their commits), body, labels in order, `--closes`; comments the
+  target id and body. `--json` is not an input.
+- **Different inputs**: `E_CONFLICT`, `retryable: false`, `data` above.
+- **Concurrent same key**: one record and one entity. A loser that passed
+  the lookup answers from the winner's record. A loser that meets the
+  winner's held ref locks before any record is readable gets `E_CONFLICT`
+  with `retryable: true`: the message is `bounded CAS retries exhausted;
+  refs unchanged` for `issue new` and `ref CAS conflict — ref moved, retry`
+  for the other three. A retry after the winner commits replays its result.
+- **Record**: `refs/forge/idempotency/<command>/<hex>`, created in the same
+  ref transaction as the mutation. A malformed record is `E_INVALID`. Record
+  format and atomicity: `docs/architecture/git-forge.md`.
+
 ### Ref Layout
 
 ```
@@ -130,6 +262,7 @@ refs/forge/prs/<n>/gen/<k>/source        # t1: immutable snapshot ref for genera
 refs/forge/prs/<n>/gen/<k>/base          # t1: immutable snapshot ref for generation k >= 1 → gen-k base_head
 refs/forge/prs/<n>/result                # prepared-candidate/pending merge-result ref → result_commit (created by `pr prepare`, deleted by the merge final transaction or reported as leftover on failure)
 refs/forge/meta/counter                  # versioned counter commit chain (next sequential id)
+refs/forge/idempotency/<command>/<hex>   # idempotency record (immutable): <command> = issue-new|pr-create|issue-comment|pr-comment, <hex> = lowercase hex of the key bytes
 refs/remotes/<remote>/forge/*            # remote-tracking mirror; never local-authoritative
 ```
 
@@ -182,13 +315,13 @@ Kinds and body fields:
 | `pr.review` | pr | `{decision: "approve"|"reject", generation, base_head, strategy?, result_commit?, result_tree?, body?, file?, line?, commit?}` |
 | `pr.merge` | pr | `{strategy: "merge"|"squash"|"rebase"|"ff", result_commit}` |
 | `pr.abandoned` | pr | `{reason}` |
-| `ci.check` | pr | `{status: "pending"|"success"|"failed", plan?, generation, base_head, strategy?, result_commit?, result_tree?}` |
+| `ci.check` | pr | `{status: "pending"|"success"|"failed", plan?, generation, base_head, strategy?, result_commit?, result_tree?, reason?, tail?}` |
 
 `pr.review` and `ci.check` bind the `generation` they were taken against (t1) and the live `base_head` (t2); when a prepared candidate exists at the time of the event, both also bind the candidate identity (`strategy`, `result_commit`, `result_tree`). `pr.review` is anchored to optional `commit` + permission to include `file`/`line` for inline comment. Inline comments are immutable references to a snapshot commit; they never follow later diff changes.
 
 `pr.abandoned` makes the PR **terminal** (see PR Lifecycle): `reason` is the required abandonment text; the PR is then refused by `pr merge`, `pr review`, and `ci run` before any write, and no reopen exists — a reopened PR is a new entity.
 
-`ci.check` records an on-demand **CI Run** on a PR. Its `body` carries `status` (`pending` | `success` | `failed`) and, once a run has executed, `plan` (the plan that ran: `.forge/ci.sh`, or the `just check` fallback), plus the `generation` captured at run start and the live `base_head` (and the prepared-candidate identity when the run validated a candidate); the initial pending marker from `pr create` carries only `status: "pending"` — no plan executes at creation. The top-level `ts`/`actor` record when the Check was written and who invoked the run. Folding keeps the LATEST `ci.check` for the PR, so the merge gate reads a single current status and requires it to be `success` on the PR's CURRENT snapshot generation — a green Check from an older generation is stale (an in-flight run whose append lands after a concurrent `pr update` still carries its captured generation and never greens the new one).
+`ci.check` records an on-demand **CI Run** on a PR. Its `body` carries `status` (`pending` | `success` | `failed`) and, once a run has executed, `plan` (the plan that ran: `.forge/ci.sh`, or the `just check` fallback), plus the `generation` captured at run start and the live `base_head` (and the prepared-candidate identity when the run validated a candidate); the initial pending marker from `pr create` carries only `status: "pending"` — no plan executes at creation. A `failed` Check written by `ci run` also carries `reason` and `tail` (CI failure, above); `plan` is absent when the plan was refused before selection. Checks without these fields fold as `None`. The top-level `ts`/`actor` record when the Check was written and who invoked the run. Folding keeps the LATEST `ci.check` for the PR, so the merge gate reads a single current status and requires it to be `success` on the PR's CURRENT snapshot generation — a green Check from an older generation is stale (an in-flight run whose append lands after a concurrent `pr update` still carries its captured generation and never greens the new one).
 
 **Effective review decision (L1)**: the last reachable `pr.review` event in the entity chain's parent order (single local chain in L1) is the effective PR decision; the merge gate requires that decision to be `approve` AND bound to the PR's current snapshot generation — each `pr.review` stamps the `generation` captured at review time (plus the live `base_head`, and the prepared-candidate identity when one is current), and the gate compares that captured generation with the PR's CURRENT generation, so a pre-update approval is stale and refused with a re-review remedy. Repeated decisions by the same or different actors simply advance the effective decision; no per-actor union semantics. DAG linearization for multi-chain convergence is deferred to ADR-0004/L2. `approve → reject` and `reject → approve` transitions are first-class test cases.
 
@@ -386,3 +519,4 @@ Recorded in `docs/adr/`:
 - Identity is resolved through the `git` binary before any write, never a libgit2 `repo.config()` read — that path can SIGSEGV on a config corrupted after `Repository::open` (VAL-115). The trade-off is git-binary spawn cost per write.
 - `git forge pr merge` merges while `base_ref` is checked out only when every such worktree is clean (untracked counts as dirty, ignored does not); the clean worktree is refreshed to the result commit after the base CAS, and a refresh failure rolls the refs back and reports the worktree as a leftover. **Sparse-checkout and submodules in a base worktree are out of L1 scope**: behavior with either present is not covered by the clean/refresh contract (the porcelain cleanliness check and the bare `reset --hard` refresh make no promises about sparse index state or submodule contents) and may refuse or mis-refresh.
 - The test-only `GIT_FORGE_TEST_MERGE_BARRIER` seam exists only in test/debug builds and is ignored in release.
+- The CI output tail is diagnostic text, not an exact byte record: bytes that are not valid UTF-8 become U+FFFD, so distinct invalid bytes look the same. A plan descendant that leaves the process group (for example with `setsid`) can keep the output pipe open; `ci run` then waits at most about one second for the pipe to close and records the tail read so far.
