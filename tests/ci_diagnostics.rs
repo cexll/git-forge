@@ -328,9 +328,12 @@ fn missing_trusted_just_is_spawn_failed() {
     });
 }
 
-/// A release build ignores the debug-only seam: `ci run` ends the same way
-/// with and without `GIT_FORGE_TEST_NO_TRUSTED_JUST=1`, whatever `just` the
-/// host has. Runs only under `cargo test --release`.
+/// A release build ignores the debug-only seam: with a trusted `just` on the
+/// host, `ci run` succeeds without `GIT_FORGE_TEST_NO_TRUSTED_JUST` and gives
+/// the same success with `GIT_FORGE_TEST_NO_TRUSTED_JUST=1`. Runs only under
+/// `cargo test --release`. A trusted `just` is a host precondition, decided by
+/// the built binary's own resolution; without one, the test fails with the
+/// binary's `no trusted \`just\`` diagnostic instead of passing vacuously.
 #[cfg(not(debug_assertions))]
 #[test]
 fn release_build_ignores_the_no_trusted_just_seam() {
@@ -343,11 +346,23 @@ fn release_build_ignores_the_no_trusted_just_seam() {
             output.status.code(),
             body["status"].clone(),
             body["reason"].clone(),
+            String::from_utf8_lossy(&output.stderr).into_owned(),
         )
     };
-    let without = run(&[]);
-    let with = run(&[("GIT_FORGE_TEST_NO_TRUSTED_JUST", "1")]);
-    assert_eq!(with, without);
+    let (code, status, reason, stderr) = run(&[]);
+    assert!(
+        code == Some(0) && status == "success",
+        "this release test requires a trusted `just` on the host; the baseline \
+         `ci run` without the seam variable must succeed, got exit {code:?}, \
+         status {status}, reason {reason}: {stderr}"
+    );
+    let (seam_code, seam_status, seam_reason, seam_stderr) =
+        run(&[("GIT_FORGE_TEST_NO_TRUSTED_JUST", "1")]);
+    assert_eq!(
+        (seam_code, seam_status, seam_reason),
+        (code, status, reason),
+        "a release build must ignore GIT_FORGE_TEST_NO_TRUSTED_JUST: {seam_stderr}"
+    );
 }
 
 #[test]
