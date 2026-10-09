@@ -181,7 +181,11 @@ pub(crate) fn expected_value_rejected(error: &StoreError, lines: &[String]) -> b
 /// Whether `error` is git's lock-file contention on a ref this transaction
 /// names: another transaction holds `<ref>.lock` (for example a same-key
 /// winner that is prepared but not yet committed). Recognized only from the
-/// exact `prepare` diagnostic; every other failure stays fatal.
+/// exact `prepare` diagnostic, on any stderr line: git trace output
+/// (`GIT_TRACE*`), warnings, or hook output may precede it. Every other
+/// failure stays fatal. The runner keeps the caller's `GIT_TRACE*`
+/// variables: the line match does not depend on them, and clearing them
+/// would only hide a user's requested git trace.
 pub(super) fn lock_contended(error: &StoreError, lines: &[String]) -> bool {
     let StoreError::Command(stderr) = error else {
         return false;
@@ -192,10 +196,12 @@ pub(super) fn lock_contended(error: &StoreError, lines: &[String]) -> bool {
         .any(|reference| {
             let prefix =
                 format!("fatal: prepare: cannot lock ref '{reference}': Unable to create '");
-            stderr
-                .strip_prefix(&prefix)
-                .and_then(|rest| rest.split_once("': File exists."))
-                .is_some_and(|(path, _)| path.ends_with(&format!("/{reference}.lock")))
+            stderr.lines().any(|diagnostic| {
+                diagnostic
+                    .strip_prefix(&prefix)
+                    .and_then(|rest| rest.split_once("': File exists."))
+                    .is_some_and(|(path, _)| path.ends_with(&format!("/{reference}.lock")))
+            })
         })
 }
 
@@ -544,6 +550,16 @@ mod tests {
         assert!(lock_contended(&held(COUNTER_REF), &lines));
         assert!(lock_contended(&held("refs/forge/issues/1"), &lines));
         assert!(!lock_contended(&held("refs/forge/issues/2"), &lines));
+        // Git trace or warning lines may precede the diagnostic.
+        let traced = |reference: &str| match held(reference) {
+            StoreError::Command(stderr) => StoreError::Command(format!(
+                "12:00:00.000000 trace.c:1 trace: built-in: git update-ref --stdin\n\
+                 warning: some warning\n{stderr}"
+            )),
+            other => other,
+        };
+        assert!(lock_contended(&traced(COUNTER_REF), &lines));
+        assert!(!lock_contended(&traced("refs/forge/issues/2"), &lines));
         let moved = StoreError::Command(format!(
             "fatal: prepare: cannot lock ref '{COUNTER_REF}': is at {} but expected {}",
             "3".repeat(40),

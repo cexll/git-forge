@@ -640,8 +640,19 @@ fn replay_after_the_entity_changed_returns_the_original_result() {
 /// Start `args` with a write barrier at `barrier` and wait until it parks
 /// there: its record lookup has run and it has written nothing yet.
 fn spawn_parked(repo: &Repo, args: &[&str], barrier: &Path) -> std::process::Child {
+    spawn_parked_with(repo, args, barrier, &[])
+}
+
+/// [`spawn_parked`] with extra environment variables.
+fn spawn_parked_with(
+    repo: &Repo,
+    args: &[&str],
+    barrier: &Path,
+    env: &[(&str, &str)],
+) -> std::process::Child {
     let mut child = repo
         .command(args)
+        .envs(env.iter().copied())
         .env("GIT_FORGE_TEST_WRITE_BARRIER", barrier)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -1373,6 +1384,19 @@ fn wait_for(child: &mut std::process::Child, path: &Path, what: &str) {
 /// winner commits, the same call replays the winner's result.
 #[test]
 fn a_same_key_loser_blocked_by_a_prepared_winner_gets_a_retryable_conflict() {
+    loser_blocked_by_a_prepared_winner(&[]);
+}
+
+/// The same with git tracing on: trace lines precede git's lock diagnostic
+/// on stderr, and the loser still gets the retryable conflict.
+#[test]
+fn a_same_key_loser_blocked_by_a_prepared_winner_under_git_trace_gets_a_retryable_conflict() {
+    loser_blocked_by_a_prepared_winner(&[("GIT_TRACE", "1")]);
+}
+
+/// Run every keyed command as a prepared winner and a blocked loser, both
+/// with `env` set.
+fn loser_blocked_by_a_prepared_winner(env: &[(&str, &str)]) {
     let cases: [(&str, &[&str]); 4] = [
         (
             "issue new",
@@ -1431,6 +1455,7 @@ fn a_same_key_loser_blocked_by_a_prepared_winner_gets_a_retryable_conflict() {
         // The winner alone runs the hook: only its environment names it.
         let mut winner = repo
             .command(args)
+            .envs(env.iter().copied())
             .env("GIT_FORGE_TEST_WRITE_BARRIER", &a)
             .env("GIT_CONFIG_COUNT", "1")
             .env("GIT_CONFIG_KEY_0", "core.hooksPath")
@@ -1440,7 +1465,7 @@ fn a_same_key_loser_blocked_by_a_prepared_winner_gets_a_retryable_conflict() {
             .spawn()
             .unwrap();
         wait_for(&mut winner, &a.join("ready"), case);
-        let loser = spawn_parked(&repo, args, &b);
+        let loser = spawn_parked_with(&repo, args, &b, env);
         std::fs::write(a.join("release"), "release").unwrap();
         wait_for(&mut winner, &hooks.join("held"), case);
         let lost = release(loser, &b);
