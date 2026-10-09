@@ -442,7 +442,12 @@ returns the first result instead of a second Issue, PR or comment.
   because another transaction holds a lock on one of its refs (for
   example a same-key winner that is prepared but not yet committed) and no
   record is readable yet, the call returns `E_CONFLICT` with
-  `retryable: true`. A retry after the winner commits replays its result.
+  `retryable: true`, an empty `input`, and the hint `Read the current
+  state and retry the command.` The message is the store's CAS failure:
+  `bounded CAS retries exhausted; refs unchanged` for `issue new`, which
+  first spends its bounded retries on the conflict, and `ref CAS conflict — ref moved, retry`
+  for `pr create`, `issue comment` and `pr comment`. A retry after the
+  winner commits replays its result.
 
 A record ref that exists but is not well formed is `E_INVALID`
 (`malformed idempotency record <ref>`), never a new key, a conflict or an
