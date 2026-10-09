@@ -850,6 +850,7 @@ pub(crate) fn cmd_pr_update(args: &[String]) -> Result<String, CliError> {
     let event = store
         .update_pr(
             id,
+            &base_ref,
             old_source,
             old_base,
             old_merge_base,
@@ -859,7 +860,13 @@ pub(crate) fn cmd_pr_update(args: &[String]) -> Result<String, CliError> {
             generation,
             &actor,
         )
-        .map_err(CliError::from)?;
+        // The transaction verifies the base tip checked above: a base that
+        // moved or was deleted since then is reported as such.
+        .map_err(|error| match resolve_tip(&base_ref) {
+            Ok(current) if current == new_base => CliError::from(error),
+            Ok(current) => base_moved_error(id, &base_ref, old_base, current),
+            Err(missing) => missing,
+        })?;
     if json {
         return Ok(crate::machine::pr_update_json(
             id,

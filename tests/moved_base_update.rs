@@ -301,3 +301,105 @@ fn pr_update_deleted_base_keeps_not_found() {
     );
     assert_eq!(repo.all_refs(), before, "a refused update changed refs");
 }
+
+/// Run `pr update 1 --json` parked at the test-only write barrier (after its
+/// moved-base check, before its transaction), run `between`, then release it.
+fn update_racing(f: &Fixture, between: impl Fn(&Repo)) -> (i32, String, String) {
+    let repo = &f.repo;
+    let barrier = repo.0.with_extension("barrier");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_git-forge"))
+        .args(["forge", "pr", "update", "1", "--json"])
+        .current_dir(&repo.0)
+        .env_remove("GIT_FORGE_ROLE")
+        .env("GIT_FORGE_TEST_WRITE_BARRIER", &barrier)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    while !barrier.join("ready").exists() {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "exited before the barrier"
+        );
+        assert!(std::time::Instant::now() < deadline, "never parked");
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    between(repo);
+    std::fs::write(barrier.join("release"), "release").unwrap();
+    let out = child.wait_with_output().unwrap();
+    let _ = std::fs::remove_dir_all(&barrier);
+    (
+        out.status.code().unwrap_or(-1),
+        String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        String::from_utf8_lossy(&out.stderr).trim().to_string(),
+    )
+}
+
+/// A base that moves after `pr update` checked it and before its transaction
+/// publishes still refuses with `E_BASE_MOVED` (the transaction verifies the
+/// observed base tip), naming the moved tip, and publishes no generation.
+#[test]
+fn pr_update_refuses_a_base_moved_after_its_check() {
+    let f = fixture("race", "main");
+    let repo = &f.repo;
+    let snapshot_base = repo.rev("refs/heads/main");
+    let source = repo.child_of(&repo.rev("refs/heads/feature"), "source advance");
+    repo.git(&["update-ref", "refs/heads/feature", &source]);
+    let (code, stdout, stderr) = update_racing(&f, |repo| {
+        let next = repo.child_of(&repo.rev("refs/heads/main"), "base advance");
+        repo.git(&["update-ref", "refs/heads/main", &next]);
+    });
+    let current_base = repo.rev("refs/heads/main");
+    let message = expected_message("main");
+    assert_eq!(code, 1, "{stdout} {stderr}");
+    assert_eq!(stderr, format!("git-forge: {message}"));
+    let actual: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(
+        actual,
+        serde_json::json!({"error": {
+            "code": "E_BASE_MOVED",
+            "message": message,
+            "input": "main",
+            "hint": HINT,
+            "retryable": false,
+            "data": {
+                "pr": 1,
+                "base": "main",
+                "snapshot_base": snapshot_base,
+                "current_base": current_base,
+            }
+        }})
+    );
+    let forge_refs = repo.git(&["for-each-ref", "--format=%(refname)", "refs/forge/prs/1/"]);
+    assert!(
+        !forge_refs.contains("/gen/1/"),
+        "a generation was published: {forge_refs}"
+    );
+    let (_, shown, _) = repo.forge(&["forge", "pr", "show", "1", "--json"]);
+    let shown: serde_json::Value = serde_json::from_str(&shown).unwrap();
+    assert_eq!(shown["generation"], 0, "{shown}");
+}
+
+/// A base deleted in the same window keeps the missing-branch refusal and
+/// publishes no generation.
+#[test]
+fn pr_update_refuses_a_base_deleted_after_its_check() {
+    let f = fixture("race-deleted", "main");
+    let repo = &f.repo;
+    let source = repo.child_of(&repo.rev("refs/heads/feature"), "source advance");
+    repo.git(&["update-ref", "refs/heads/feature", &source]);
+    let (code, stdout, stderr) = update_racing(&f, |repo| {
+        repo.git(&["update-ref", "-d", "refs/heads/main"]);
+    });
+    assert_eq!(code, 1, "{stdout} {stderr}");
+    assert_eq!(stderr, "git-forge: branch 'main' does not exist");
+    let actual: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+    assert_eq!(actual["error"]["code"], "E_NOT_FOUND", "{actual}");
+    assert_eq!(actual["error"]["input"], "main", "{actual}");
+    let forge_refs = repo.git(&["for-each-ref", "--format=%(refname)", "refs/forge/prs/1/"]);
+    assert!(
+        !forge_refs.contains("/gen/1/"),
+        "a generation was published: {forge_refs}"
+    );
+}

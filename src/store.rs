@@ -921,10 +921,16 @@ impl BoundEventStore {
     /// Parameter order is fixed and documented like `create_pr`: id, then
     /// the three old snapshot OIDs, then the three new ones, then the
     /// generation number, then the actor.
+    ///
+    /// Base binding: the transaction also verifies that `refs/heads/<base>`
+    /// still points at `new_base`, the tip the caller checked. A base that
+    /// moved (or was deleted) after that check fails the transaction without
+    /// a retry, and the caller re-reads the base to report it.
     #[allow(clippy::too_many_arguments)]
     pub fn update_pr(
         &self,
         id: u64,
+        base_branch: &str,
         old_source: Oid,
         old_base: Oid,
         old_merge_base: Oid,
@@ -937,6 +943,7 @@ impl BoundEventStore {
         let head = pr_head_ref(id);
         let source_gen_ref = pr_source_generation_ref(id, generation);
         let base_gen_ref = pr_base_generation_ref(id, generation);
+        let base_branch_ref = format!("refs/heads/{base_branch}");
         let mut body = HashMap::new();
         body.insert(
             "old_source_head".into(),
@@ -970,6 +977,7 @@ impl BoundEventStore {
             let parents: Vec<Oid> = tip.into_iter().collect();
             let event_oid = self.write_event_commit(&event, &parents, &message)?;
             let mut lines = vec![
+                format!("verify {base_branch_ref} {new_base}"),
                 format!("update {source_gen_ref} {new_source} {ZERO_OID}"),
                 format!("update {base_gen_ref} {new_base} {ZERO_OID}"),
             ];
@@ -985,6 +993,9 @@ impl BoundEventStore {
                     // caller must re-fold and use the next one.
                     if self.inner.current_tip(&source_gen_ref)?.is_some() {
                         return Err(StoreError::RefExists(source_gen_ref));
+                    }
+                    if self.inner.current_tip(&base_branch_ref)? != Some(new_base) {
+                        return Err(e);
                     }
                     let fresh = self.inner.current_tip(&head)?;
                     if fresh == tip {

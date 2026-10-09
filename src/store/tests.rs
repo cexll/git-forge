@@ -251,3 +251,54 @@ fn a_failed_transaction_aborts_writes_nothing_and_leaves_no_lock() {
     assert_eq!(lock_files(&path), Vec::<std::path::PathBuf>::new());
     let _ = std::fs::remove_dir_all(&path);
 }
+
+/// `update_pr` binds the base tip its caller checked: when
+/// `refs/heads/<base>` no longer points at `new_base`, the transaction
+/// fails and neither generation ref nor the PR head is written; with the
+/// checked tip in place the same update publishes.
+#[test]
+fn update_pr_verifies_the_checked_base_tip() {
+    let path = std::env::temp_dir().join(format!("gf-store-update-base-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&path);
+    EventStore::init(&path).unwrap();
+    let store = EventStore::open(&path).unwrap();
+    let checked = empty_commit(&store);
+    let moved = store
+        .repo
+        .commit(
+            None,
+            &Signature::now("Test", "test@example.com").unwrap(),
+            &Signature::now("Test", "test@example.com").unwrap(),
+            "moved",
+            &store.repo.find_commit(checked).unwrap().tree().unwrap(),
+            &[&store.repo.find_commit(checked).unwrap()],
+        )
+        .unwrap();
+    store
+        .repo
+        .reference("refs/heads/main", moved, true, "m")
+        .unwrap();
+    let bound = EventStore::open(&path)
+        .unwrap()
+        .bind_signature(Signature::now("Test", "test@example.com").unwrap());
+    let update = |base| {
+        bound.update_pr(
+            1, "main", checked, checked, checked, moved, base, checked, 1, "a",
+        )
+    };
+    assert!(update(checked).is_err());
+    for name in [
+        pr_head_ref(1),
+        pr_source_generation_ref(1, 1),
+        pr_base_generation_ref(1, 1),
+    ] {
+        assert_eq!(store.current_tip(&name).unwrap(), None, "{name}");
+    }
+    let event = update(moved).unwrap();
+    assert_eq!(store.current_tip(&pr_head_ref(1)).unwrap(), Some(event));
+    assert_eq!(
+        store.current_tip(&pr_base_generation_ref(1, 1)).unwrap(),
+        Some(moved)
+    );
+    let _ = std::fs::remove_dir_all(&path);
+}
