@@ -129,10 +129,24 @@ wins.
 
 Every command failure exits 1. Without `--json`, stdout is empty and stderr
 prints `git-forge: <message>`. With a bare `--json` token, stdout holds one
-JSON error object and stderr keeps the same line. A bare `--json` is a
-standalone token: not the value of a value-taking option (`--label --json`
-labels the Issue `--json`) and not after `--`. A command that has no JSON
-success result rejects `--json` the same way, with `E_USAGE`.
+JSON error object and stderr keeps the same line. When a command rejects
+`--json` because it has no JSON success result, that `E_USAGE` failure is
+also printed as JSON.
+
+A bare `--json` is a standalone token. It is not the value of a
+value-taking option: `issue new t --label --json` labels the Issue `--json`,
+and `--idempotency-key --json` uses the key `--json`. Only `issue new` and
+`pr create` declare `--` as end-of-options; after their `--`, `--json` is
+data. Other commands do not accept `--` (for example `pr show` rejects it as
+an unknown option), so a `--json` after it still requests JSON. Where the
+JSON decision is made:
+
+| Path | JSON error when |
+|---|---|
+| Top level, unknown command, `forge <sub>` with an unknown `<sub>`, `version` | any argument is `--json` (no command grammar ran) |
+| Namespace dispatch (`issue`, `pr`, `ci`, the `forge` form and the `git-issue`/`git-pr` wrappers) | the subcommand slot is `--json`, or a standalone `--json` follows the subcommand; after an unknown subcommand every `--json` is standalone |
+| Namespace help (`help`, `-h`, `--help` as the subcommand, or a leading help token after a known subcommand) | a standalone `--json` follows the subcommand (`E_USAGE`, help has no JSON) |
+| A known subcommand | its own split decides, before its parser reports any usage error |
 
 ```json
 {"error":{"code":"E_USAGE","message":"usage: git forge pr show <n> [--json]","input":"","hint":"Run the command with --help and correct its arguments.","retryable":false}}
@@ -167,7 +181,7 @@ Errors with `data` (keys in order):
 |---|---|---|---|---|
 | `E_PREPARE_CONFLICT` | `pr prepare` (merge, squash, rebase) | PR id | `pr`, `strategy`, `base` (base tip the candidate was built on), `source` (snapshot source commit), `paths` (every conflicted path, git-quoted) | ``Merge the base branch into the source branch, resolve the conflicts, then run `git forge pr update <n>` or create a replacement PR.`` |
 | `E_BASE_MOVED` | `pr update` | base branch name | `pr`, `base` (branch name), `snapshot_base`, `current_base` (live tip, or `null` when the base was deleted after the check) | `Inspect the current base and PR snapshot before proceeding.` |
-| `E_CI_FAILED` | `ci run` | PR id | `pr`, `reason`, `tail` | `Fix the CI plan and run CI again.` |
+| `E_CI_FAILED` | `ci run` | PR id | `pr`, `reason`, `tail` | `Fix the CI plan and run CI again.`, or `Inspect the reported worktree cleanup failure.` when the temporary worktree was left over |
 | `E_CONFLICT` | keyed command, key reused with different inputs | the key | `command`, `key`, `id` (recorded result id) | `Repeat the original inputs to read the recorded result, or use a new idempotency key.` |
 
 - **Prepare conflict** message: `PR #<n> cannot be prepared with strategy
@@ -176,15 +190,28 @@ Errors with `data` (keys in order):
   '<source_ref>', resolve the conflicts, then run `git forge pr update <n>`
   or create a replacement PR; <cleanup outcome>`. It lists at most 20 paths,
   then ` (and <m> more)`; `data.paths` is never cut. Refs are unchanged. A
-  failure without unmerged entries stays `E_INTERNAL`.
+  failure without unmerged entries stays `E_INTERNAL`. `ff` has no conflict
+  path, and `pr merge` strategy failures are not covered by this payload.
 - **Moved base** message: `base branch '<base_ref>' has moved since PR #<n>
   was created; run git forge pr prepare <n> --strategy <s> to merge the
   existing snapshot, or create a replacement PR from the updated source with
   the same --closes and abandon PR #<n>` (`<s>` is literal). Nothing is
   written. A base already deleted at the check is `E_NOT_FOUND`.
 - **CI failure**: a non-green `ci run` records a `failed` Check with one
-  `reason` and the output `tail`, then fails with the message `CI run for PR
-  #<n> failed (<plan>): <detail>; reason: <reason>; output tail: <tail>`.
+  `reason` and the output `tail`, then fails with `E_CI_FAILED`. The message
+  has one of two forms:
+  - Usual: `CI run for PR #<n> failed[ (<plan>)]: <detail>; reason:
+    <reason>[; output tail: <tail>]`, with the hint `Fix the CI plan and run
+    CI again.`
+  - Worktree left over: `CI run recorded <status> but temp worktree cleanup
+    failed: <leftover>; reason: <reason>[; output tail: <tail>]`, with the
+    hint `Inspect the reported worktree cleanup failure.`
+
+  ` (<plan>)` is absent when no plan was selected. The output-tail clause is
+  absent when the run printed nothing (`data.tail` is then `""`). Failures
+  before or after the CI result are not Checks and keep their own codes: a
+  missing or abandoned PR, a missing snapshot ref, a temporary worktree that
+  cannot be created, and a Check that cannot be appended.
   `reason` is the first cause in run order: `plan_invalid` (no plan, a
   symlinked or irregular plan, or a `just check` justfile that fails
   validation), `spawn_failed`, `timeout`, `nonzero_exit`, `cleanup_failed`.
@@ -200,11 +227,13 @@ human output is unchanged. There is no common envelope; key order is fixed
 per command. The shapes of `issue new|apply|list|show`, `pr create|list|show`
 and `ci run` are unchanged; the `ci` member of `pr create|show` is `null` or
 `{"status","plan","reason","tail"}`, where `reason` and `tail` are `null`
-for a pending or green Check.
+for a pending or green Check and for a Check recorded before these fields
+existed.
 
-Mutation results open with `id` and `state` (`open|closed` for an Issue,
-`open|merged|abandoned` for a PR), folded up to the event the command wrote.
-`event` is the commit the command appended. Commit ids are full 40-hex.
+The result objects in the table below open with `id` and `state`
+(`open|closed` for an Issue, `open|merged|abandoned` for a PR), folded up
+to the event the command wrote. `event` is the commit the command appended; `pr merge` has no `event` and
+returns `merge_commit` instead. Commit ids are full 40-hex.
 
 | Command | Result object (keys in order) |
 |---|---|
@@ -223,16 +252,22 @@ In `pr diff`, `base` and `head` are snapshot commits, not branch names, and
 `git diff base...head` output with leading and trailing whitespace removed,
 followed by one newline, or the empty string when that output is empty.
 
-Help has no JSON result: a help request with `--json` is `E_USAGE` and
-writes nothing. A `pr merge --recycle-worktree` whose recycle step fails
-after the merge is final exits 1; it prints no success result.
+Help has no JSON result: a help request with `--json` exits 1 with
+`E_USAGE` and writes nothing, also outside a git repository. A help request
+is a `-h` or `--help` token, or a `help` subcommand word, where the command's
+parser reads it as help. A `-h` or `--help` that is an option value (for
+example `--label --help`) is data, with or without `--json`.
+
+A `pr merge --recycle-worktree` whose recycle step fails after the merge is
+final exits 1; it prints no success result.
 
 ### Idempotency Keys (schema 1)
 
 `issue new`, `pr create`, `issue comment` and `pr comment` accept
 `--idempotency-key <k>`. A retry with the same key and the same inputs
-returns the first result (same `--json` or human output, exit 0) and writes
-nothing.
+exits 0 with the first result and writes nothing. The record keeps both the
+`--json` and the human result, so the replay prints the one for its own
+mode.
 
 - **Key**: non-empty, at most 100 bytes, compared byte for byte. A missing,
   empty, longer or repeated key is `E_USAGE` before any read or write.
@@ -243,7 +278,9 @@ nothing.
   target id and body. `--json` is not an input.
 - **Different inputs**: `E_CONFLICT`, `retryable: false`, `data` above.
 - **Concurrent same key**: one record and one entity. A loser that passed
-  the lookup answers from the winner's record. A loser that meets the
+  the lookup before the winner committed, and whose later step then fails,
+  answers from the winner's record (the result, or `E_CONFLICT` for
+  different inputs). A loser that meets the
   winner's held ref locks before any record is readable gets `E_CONFLICT`
   with `retryable: true`: the message is `bounded CAS retries exhausted;
   refs unchanged` for `issue new` and `ref CAS conflict — ref moved, retry`
