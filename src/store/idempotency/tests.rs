@@ -590,6 +590,7 @@ fn every_malformed_record_failure_mode_is_invalid_state() {
         ("C6 v is 2", edit("\"v\":1", "\"v\":2")),
         ("C6 v is a string", edit("\"v\":1", "\"v\":\"1\"")),
         ("C6 v missing", edit("\"v\":1,", "")),
+        ("C6 v with a leading zero", edit("\"v\":1", "\"v\":01")),
         ("C7 extra field", edit("}", ",\"extra\":1}")),
         ("C7 field renamed", edit("\"text\":", "\"texts\":")),
         (
@@ -623,6 +624,11 @@ fn every_malformed_record_failure_mode_is_invalid_state() {
         ("C10 id negative", edit("\"id\":1", "\"id\":-1")),
         ("C10 id a string", edit("\"id\":1", "\"id\":\"1\"")),
         ("C10 id missing", edit("\"id\":1,", "")),
+        ("C10 id with a leading zero", edit("\"id\":1", "\"id\":01")),
+        (
+            "C10 id with leading zeroes",
+            edit("\"id\":1", "\"id\":0001"),
+        ),
         ("C11 json missing", edit("\"json\":", "\"jsonx\":")),
         (
             "C11 json not a string",

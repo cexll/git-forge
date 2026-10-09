@@ -964,7 +964,10 @@ impl<'a> Parser<'a> {
         while self.bytes.get(self.pos).is_some_and(|b| b.is_ascii_digit()) {
             self.pos += 1;
         }
-        if self.pos == digits_start {
+        // JSON number syntax: the integer part is `0` or starts with 1-9.
+        if self.pos == digits_start
+            || (self.bytes[digits_start] == b'0' && self.pos - digits_start > 1)
+        {
             return None;
         }
         let raw = std::str::from_utf8(&self.bytes[start..self.pos]).ok()?;

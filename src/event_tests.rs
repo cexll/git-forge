@@ -113,6 +113,20 @@ fn uuid_v4_shape_boundaries() {
 
 /// Full escape set (\b \f \/), negative numbers, empty containers, and
 /// whitespace-tolerant parsing — branches not hit by the roundtrip tests.
+/// JSON number syntax: a zero integer part is a single `0`, so a zero
+/// followed by another digit is not a number; `0`, `-0` and multi-digit
+/// numbers without a leading zero are.
+#[test]
+fn json_parser_rejects_numbers_with_leading_zeroes() {
+    for text in ["01", "-01", "00", "007", "[01]", r#"{"v":01}"#] {
+        assert!(parse_json_value(text).is_none(), "{text}");
+    }
+    assert_eq!(parse_json_value("0").unwrap(), JsonValue::Number(0));
+    assert_eq!(parse_json_value("-0").unwrap(), JsonValue::Number(0));
+    assert_eq!(parse_json_value("10").unwrap(), JsonValue::Number(10));
+    assert_eq!(parse_json_value("-100").unwrap(), JsonValue::Number(-100));
+}
+
 #[test]
 fn json_parser_accepts_full_escape_set_and_negative_numbers() {
     let v = parse_json_value(r#""\b\f\/""#).unwrap();
