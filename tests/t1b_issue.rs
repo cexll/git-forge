@@ -946,3 +946,59 @@ fn bare_forge_direct_form_prints_top_help() {
     assert_eq!(c, 0, "bare forge must print help: {e}");
     assert!(o.contains("usage: git forge"), "bare forge help: {o}");
 }
+
+/// A `reference-transaction` hook that prints git's exact expected-value
+/// `prepare` diagnostic for the first `refs/forge/` ref and exits 1 makes git
+/// append `fatal: ref updates aborted by hook`. `issue new` must report that
+/// hook failure once: no retry, no `E_CONFLICT`, and no ref written.
+#[test]
+fn hook_printing_a_cas_diagnostic_is_reported_as_the_hook_failure() {
+    let dir = tmpdir("hookcas");
+    init_repo(&dir);
+    let hooks = dir.join(".git").join("hooks");
+    std::fs::create_dir_all(&hooks).unwrap();
+    let hook = hooks.join("reference-transaction");
+    std::fs::write(
+        &hook,
+        format!(
+            "#!/bin/sh\n\
+             echo \"$1\" >> '{log}'\n\
+             [ \"$1\" = prepared ] || {{ cat >/dev/null; exit 0; }}\n\
+             while read old new ref; do\n\
+               case \"$ref\" in refs/forge/*) break ;; esac\n\
+             done\n\
+             cat >/dev/null\n\
+             if [ \"$old\" = 0000000000000000000000000000000000000000 ]; then\n\
+               echo \"fatal: prepare: cannot lock ref '$ref': reference already exists\" >&2\n\
+             else\n\
+               echo \"fatal: prepare: cannot lock ref '$ref': is at \
+             3333333333333333333333333333333333333333 but expected $old\" >&2\n\
+             fi\n\
+             exit 1\n",
+            log = dir.join("hook.log").display()
+        ),
+    )
+    .unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let (code, _, stderr) = forge(&dir, &["forge", "issue", "new", "Hooked"]);
+    assert_ne!(code, 0, "hook rejection must fail the command");
+    assert!(
+        stderr.contains("ref updates aborted by hook"),
+        "stderr: {stderr}"
+    );
+    assert!(!stderr.contains("E_CONFLICT"), "stderr: {stderr}");
+    let log = std::fs::read_to_string(dir.join("hook.log")).unwrap();
+    assert_eq!(
+        log.lines().filter(|state| *state == "prepared").count(),
+        1,
+        "the hook rejection must not be retried: {log}"
+    );
+    let refs = Command::new("git")
+        .args(["for-each-ref", "refs/forge"])
+        .current_dir(&dir)
+        .output()
+        .unwrap();
+    assert!(refs.stdout.is_empty(), "refs written: {:?}", refs.stdout);
+}

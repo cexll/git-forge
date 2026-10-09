@@ -139,6 +139,9 @@ pub(crate) fn expected_value_rejected(error: &StoreError, lines: &[String]) -> b
     let StoreError::Command(stderr) = error else {
         return false;
     };
+    if aborted_by_hook(stderr) {
+        return false;
+    }
     lines.iter().any(|line| {
         let mut fields = line.split_whitespace();
         let operation = fields.next();
@@ -160,6 +163,18 @@ pub(crate) fn expected_value_rejected(error: &StoreError, lines: &[String]) -> b
             })
         })
     })
+}
+
+/// Whether git reports that a `reference-transaction` hook rejected the
+/// prepared transaction. git runs that hook only after every ref is locked
+/// and its expected value checked, so a hook abort is never a CAS or lock
+/// failure, even when the hook printed git's exact diagnostic text. The
+/// runner cannot tell the two apart structurally: both end before
+/// `prepare: ok`. git's own abort line is the only signal.
+fn aborted_by_hook(stderr: &str) -> bool {
+    stderr
+        .lines()
+        .any(|line| line.trim_end() == "fatal: ref updates aborted by hook")
 }
 
 /// Whether one `prepare` diagnostic `reason` for `reference` rejects this
@@ -199,6 +214,9 @@ pub(super) fn lock_contended(error: &StoreError, lines: &[String]) -> bool {
     let StoreError::Command(stderr) = error else {
         return false;
     };
+    if aborted_by_hook(stderr) {
+        return false;
+    }
     lines
         .iter()
         .filter_map(|line| line.split_whitespace().nth(1))
@@ -628,5 +646,45 @@ mod tests {
         ));
         assert!(!lock_contended(&other_lock, &lines));
         assert!(!lock_contended(&StoreError::CasConflict, &lines));
+    }
+
+    /// git's own `ref updates aborted by hook` line after a hook-printed
+    /// diagnostic: the hook rejected the prepared transaction, so the run is
+    /// a hook failure, never a CAS conflict.
+    #[test]
+    fn hook_abort_is_not_an_expected_value_rejection() {
+        let old = "1".repeat(40);
+        let lines = vec![format!("verify {COUNTER_REF} {old}")];
+        let moved = format!(
+            "fatal: prepare: cannot lock ref '{COUNTER_REF}': is at {} but expected {old}",
+            "3".repeat(40)
+        );
+        let traced =
+            format!("12:00:00.000000 trace.c:1 trace: built-in: git update-ref --stdin\n{moved}");
+        assert!(expected_value_rejected(
+            &StoreError::Command(traced),
+            &lines
+        ));
+        let aborted = StoreError::Command(format!("{moved}\nfatal: ref updates aborted by hook"));
+        assert!(!expected_value_rejected(&aborted, &lines));
+    }
+
+    /// git's own `ref updates aborted by hook` line after a hook-printed
+    /// lock-contention diagnostic: a hook failure, never lock contention.
+    #[test]
+    fn hook_abort_is_not_lock_contention() {
+        let lines = vec![format!(
+            "update {COUNTER_REF} {} {ZERO_OID}",
+            "1".repeat(40)
+        )];
+        let held = format!(
+            "fatal: prepare: cannot lock ref '{COUNTER_REF}': Unable to create \
+             '/tmp/r/.git/{COUNTER_REF}.lock': File exists."
+        );
+        let traced =
+            format!("12:00:00.000000 trace.c:1 trace: built-in: git update-ref --stdin\n{held}");
+        assert!(lock_contended(&StoreError::Command(traced), &lines));
+        let aborted = StoreError::Command(format!("{held}\nfatal: ref updates aborted by hook"));
+        assert!(!lock_contended(&aborted, &lines));
     }
 }
