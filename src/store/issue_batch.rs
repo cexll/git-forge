@@ -133,6 +133,8 @@ impl BoundEventStore {
 
 // Git has no structured update-ref error code. Only recognized expected-value
 // diagnostics for this transaction permit retry; unknown failures stay fatal.
+// The diagnostic may sit on any stderr line: git trace output (`GIT_TRACE*`),
+// warnings, or hook output may precede it.
 pub(crate) fn expected_value_rejected(error: &StoreError, lines: &[String]) -> bool {
     let StoreError::Command(stderr) = error else {
         return false;
@@ -152,30 +154,37 @@ pub(crate) fn expected_value_rejected(error: &StoreError, lines: &[String]) -> b
             return false;
         };
         let prefix = format!("fatal: prepare: cannot lock ref '{reference}': ");
-        let Some(reason) = stderr.strip_prefix(&prefix) else {
-            return false;
-        };
-        if expected == ZERO_OID {
-            return reason == "reference already exists";
-        }
-        // update-ref exposes only stderr, not structured rejection codes. A
-        // missing ref is a CAS failure only for this named update's nonzero
-        // expected OID; absent-ref verifies and unrelated failures stay fatal.
-        if operation == Some("update")
-            && reason
-                .strip_prefix("unable to resolve reference '")
-                .and_then(|name| name.strip_suffix('\''))
-                == Some(reference)
-        {
-            return true;
-        }
-        reason
-            .strip_prefix("is at ")
-            .and_then(|s| s.split_once(" but expected "))
-            .is_some_and(|(actual, rejected)| {
-                rejected == expected && actual != expected && Oid::from_str(actual).is_ok()
+        stderr.lines().any(|diagnostic| {
+            diagnostic.strip_prefix(&prefix).is_some_and(|reason| {
+                rejects_expected_value(operation == Some("update"), reference, expected, reason)
             })
+        })
     })
+}
+
+/// Whether one `prepare` diagnostic `reason` for `reference` rejects this
+/// line's `expected` value.
+fn rejects_expected_value(update: bool, reference: &str, expected: &str, reason: &str) -> bool {
+    if expected == ZERO_OID {
+        return reason == "reference already exists";
+    }
+    // update-ref exposes only stderr, not structured rejection codes. A
+    // missing ref is a CAS failure only for this named update's nonzero
+    // expected OID; absent-ref verifies and unrelated failures stay fatal.
+    if update
+        && reason
+            .strip_prefix("unable to resolve reference '")
+            .and_then(|name| name.strip_suffix('\''))
+            == Some(reference)
+    {
+        return true;
+    }
+    reason
+        .strip_prefix("is at ")
+        .and_then(|s| s.split_once(" but expected "))
+        .is_some_and(|(actual, rejected)| {
+            rejected == expected && actual != expected && Oid::from_str(actual).is_ok()
+        })
 }
 
 /// Whether `error` is git's lock-file contention on a ref this transaction
@@ -529,6 +538,53 @@ mod tests {
             store.store().current_tip(COUNTER_REF).unwrap(),
             snapshot.counter_tip
         );
+    }
+
+    /// An expected-value rejection is recognized from git's exact `prepare`
+    /// diagnostic on any stderr line, so git trace or warning lines before it
+    /// keep a CAS conflict retryable.
+    #[test]
+    fn expected_value_rejection_is_recognized_after_trace_lines() {
+        let old = "1".repeat(40);
+        let actual = "3".repeat(40);
+        let lines = vec![
+            format!("verify {COUNTER_REF} {old}"),
+            format!("update refs/forge/issues/1 {} {ZERO_OID}", "2".repeat(40)),
+        ];
+        let traced = |diagnostic: &str| {
+            StoreError::Command(format!(
+                "12:00:00.000000 trace.c:1 trace: built-in: git update-ref --stdin\n\
+                 warning: some warning\n{diagnostic}"
+            ))
+        };
+        let moved = format!(
+            "fatal: prepare: cannot lock ref '{COUNTER_REF}': is at {actual} but expected {old}"
+        );
+        assert!(expected_value_rejected(
+            &StoreError::Command(moved.clone()),
+            &lines
+        ));
+        assert!(expected_value_rejected(&traced(&moved), &lines));
+        assert!(expected_value_rejected(
+            &traced(
+                "fatal: prepare: cannot lock ref 'refs/forge/issues/1': reference already exists"
+            ),
+            &lines
+        ));
+        assert!(!expected_value_rejected(
+            &traced(
+                "fatal: prepare: cannot lock ref 'refs/forge/issues/2': reference already exists"
+            ),
+            &lines
+        ));
+        assert!(!expected_value_rejected(
+            &traced("fatal: some other failure"),
+            &lines
+        ));
+        assert!(!expected_value_rejected(
+            &traced(&format!("warning: {moved}")),
+            &lines
+        ));
     }
 
     /// Lock-file contention is recognized only from git's exact `prepare`
