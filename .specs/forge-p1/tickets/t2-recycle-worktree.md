@@ -14,7 +14,7 @@ Per issue #4's spec amendment (command shape and recycle ownership):
 - Validation: path must be a REGISTERED worktree whose checked-out branch is the PR source_ref. Wrong/unregistered paths are refused with refs untouched.
 - Dirty check: a dirty worktree is refused without `--force` (untracked counts, same `git status --porcelain` semantics as #3).
 - Branch deletion ONLY when the source tip is an ancestor of the integrated base tip: `--ff`/`--merge` delete the branch; `--squash`/`--rebase` keep it and REPORT why.
-- Structured outcome line for orchestrators, exactly this vocabulary: `removed | refused-dirty | refused-not-contained | partial-leftover(<path>) | branch-deleted | branch-kept(<reason>)`.
+- Human recycle success output follows `merged PR #<n> into <base> (<sha>); ` and is `recycle outcome: removed; branch-deleted (<branch>)`, `recycle outcome: removed; branch-kept(<branch>: <reason>)`, or, under `ff`/`merge`, `recycle outcome: removed (branch <branch> absent)`; exact retention reasons are documented in `docs/architecture/git-forge.md` under Source-worktree recycle. Refusals contain `recycle refused (refused-dirty): <detail>` or `recycle refused (refused-not-contained): <detail>`; partial failures contain `recycle outcome: partial-leftover(<path>): <detail>`.
 - Sequencing: the recycle runs after base refresh (#3) and finalization; it never touches the base worktree. Salvage renaming of an unmerged branch is adapter/pipeline-side and runs BEFORE this call — forge does not salvage.
 - Docs: wire-contract row for the new flag + outcome vocabulary; the switchover announcement lands in this ticket's OLD-PATH integration commit message and Issue comment (one commit boundary per the switchover ADR).
 
@@ -34,6 +34,6 @@ Fulfills: VAL-109, VAL-110, VAL-111, VAL-112, VAL-118
 - Evidence expected: dogfood assertions on outcome lines green; injection green; cargo test exit 0
 
 ### Notes
-- The outcome line is the forge→adapter contract (adapter contract clause 8): the adapter consumes it verbatim and persists it before clearing feature.worktree/branch. Keep the vocabulary exact.
+- The forge→adapter contract (adapter contract clause 8) uses the full CLI messages, including prefixes, branch names, and reasons, not a bare-state machine vocabulary; the adapter persists the outcome before clearing feature.worktree/branch.
 - This ticket lands by the OLD path (no forge PR) per the switchover ADR; its integration commit announces the switchover.
 - Recycling is explicit per-merge, not hooked (hooks are L2, not built).
