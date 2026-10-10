@@ -4210,7 +4210,7 @@ fn recycle_setup(tag: &str) -> (PathBuf, PathBuf) {
     checkout(&dir, "feature");
     add_passing_ci_plan(&dir);
     checkout(&dir, "main");
-    let wt = add_source_worktree(&dir, "wt-src", "feature");
+    let wt = add_source_worktree(&dir, tag, "feature");
     let (c, o, e) = forge(
         &dir,
         &[
@@ -4229,6 +4229,162 @@ fn recycle_setup(tag: &str) -> (PathBuf, PathBuf) {
     let (c, o, e) = forge(&dir, &["forge", "pr", "review", "1", "--approve"]);
     assert_eq!(c, 0, "approve failed: {e} {o}");
     (dir, wt)
+}
+
+/// Run one vocabulary case through the real CLI in the supplied fixture.
+fn run_exact_recycle_case(dir: &Path, wt: &Path, case: &str, json: bool) -> (i32, String, String) {
+    let wts = wt.to_str().unwrap();
+    let mut shim = None;
+    if case.starts_with("absent") {
+        // Delete the real source ref after pre-validation, before the live-tip
+        // read. The registered worktree remains attached to the absent ref.
+        shim = Some(make_git_shim(
+            "absent-source",
+            "if [ \"$3\" = \"rev-parse\" ] && [ \"$4\" = \"--verify\" ] && \
+                 [ \"$5\" = \"--quiet\" ] && [ \"$6\" = \"refs/heads/feature\" ]; then\n\
+                 \"$REAL_GIT\" -C \"$2\" update-ref -d refs/heads/feature\n\
+                 fi",
+        ));
+    }
+    if case == "dirty" {
+        std::fs::write(wt.join("untracked.txt"), "keep me\n").unwrap();
+    }
+    let missing = dir.join("not-registered");
+    let target = if case == "containment" {
+        missing.to_str().unwrap()
+    } else {
+        wts
+    };
+    let strategy = match case {
+        "kept" | "absent-squash" => "--squash",
+        "absent-rebase" => "--rebase",
+        "absent-merge" => "--merge",
+        _ => "--ff",
+    };
+    let mut args = vec![
+        "forge",
+        "pr",
+        "merge",
+        "1",
+        strategy,
+        "--recycle-worktree",
+        target,
+    ];
+    if json {
+        args.push("--json");
+    }
+    let envs = if case == "partial" {
+        vec![("GIT_FORGE_TEST_FAIL_RECYCLE_REMOVE", wts)]
+    } else {
+        Vec::new()
+    };
+    let result = run_forge(dir, shim.as_deref(), &envs, &args);
+    if let Some(shim) = shim {
+        std::fs::remove_dir_all(shim).unwrap();
+    }
+    result
+}
+
+fn assert_exact_recycle_line(result: &(i32, String, String), line: &str, json: bool, failed: bool) {
+    let (code, stdout, stderr) = result;
+    assert_eq!(*code, i32::from(failed), "{result:?}");
+    if json {
+        let value: serde_json::Value = serde_json::from_str(stdout).unwrap();
+        let field = if failed {
+            &value["error"]["data"]["recycle"]
+        } else {
+            &value["recycle"]
+        };
+        assert_eq!(field.as_str(), Some(line), "{result:?}");
+    } else if failed {
+        assert_eq!(stdout, "", "failure stdout stays empty");
+    }
+    if !json || failed {
+        let output = if failed { stderr } else { stdout };
+        let lines: Vec<_> = output
+            .lines()
+            .filter(|s| s.starts_with("recycle outcome:"))
+            .collect();
+        assert_eq!(lines, vec![line], "exact outcome line: {result:?}");
+    }
+}
+
+/// Exercise each vocabulary state through both human and JSON CLI surfaces.
+fn exact_recycle_outcome_case(case: &str, expected: &str) {
+    for json in [false, true] {
+        let (dir, wt) = recycle_setup(case);
+        let wts = wt.to_str().unwrap();
+        let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
+        let pr_before = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+        let result = run_exact_recycle_case(&dir, &wt, case, json);
+        let line = if case == "partial" {
+            format!("recycle outcome: partial-leftover({wts})")
+        } else {
+            format!("recycle outcome: {expected}")
+        };
+        let refused = case == "dirty" || case == "containment";
+        let failed = refused || case == "partial";
+        // Clean up this case even when the exact-line assertion fails on RED.
+        let registered = wt.exists();
+        let feature = ref_oid(&dir, "refs/heads/feature");
+        let base = ref_oid(&dir, "refs/heads/main").unwrap();
+        let pr = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+        let (_, status, _) = git(&dir, &["status", "--porcelain"]);
+        let (_, head, _) = git(&dir, &["rev-parse", "HEAD"]);
+        let (_, ledger, _) = git(&dir, &["worktree", "list", "--porcelain"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+        if wt.exists() {
+            std::fs::remove_dir_all(&wt).unwrap();
+        }
+        assert_exact_recycle_line(&result, &line, json, failed);
+        assert_eq!(registered, failed, "source directory state");
+        assert_eq!(ledger.contains(wts), failed, "source registration state");
+        assert_eq!(feature.is_some(), failed || case == "kept", "branch state");
+        assert_eq!(status, "", "base remains clean");
+        assert_eq!(head, base, "base HEAD matches result");
+        if refused {
+            assert_eq!(base, base_before);
+            assert_eq!(pr, pr_before);
+        } else {
+            assert_ne!(pr, pr_before, "merge is terminal even on partial failure");
+            if failed {
+                assert!(result.2.contains("merged PR #1 into main"));
+            }
+        }
+    }
+}
+
+#[test]
+fn recycle_exact_removed_when_branch_absent() {
+    for case in ["absent", "absent-merge", "absent-squash", "absent-rebase"] {
+        exact_recycle_outcome_case(case, "removed");
+    }
+}
+
+#[test]
+fn recycle_exact_branch_deleted() {
+    exact_recycle_outcome_case("deleted", "removed; branch-deleted");
+}
+
+#[test]
+fn recycle_exact_branch_kept() {
+    exact_recycle_outcome_case("kept", "removed; branch-kept(squash synthesizes a new commit; original source commits retained; salvage renaming is pipeline-side)");
+}
+
+#[test]
+fn recycle_exact_refused_dirty() {
+    exact_recycle_outcome_case("dirty", "refused-dirty");
+}
+
+#[test]
+fn recycle_exact_refused_not_contained() {
+    exact_recycle_outcome_case("containment", "refused-not-contained");
+}
+
+#[cfg(debug_assertions)]
+#[test]
+fn recycle_exact_partial_leftover() {
+    exact_recycle_outcome_case("partial", "");
 }
 
 #[test]

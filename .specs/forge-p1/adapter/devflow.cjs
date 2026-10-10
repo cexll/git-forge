@@ -1858,7 +1858,7 @@ const FORGE_RE = {
   issueCreated: /^issue #(\d+) created:/m,
   prCreated: /^PR #(\d+) created:/m,
   merged: /merged PR #(\d+) into (\S+) \(([0-9a-f]{7,64})\)/,
-  recycleOutcome: /recycle outcome: ([^\n]*)/,
+  recycleOutcome: /^recycle outcome: ([^\r\n]*)$/m,
   // `pr merge` refusals, matched on the forge's own words (never inferred):
   movedBase: /has moved since PR #\d+ was created/,
   notOnTop: /not directly on top of the snapshot base|merge_base != base_head/,
@@ -1868,8 +1868,8 @@ const FORGE_RE = {
   ciRed: /ci run (recorded: failed|for PR #\d+ failed)|CI run for PR #\d+ failed/,
   // Recycle refusal (clause 6 → worktree_partial_removal), both phases: the
   // pre-merge validation (merge NOT executed) and the phase-2 TOCTOU re-check
-  // (merge terminal, worktree stays). Matched on the forge's own refusal word.
-  recycleRefused: /recycle refused \((refused-dirty|refused-not-contained)\)/,
+  // (merge terminal, worktree stays). Consume the exact standalone outcome line.
+  recycleRefused: /^recycle outcome: (refused-dirty|refused-not-contained)$/m,
 };
 
 /** Run one `git forge` command from the repo root. The caller env names the caller; only the adapter sets it. */
@@ -2196,8 +2196,8 @@ function forgeMergeFeature(missionDir, state, featuresDoc, feature) {
       feature.status = 'completed';
       feature.currentWorkerSessionId = null;
       // Persist the outcome BEFORE anything is cleared; the worktree stays.
-      logEvent(missionDir, 'forge_recycle_outcome', { featureId: feature.id, prId, outcome: partialOutcome[1], worktree: feature.worktree });
-      logEvent(missionDir, 'worktree_recycle_partial', { featureId: feature.id, prId, outcome: partialOutcome[1], keptWorktree: feature.worktree });
+      logEvent(missionDir, 'forge_recycle_outcome', { featureId: feature.id, prId, outcome: partialOutcome[0], worktree: feature.worktree });
+      logEvent(missionDir, 'worktree_recycle_partial', { featureId: feature.id, prId, outcome: partialOutcome[0], keptWorktree: feature.worktree });
       state.state = 'paused';
       state.pauseReason = 'worktree_partial_removal';
       writeState(missionDir, state);
@@ -2248,6 +2248,8 @@ function forgeMergeFeature(missionDir, state, featuresDoc, feature) {
         state.state = 'paused';
         state.pauseReason = 'worktree_partial_removal';
         writeState(missionDir, state);
+        const refusal = out.match(FORGE_RE.recycleRefused)[0];
+        logEvent(missionDir, 'forge_recycle_outcome', { featureId: feature.id, prId, outcome: refusal, worktree: feature.worktree });
         logEvent(missionDir, 'worktree_recycle_refused', { featureId: feature.id, prId, error: out.slice(0, 300) });
         logEvent(missionDir, 'merge_blocked', { featureId: feature.id, code: 'worktree_partial_removal' });
         writeFeaturesDoc(missionDir, featuresDoc);
@@ -2295,7 +2297,7 @@ function forgeMergeFeature(missionDir, state, featuresDoc, feature) {
       return { ok: false, code: 'forge_bridge_failed', message: err.message };
     }
     const commitId = mm[3];
-    const outcome = (out.match(FORGE_RE.recycleOutcome) || [])[1] || null;
+    const outcome = (out.match(FORGE_RE.recycleOutcome) || [])[0] || null;
     // Mirror the transition BEFORE anything else is derived from it (clause 5).
     logEvent(missionDir, 'forge_merged', { featureId: feature.id, prId, commitId, oldPrId: supersededFrom || undefined });
     logEvent(missionDir, 'feature_merged', { featureId: feature.id, branch, commitId, prId });

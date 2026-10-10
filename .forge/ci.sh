@@ -7,3 +7,11 @@ set -e
 export PATH="$HOME/.cargo/bin:$PATH"
 export RUSTUP_TOOLCHAIN=1.93.0-aarch64-apple-darwin
 cargo test
+
+# Adapter fixtures use /usr/bin/env node, so children need Node on PATH too.
+export PATH="$PATH:/opt/homebrew/bin:/opt/homebrew/opt/node/bin"
+if ! command -v node >/dev/null 2>&1; then
+  echo "forge CI: node missing — install Node.js or add it to PATH; adapter tests are required" >&2
+  exit 1
+fi
+node --test .specs/forge-p1/adapter/forge-adapter.test.cjs

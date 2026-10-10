@@ -97,6 +97,10 @@ test *args:
 unit:
     @if [ -f Cargo.toml ]; then cargo test --lib; else echo "unit: no Cargo.toml yet — lands with devflow t0"; fi
 
+
+# Bundled forge adapter consumer regressions against the current recycle wire line.
+adapter-test *args:
+    node --test {{args}} .specs/forge-p1/adapter/forge-adapter.test.cjs
 # Real enforced e2e gate (F-008): `just e2e` runs `dogfood-all` — BOTH 141/141
 # dogfood oracles on disposable clones: the master-default oracle
 # (scripts/gf-dogfood.sh) and the owned main-default regression

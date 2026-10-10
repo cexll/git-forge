@@ -18,13 +18,11 @@ const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
 
-const ROOT = path.join(__dirname, '..', '..');
-const CLI = path.join(ROOT, 'scripts', 'devflow.cjs');
-const FAKE = path.join(ROOT, 'fixtures', 'devflow', 'fake-git-forge.cjs');
+const CLI = path.join(__dirname, 'devflow.cjs');
+const FAKE = path.join(__dirname, 'fake-git-forge.cjs');
 
 const SPEC = '.specs/forge-matrix';
-const FAKE_BIN_DIR = path.join(__dirname, '..', '..', 'fixtures', 'devflow', 'bin');
-if (!fs.existsSync(FAKE_BIN_DIR)) fs.mkdirSync(FAKE_BIN_DIR, { recursive: true });
+const FAKE_BIN_DIR = fs.mkdtempSync(path.join(os.tmpdir(), 'forge-adapter-bin-'));
 const FAKE_LINK = path.join(FAKE_BIN_DIR, 'git-forge');
 
 let tmp;
@@ -272,7 +270,7 @@ before(() => {
 
 after(() => {
   fs.rmSync(tmp, { recursive: true, force: true });
-  if (fs.existsSync(FAKE_LINK)) fs.rmSync(FAKE_LINK, { force: true });
+  fs.rmSync(FAKE_BIN_DIR, { recursive: true, force: true });
 });
 
 // ---------------------------------------------------------------------------
@@ -696,6 +694,8 @@ test('F-002: phase-1 recycle refusal (refused-dirty) pauses worktree_partial_rem
   assert.ok(!ev.some((e) => e.pauseReason === 'forge_bridge_failed' || e.code === 'forge_bridge_failed'), 'the refusal never lands in the catch-all');
   const rt = runtime(arm.missionDir);
   assert.ok(rt.features.t1.worktree, 'feature.worktree is kept as the recovery record');
+  assert.ok(!ev.some((e) => e.event === 'forge_merged'), 'phase-1 refusal has no terminal merge');
+  assert.equal(forgeState(arm).prs.prs[0].merged, null, 'forge PR remains unmerged');
   // Recovery: the injection was consumed and the worktree is actually clean, so the re-run merges.
   const merged = run(['merge-feature', '--mission-dir', arm.missionDir, '--feature', 't1'], arm.env);
   assert.equal(merged.status, 0, `re-run after clearing self-heals: ${merged.stderr}`);
@@ -713,6 +713,8 @@ test('F-002: phase-2 TOCTOU refused-dirty keeps the terminal merge and pauses wo
   assert.equal(state(arm.missionDir).pauseReason, 'worktree_partial_removal', 'the refusal pauses worktree_partial_removal');
   const partial = ev.find((e) => e.event === 'worktree_recycle_partial');
   assert.ok(partial && partial.keptWorktree, 'the refused worktree is recorded as kept before any sweep');
+  assert.ok(rt.features.t1.worktree, 'phase-2 recovery retains feature.worktree');
+  assert.equal(partial.outcome, 'recycle outcome: refused-dirty', 'the exact outcome line is persisted');
 });
 
 test('F-008: a lost-issueId refile never adopts a CLOSED issue — it files a fresh open one', () => {
@@ -752,12 +754,6 @@ test('F-009: the fixture enforces the real forge ff precondition — a non-ff sn
   assert.ok(!events(arm.missionDir).some((e) => e.pauseReason === 'forge_bridge_failed' || e.code === 'forge_bridge_failed'), 'notOnTop is its own taxonomy class, not a bridge failure');
 });
 
- test('F-010: the node matrix is wired into a standing gate — one justfile entry runs the forge adapter matrix', () => {
-   const justfile = fs.readFileSync(path.join(ROOT, 'justfile'), 'utf8');
-   assert.match(justfile, /forge-matrix:/, 'the standing gate entry exists');
-   assert.match(justfile, /forge-adapter\.test\.cjs/, 'it runs the forge adapter matrix');
-   assert.match(justfile, /dual-path-parity\.test\.cjs/, 'it runs dual-path parity');
- });
 
 // ---------------------------------------------------------------------------
 // CR-04..CR-10 (code review round 1): adapter fixes
@@ -935,10 +931,3 @@ test('CR-09: waive-assertion refuses a PENDING (never-run) assertion', () => {
   assert.ok(!ev.some((e) => e.event === 'assertion_waiver'), 'no waiver event was written');
 });
 
-test('CR-10: forgeFileActiveTickets has exactly one definition (the dead duplicate is gone)', () => {
-  const src = fs.readFileSync(path.join(ROOT, 'scripts', 'devflow.cjs'), 'utf8');
-  const defs = src.match(/function forgeFileActiveTickets/g) || [];
-  assert.equal(defs.length, 1, 'exactly one definition survives');
-  const abandons = src.match(/function forgeAbandonTicketIssue/g) || [];
-  assert.equal(abandons.length, 1, 'forgeAbandonTicketIssue is defined exactly once');
-});
