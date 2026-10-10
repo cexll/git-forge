@@ -172,7 +172,7 @@ Success with `--json` prints one object or array on stdout, exits 0, and leaves 
 
 `event` is the appended event's commit OID; `merge_commit` is the resulting base tip. `candidate` is a prepared commit or `null`. `pr diff`'s `base` and `head` are snapshot commits, not branch names. Read `state` as the command's resulting state, not a guarantee against later concurrent changes. Idempotent replay returns historical results, not current state.
 
-Every command failure exits 1. With standalone `--json`, stdout contains an `error` object with `code`, `message`, `input`, `hint`, and `retryable`, optionally with `data`. Stderr retains `git-forge: <message>`. Without `--json`, stdout is empty. Parse `code` and `data`; keep stderr separate. Help has no JSON result: help plus `--json` returns `E_USAGE`. An option value equal to `--json`, or a token after end-of-options `--`, is data rather than an output flag. `--json=x` is not supported.
+Every command failure exits 1. With standalone `--json`, stdout contains an `error` object with `code`, `message`, `input`, `hint`, and `retryable`, optionally with `data`. Stderr retains `git-forge: <message>`. Without `--json`, stdout is empty. Parse `code` and `data`; keep stderr separate. Help has no JSON result: help plus `--json` returns `E_USAGE`. An option value equal to `--json` is data rather than an output flag. Only `issue new` and `pr create` accept end-of-options `--`; a token after it is data. Other commands reject `--` with `E_USAGE` (`unknown option '--'`). `--json=x` is not supported.
 
 | Error code | Action |
 |---|---|
