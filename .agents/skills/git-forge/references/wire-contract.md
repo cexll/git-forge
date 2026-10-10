@@ -167,6 +167,7 @@ are usage errors, never panics: `pr show` and `pr diff` use
 | `E_CONFLICT` | Compare-and-swap conflict, exhausted CAS retries, or stale snapshot; read current state before retrying. Also an idempotency key reused with different inputs (`retryable: false`) |
 | `E_BASE_MOVED` | Base movement prevents the requested operation |
 | `E_PREPARE_CONFLICT` | Candidate preparation encounters a merge conflict |
+| `E_MERGE_CONFLICT` | Unprepared merge strategy execution encounters a merge conflict |
 | `E_GATE` | Merge gate refuses the operation |
 | `E_CI_FAILED` | CI execution or cleanup fails |
 | `E_INVALID` | Domain validation rejects input or repository state |
@@ -181,6 +182,7 @@ Errors with `data` (keys in order):
 | Code | Command | `input` | `data` | `hint` |
 |---|---|---|---|---|
 | `E_PREPARE_CONFLICT` | `pr prepare` (merge, squash, rebase) | PR id | `pr`, `strategy`, `base` (base tip the candidate was built on), `source` (snapshot source commit), `paths` (every conflicted path, git-quoted) | ``Merge the base branch into the source branch, resolve the conflicts, then run `git forge pr update <n>` or create a replacement PR.`` |
+| `E_MERGE_CONFLICT` | `pr merge` (merge, squash, rebase; no prepared candidate) | PR id | `pr`, `strategy`, `base` (base tip used by the strategy), `source` (snapshot source commit), `paths` (every conflicted path, git-quoted) | ``Merge the base branch into the source branch, resolve the conflicts, then run `git forge pr update <n>` or create a replacement PR.`` |
 | `E_BASE_MOVED` | `pr update` | base branch name | `pr`, `base` (branch name), `snapshot_base`, `current_base` (live tip, or `null` when the base was deleted after the check) | `Inspect the current base and PR snapshot before proceeding.` |
 | `E_CI_FAILED` | `ci run` | PR id | `pr`, `reason`, `tail` | `Fix the CI plan and run CI again.`, or `Inspect the reported worktree cleanup failure.` when the temporary worktree was left over |
 | `E_CONFLICT` | keyed command, key reused with different inputs | the key | `command`, `key`, `id` (recorded result id) | `Repeat the original inputs to read the recorded result, or use a new idempotency key.` |
@@ -192,7 +194,26 @@ Errors with `data` (keys in order):
   or create a replacement PR; <cleanup outcome>`. It lists at most 20 paths,
   then ` (and <m> more)`; `data.paths` is never cut. Refs are unchanged. A
   failure without unmerged entries stays `E_INTERNAL`. `ff` has no conflict
-  path, and `pr merge` strategy failures are not covered by this payload.
+  path.
+- **Merge strategy conflict**: `pr merge <n> --merge|--squash|--rebase`
+  executes the strategy when there is no prepared candidate and the base has
+  not moved since the PR snapshot. A failed strategy with unmerged index
+  entries returns `E_MERGE_CONFLICT`. The message is identical to the prepare
+  conflict message above, except it starts `PR #<n> cannot be merged with
+  strategy <s>`. Classification, git-quoted paths, terminal escaping, the
+  20-path message limit, complete `data.paths`, hint, input, retryability
+  (`false`), and cleanup outcome are shared with prepare conflicts.
+  Both commands classify the unmerged index before cleanup; a failing hook
+  that leaves unmerged entries receives the corresponding conflict code.
+  Hook and process failures without unmerged entries remain `E_INTERNAL`.
+  The failure publishes no result ref or merge event and changes no refs or
+  existing user worktrees. The temporary worktree and its sibling path lock
+  are cleaned up; a worktree removal failure retains the leftover report.
+  Prepared-candidate merge consumes its candidate without executing a
+  strategy, so it cannot raise this error. `--ff` fast-forwards without
+  merging trees and cannot leave a conflict index; divergent history fails
+  its precondition before worktree creation. Operational failures remain
+  `E_INTERNAL`.
 - **Moved base** message: `base branch '<base_ref>' has moved since PR #<n>
   was created; run git forge pr prepare <n> --strategy <s> to merge the
   existing snapshot, or create a replacement PR from the updated source with
