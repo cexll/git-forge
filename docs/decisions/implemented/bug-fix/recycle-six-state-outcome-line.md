@@ -55,3 +55,8 @@ strategy, force, wrong-branch, and phase-2 dirty coverage remains in place.
 Repository wire documentation and the QA driver use the exact line format.
 The installed user-level skill contract is read-only and requires a separate
 owner update, recorded on Issue #50.
+
+The repository's `.forge/ci.sh` runs the bundled adapter matrix after `cargo test`.
+Node.js is required. The plan adds Homebrew's bin and Node install directories
+to `PATH` so adapter fixture subprocesses can also resolve `node`. A missing
+Node executable fails the plan with a diagnostic instead of skipping the matrix.
