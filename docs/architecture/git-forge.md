@@ -169,6 +169,7 @@ keeps its current schema-1 shapes; it has no common envelope.
 | `E_CONFLICT` | Compare-and-swap conflict, exhausted CAS retries, or stale snapshot; read current state before retrying. Also an idempotency key reused with different inputs (`retryable: false`) |
 | `E_BASE_MOVED` | Base movement prevents the requested operation |
 | `E_PREPARE_CONFLICT` | Candidate preparation encounters a merge conflict |
+| `E_MERGE_CONFLICT` | Unprepared merge strategy execution encounters a merge conflict |
 | `E_GATE` | Merge gate refuses the operation |
 | `E_CI_FAILED` | CI execution or cleanup fails |
 | `E_INVALID` | Domain validation rejects input or repository state |
@@ -179,14 +180,14 @@ Issue chains without a usable matching creation event return `E_INVALID`.
 These failures reject repository state, not an absent requested entity.
 An absent requested Issue remains `E_NOT_FOUND`.
 
-Known limitation: preparation classifies failures from the unmerged index before
-cleanup. A failing hook that leaves unmerged index entries returns
-`E_PREPARE_CONFLICT`; the CLI does not distinguish hook-created entries from
-strategy conflicts. Hook and process failures without unmerged entries remain
-`E_INTERNAL`.
+Known limitation: preparation and unprepared merge classify failures from the
+unmerged index before cleanup. A failing hook that leaves unmerged index entries
+returns `E_PREPARE_CONFLICT` or `E_MERGE_CONFLICT`, respectively; the CLI does not
+distinguish hook-created entries from strategy conflicts. Hook and process
+failures without unmerged entries remain `E_INTERNAL`.
 
 The CLI preserves typed CAS failures as `E_CONFLICT` with `retryable: true`.
-Other failures are not automatically retryable. The prepare-conflict,
+Other failures are not automatically retryable. The strategy-conflict,
 moved-base, and CI-failure payloads are below.
 
 Canonical local branch names that are absent return `E_NOT_FOUND` with the
@@ -207,8 +208,9 @@ rejects the entire transaction. Expected-absent creation occurs only in the
 separate pending-result publication, not finalization. Unknown Git diagnostics
 remain `E_INTERNAL`; missing-reference classification requires an exact named
 update operation with a nonzero expected OID.
-Preparation returns `E_PREPARE_CONFLICT` when a failed strategy leaves an
-unmerged index, subject to the hook limitation documented beside the code list.
+Preparation returns `E_PREPARE_CONFLICT` and unprepared merge execution returns
+`E_MERGE_CONFLICT` when a failed strategy leaves an unmerged index, subject to
+the hook limitation documented beside the code list.
 
 #### Prepare conflict
 
@@ -254,7 +256,34 @@ PR #<n> cannot be prepared with strategy <s>: source <source> conflicts with bas
 The `ff` strategy has no conflict path: a source that does not sit on the
 base tip fails the fast-forward precondition before a worktree exists. A
 failure without unmerged entries keeps its `git <s> failed: <cause>` message
-and `E_INTERNAL`. `pr merge` strategy execution is not part of this contract.
+and `E_INTERNAL`.
+
+#### Merge strategy conflict
+
+`pr merge <n> --merge|--squash|--rebase` executes the strategy when there is no
+prepared candidate and the base has not moved since the PR snapshot. A failed
+strategy with unmerged index entries returns `E_MERGE_CONFLICT`. Classification,
+git-quoted paths, terminal escaping, the 20-path message limit, complete
+`data.paths`, hint, input, retryability, and cleanup outcome are identical to
+"Prepare conflict" above. Only the code and operation wording differ:
+
+```text
+PR #<n> cannot be merged with strategy <s>: source <source> conflicts with base '<base_ref>' at <base> in <k> path(s): <p1>, <p2>, ...; merge '<base_ref>' into the source branch '<source_ref>', resolve the conflicts, then run `git forge pr update <n>` or create a replacement PR; worktree cleaned up, no ref changes made
+```
+
+```json
+{"error":{"code":"E_MERGE_CONFLICT","message":"PR #1 cannot be merged with strategy merge: ...","input":"1","hint":"Merge the base branch into the source branch, resolve the conflicts, then run `git forge pr update 1` or create a replacement PR.","retryable":false,"data":{"pr":1,"strategy":"merge","base":"<40-hex>","source":"<40-hex>","paths":["shared.txt"]}}}
+```
+
+The failure publishes no result ref or merge event and changes no refs. The
+temporary worktree and its sibling path lock are cleaned up; a worktree removal
+failure keeps the adapter's leftover report. Existing user worktrees are not
+changed. Prepared-candidate merge consumes its candidate without executing a
+strategy, so it cannot raise this error. `--ff` can reach strategy execution
+only when the base tip is an ancestor of the source; it changes HEAD without
+merging trees and cannot leave a conflict index. Divergent history refuses its
+fast-forward precondition before worktree creation. Operational failures keep
+`E_INTERNAL`.
 
 #### Moved base
 

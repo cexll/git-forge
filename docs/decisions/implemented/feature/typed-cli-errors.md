@@ -36,8 +36,9 @@ gate refusals return `E_GATE` with the existing human remedy. Preparation return
 `E_PREPARE_CONFLICT` only when the failed strategy leaves an unmerged index,
 checked before cleanup. A failing hook that leaves unmerged entries receives
 the same code; hook and process failures without such entries remain `E_INTERNAL`.
+Unprepared merge returns `E_MERGE_CONFLICT` under the same classification.
 Conflicted-path diagnostics and conflict-specific remedies are recorded in
-`prepare-conflict-diagnostics.md`.
+`prepare-conflict-diagnostics.md` and `../bug-fix/merge-strategy-conflict-errors.md`.
 
 ## Alternatives considered
 

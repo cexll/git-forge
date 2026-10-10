@@ -19,7 +19,8 @@ with the index path comparison, which is case-insensitive under
 `core.ignorecase` and would fold `A.txt` and `a.txt` into one path. The classification is unchanged: a failure is a conflict
 exactly when the index has an unmerged entry.
 
-`pr prepare` (`src/pr_prepare.rs`) builds the `E_PREPARE_CONFLICT` error from
+`pr prepare` uses the shared formatter in `src/cli_error.rs` to build the
+`E_PREPARE_CONFLICT` error from
 structured parts: PR id, strategy, base ref and tip, source commit, up to 20
 conflicted paths, the remedy, and the cleanup outcome. Each path is the
 git-quoted path (`core.quotePath=false`): for example `"bad\200.txt"` for
@@ -61,6 +62,6 @@ asserting exit code, stderr, the complete JSON error, unchanged refs, and no
 leftover worktree. `ff` has no conflict path; its precondition refusal is
 pinned unchanged. Failures without unmerged entries keep their
 `git <s> failed: <cause>` message and `E_INTERNAL`. Temporary worktree cleanup
-and its messages are unchanged. `pr merge` strategy execution still reports a
-conflict as `E_INTERNAL` with git's stderr; that path is outside this
-decision.
+and its messages are unchanged. `pr merge` uses the same diagnostics with
+`E_MERGE_CONFLICT`; `../bug-fix/merge-strategy-conflict-errors.md` supersedes
+this decision's prepare-only scope without changing the prepare contract.

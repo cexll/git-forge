@@ -9,6 +9,7 @@
 //! owns the prepare command; the candidate gate lives in `merge_state`.
 
 use crate::cli_error::CliError;
+use crate::cli_error::{strategy_conflict_error, ConflictOperation, StrategyConflict};
 
 use std::collections::HashMap;
 
@@ -360,7 +361,8 @@ fn materialize_candidate(
             return Err(if e.conflict_paths.is_empty() {
                 CliError::from(e.message)
             } else {
-                prepare_conflict_error(&PrepareConflict {
+                strategy_conflict_error(&StrategyConflict {
+                    operation: ConflictOperation::Prepare,
                     id,
                     strategy,
                     base_ref,
@@ -417,79 +419,6 @@ fn materialize_candidate(
     }
     release_lock(&mut lock_handle, &tmp);
     Ok((result_commit, result_tree))
-}
-
-/// Most conflicted paths the human message lists; JSON `data.paths` is complete.
-const MESSAGE_PATH_LIMIT: usize = 20;
-
-/// One strategy execution that left unmerged index entries.
-struct PrepareConflict<'a> {
-    id: u64,
-    strategy: &'a str,
-    base_ref: &'a str,
-    source_ref: &'a str,
-    base: Oid,
-    source: Oid,
-    paths: &'a [String],
-    cleanup: &'a str,
-}
-
-/// The `E_PREPARE_CONFLICT` failure: the message names the candidate inputs,
-/// up to [`MESSAGE_PATH_LIMIT`] conflicted paths, the remedy, and the
-/// cleanup outcome; `data` carries `pr`, `strategy`, `base`, `source`, and
-/// every conflicted path.
-fn prepare_conflict_error(conflict: &PrepareConflict<'_>) -> CliError {
-    let PrepareConflict {
-        id,
-        strategy,
-        base_ref,
-        source_ref,
-        base,
-        source,
-        paths,
-        cleanup,
-    } = *conflict;
-    // Paths and branch names come from repository content; escape control
-    // characters in the human message. Git quoting leaves C1 controls
-    // (U+0080-U+009F) in paths unescaped; sanitizing catches them.
-    let base_ref = crate::cli::sanitize_terminal(base_ref);
-    let source_ref = crate::cli::sanitize_terminal(source_ref);
-    let count = match paths.len() {
-        1 => "1 path".to_string(),
-        n => format!("{n} paths"),
-    };
-    let mut shown = paths
-        .iter()
-        .take(MESSAGE_PATH_LIMIT)
-        .map(|path| crate::cli::sanitize_terminal(path))
-        .collect::<Vec<_>>()
-        .join(", ");
-    if paths.len() > MESSAGE_PATH_LIMIT {
-        shown.push_str(&format!(" (and {} more)", paths.len() - MESSAGE_PATH_LIMIT));
-    }
-    let mut error = CliError::new(
-        "E_PREPARE_CONFLICT",
-        format!(
-            "PR #{id} cannot be prepared with strategy {strategy}: source {source} conflicts \
-             with base '{base_ref}' at {base} in {count}: {shown}; merge '{base_ref}' into the \
-             source branch '{source_ref}', resolve the conflicts, then run `git forge pr update \
-             {id}` or create a replacement PR; {cleanup}"
-        ),
-        id.to_string(),
-        format!(
-            "Merge the base branch into the source branch, resolve the conflicts, then run \
-             `git forge pr update {id}` or create a replacement PR."
-        ),
-        false,
-    );
-    error.data = vec![
-        ("pr", JsonValue::Number(id as i64)),
-        ("strategy", JsonValue::String(strategy.to_string())),
-        ("base", JsonValue::String(base.to_string())),
-        ("source", JsonValue::String(source.to_string())),
-        ("paths", crate::event::json_string_array(paths)),
-    ];
-    error
 }
 
 /// ── F-002 prepared-candidate gates ── The merge result is the
@@ -802,62 +731,4 @@ pub(crate) fn pr_prepare_help() -> String {
      \x20 conflict fails with E_PREPARE_CONFLICT, naming the conflicted paths\n\
      \x20 and the remedy; no ref changes."
         .to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{prepare_conflict_error, PrepareConflict};
-    use git2::Oid;
-
-    fn conflict_json(paths: &[String]) -> (String, String) {
-        let error = prepare_conflict_error(&PrepareConflict {
-            id: 7,
-            strategy: "squash",
-            base_ref: "main",
-            source_ref: "ticket",
-            base: Oid::from_str("1111111111111111111111111111111111111111").unwrap(),
-            source: Oid::from_str("2222222222222222222222222222222222222222").unwrap(),
-            paths,
-            cleanup: "worktree cleaned up, no ref changes made",
-        });
-        (error.message.clone(), error.to_json())
-    }
-
-    #[test]
-    fn prepare_conflict_message_caps_paths_and_data_keeps_all() {
-        let paths: Vec<String> = (0..21).map(|i| format!("p{i:02}")).collect();
-        let (message, json) = conflict_json(&paths);
-        let listed = paths[..20].join(", ");
-        assert_eq!(
-            message,
-            format!(
-                "PR #7 cannot be prepared with strategy squash: source \
-                 2222222222222222222222222222222222222222 conflicts with base 'main' at \
-                 1111111111111111111111111111111111111111 in 21 paths: {listed} (and 1 more); \
-                 merge 'main' into the source branch 'ticket', resolve the conflicts, then run \
-                 `git forge pr update 7` or create a replacement PR; worktree cleaned up, no ref \
-                 changes made"
-            )
-        );
-        let quoted: Vec<String> = paths.iter().map(|p| format!("\"{p}\"")).collect();
-        assert!(
-            json.ends_with(&format!(
-                ",\"data\":{{\"pr\":7,\"strategy\":\"squash\",\"base\":\
-                 \"1111111111111111111111111111111111111111\",\"source\":\
-                 \"2222222222222222222222222222222222222222\",\"paths\":[{}]}}}}}}",
-                quoted.join(",")
-            )),
-            "{json}"
-        );
-        assert!(json.starts_with("{\"error\":{\"code\":\"E_PREPARE_CONFLICT\","));
-    }
-
-    #[test]
-    fn prepare_conflict_message_lists_all_paths_up_to_the_cap() {
-        let paths: Vec<String> = (0..20).map(|i| format!("p{i:02}")).collect();
-        let (message, _) = conflict_json(&paths);
-        assert!(message.contains(&format!("in 20 paths: {};", paths.join(", "))));
-        let (message, _) = conflict_json(&["only.txt".to_string()]);
-        assert!(message.contains("in 1 path: only.txt;"), "{message}");
-    }
 }

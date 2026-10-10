@@ -2162,7 +2162,7 @@ fn rebase_conflict_aborts_cleans_and_leaves_refs_unchanged() {
     let (cm, _, em) = forge(&dir, &["forge", "pr", "merge", "1", "--rebase"]);
     assert_ne!(cm, 0, "conflicting rebase must fail the merge");
     assert!(
-        em.contains("git rebase failed") && em.contains("worktree cleaned up, no ref changes made"),
+        em.contains("worktree cleaned up, no ref changes made"),
         "stderr: {em}"
     );
     assert_eq!(
@@ -2291,7 +2291,7 @@ fn squash_conflict_aborts_cleans_and_leaves_refs_unchanged() {
     let (cm, _, em) = forge(&dir, &["forge", "pr", "merge", "1", "--squash"]);
     assert_ne!(cm, 0, "conflicting squash must fail the merge");
     assert!(
-        em.contains("git squash failed") && em.contains("worktree cleaned up, no ref changes made"),
+        em.contains("worktree cleaned up, no ref changes made"),
         "stderr: {em}"
     );
     assert_eq!(
