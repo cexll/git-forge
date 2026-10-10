@@ -252,6 +252,47 @@ fn role_env_empty_is_no_role() {
 // ── PR chain roles + show/JSON rendering ────────────────────────────────────
 
 #[test]
+fn pr_create_json_creator_role_matches_show() {
+    let dir = tmpdir("create-role-render");
+    init_repo(&dir);
+    make_feature(&dir, "feature", "feat\n");
+
+    for role in [None, Some("worker")] {
+        let envs: Vec<_> = role
+            .map(|value| ("GIT_FORGE_ROLE", value))
+            .into_iter()
+            .collect();
+        let (c, created, e) = forge_with_env(
+            &dir,
+            &[
+                "forge", "pr", "create", "--source", "feature", "--base", "main", "role PR",
+                "--json",
+            ],
+            &envs,
+        );
+        assert_eq!(c, 0, "create --json: {e}");
+        let created: serde_json::Value = serde_json::from_str(&created).unwrap();
+        let expected = role.map_or(serde_json::Value::Null, |value| value.into());
+        assert_eq!(
+            created.get("creator_role"),
+            Some(&expected),
+            "create --json must return the recorded creator role"
+        );
+
+        let id = created["id"].as_u64().unwrap().to_string();
+        let (c, shown, e) = forge(&dir, &["forge", "pr", "show", &id, "--json"]);
+        assert_eq!(c, 0, "show --json: {e}");
+        let shown: serde_json::Value = serde_json::from_str(&shown).unwrap();
+        assert_eq!(
+            shown.get("creator_role"),
+            created.get("creator_role"),
+            "create and show must agree on the recorded creator role"
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn three_roles_produce_distinguishable_pr_actors_in_one_repo() {
     // THE VAL-204 scenario: worker creates, reviewer approves, orchestrator
     // merges — one repo, ONE shared user.email, three distinguishable event
