@@ -218,4 +218,4 @@ git forge issue comment <id> "Candidate verified" --idempotency-key project-sche
 
 ## Reference
 
-Current source of truth in a git-forge checkout: `docs/architecture/git-forge.md`, especially ref layout, event schema v1, counter CAS, CLI failures, success results, idempotency keys, PR lifecycle, and CI. Read the bundled [wire contract](references/wire-contract.md) for the CLI-facing contract synced from git-forge master e6cda09; when it differs from the checkout contract, the checkout wins. The git-forge checkout's glossary is `CONTEXT.md`; its legacy rationale is in `docs/adr/`.
+Current source of truth in a git-forge checkout: `docs/architecture/git-forge.md`, especially ref layout, event schema v1, counter CAS, CLI failures, success results, idempotency keys, PR lifecycle, and CI. Read the bundled [wire contract](references/wire-contract.md) for the CLI-facing contract, a mirror of the git-forge repository's `docs/architecture/git-forge.md`; when it differs from the checkout contract, the checkout wins. The git-forge checkout's glossary is `CONTEXT.md`; its legacy rationale is in `docs/adr/`.
