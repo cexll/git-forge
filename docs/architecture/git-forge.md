@@ -761,6 +761,10 @@ with `LC_ALL=C`; unrecognized diagnostics fail closed without retrying.
   `error.data.recycle` contain the exact same outcome line without human detail.
   Control characters in outcome paths use the existing terminal `\xNN` escaping,
   so the outcome stays one line; normal paths are preserved exactly.
+  Domain refusals `refused-dirty` and `refused-not-contained` return `E_INVALID`
+  with `retryable: false`, both before merge and after finalization.
+  Genuine process failures retain their existing error classification, including
+  `partial-leftover(<path>)`; the outcome line alone does not determine the code.
 
 ### CI (on-demand, L1)
 

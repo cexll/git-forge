@@ -4309,6 +4309,55 @@ fn assert_exact_recycle_line(result: &(i32, String, String), line: &str, json: b
     }
 }
 
+fn assert_pre_merge_recycle_refusal(
+    dir: &Path,
+    wt: &Path,
+    case: &str,
+    result: &(i32, String, String),
+    line: &str,
+    json: bool,
+    refs: (&str, &str),
+) {
+    assert_eq!(refs.0, refs.1, "all refs stay unchanged on refusal");
+    if !json {
+        return;
+    }
+    let detail = if case == "dirty" {
+        format!(
+            "worktree '{}' has uncommitted changes; commit, stash or clean it, \
+             or pass --force to recycle anyway",
+            wt.display()
+        )
+    } else {
+        let target = dir.join("not-registered");
+        format!(
+            "'{}' is not a registered worktree checked out on the PR source branch \
+             'feature'; the worktree is untouched, the PR is not merged",
+            target.display()
+        )
+    };
+    let message = format!("{detail}\n{line}");
+    let document: serde_json::Value = serde_json::from_str(&result.1).unwrap();
+    assert_eq!(
+        document,
+        serde_json::json!({"error": {
+            "code": "E_INVALID",
+            "message": message,
+            "input": "",
+            "hint": "Correct the input or repository state before retrying.",
+            "retryable": false,
+            "data": {"recycle": line}
+        }})
+    );
+    assert_eq!(result.2, format!("git-forge: {message}"));
+}
+
+fn recycle_refs(dir: &Path) -> String {
+    let (code, refs, error) = git(dir, &["show-ref"]);
+    assert_eq!(code, 0, "read recycle refs: {error}");
+    refs
+}
+
 /// Exercise each vocabulary state through both human and JSON CLI surfaces.
 fn exact_recycle_outcome_case(case: &str, expected: &str) {
     for json in [false, true] {
@@ -4316,6 +4365,7 @@ fn exact_recycle_outcome_case(case: &str, expected: &str) {
         let wts = wt.to_str().unwrap();
         let base_before = ref_oid(&dir, "refs/heads/main").unwrap();
         let pr_before = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+        let refs_before = recycle_refs(&dir);
         let result = run_exact_recycle_case(&dir, &wt, case, json);
         let line = if case == "partial" {
             format!("recycle outcome: partial-leftover({wts})")
@@ -4329,6 +4379,7 @@ fn exact_recycle_outcome_case(case: &str, expected: &str) {
         let feature = ref_oid(&dir, "refs/heads/feature");
         let base = ref_oid(&dir, "refs/heads/main").unwrap();
         let pr = ref_oid(&dir, "refs/forge/prs/1/head").unwrap();
+        let refs_after = recycle_refs(&dir);
         let (_, status, _) = git(&dir, &["status", "--porcelain"]);
         let (_, head, _) = git(&dir, &["rev-parse", "HEAD"]);
         let (_, ledger, _) = git(&dir, &["worktree", "list", "--porcelain"]);
@@ -4345,6 +4396,15 @@ fn exact_recycle_outcome_case(case: &str, expected: &str) {
         if refused {
             assert_eq!(base, base_before);
             assert_eq!(pr, pr_before);
+            assert_pre_merge_recycle_refusal(
+                &dir,
+                &wt,
+                case,
+                &result,
+                &line,
+                json,
+                (&refs_before, &refs_after),
+            );
         } else {
             assert_ne!(pr, pr_before, "merge is terminal even on partial failure");
             if failed {
@@ -4706,9 +4766,30 @@ fn recycle_phase2_dirty_refuses_without_force() {
             "--ff",
             "--recycle-worktree",
             wts,
+            "--json",
         ],
     );
     assert_ne!(cm, 0, "phase-2 dirty recycle must exit non-zero: {om} {em}");
+    let line = "recycle outcome: refused-dirty";
+    let message = format!(
+        "merged PR #1 into main ({source_before})\n\
+         worktree '{wts}' has uncommitted changes (dirt appeared after the pre-merge \
+         validation); the worktree is untouched, commit/stash/clean it or pass --force \
+         to recycle anyway\n{line}"
+    );
+    let document: serde_json::Value = serde_json::from_str(&om).unwrap();
+    assert_eq!(
+        document,
+        serde_json::json!({"error": {
+            "code": "E_INVALID",
+            "message": message,
+            "input": "",
+            "hint": "Correct the input or repository state before retrying.",
+            "retryable": false,
+            "data": {"recycle": line}
+        }})
+    );
+    assert_eq!(em, format!("git-forge: {message}"));
     let both = format!("{om} {em}");
     assert!(
         both.contains("refused-dirty") && both.contains(wts),

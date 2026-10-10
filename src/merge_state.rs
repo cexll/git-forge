@@ -693,9 +693,10 @@ fn finish_merge_output(
 }
 
 /// One structured line shared by stderr and the additive JSON error data.
-fn recycle_error(state: &str, detail: String) -> CliError {
+fn recycle_error(state: &str, detail: impl Into<CliError>) -> CliError {
     let line = format!("recycle outcome: {}", crate::cli::sanitize_terminal(state));
-    let mut error: CliError = format!("{}\n{line}", crate::cli::sanitize_terminal(&detail)).into();
+    let mut error = detail.into();
+    error.message = format!("{}\n{line}", crate::cli::sanitize_terminal(&error.message));
     error
         .data
         .push(("recycle", crate::event::JsonValue::String(line)));
@@ -731,10 +732,10 @@ pub(crate) fn validate_recycle_target(
     if !on_source {
         return Err(recycle_error(
             "refused-not-contained",
-            format!(
+            CliError::invalid(format!(
                 "'{target}' is not a registered worktree checked out on the PR source branch \
              '{source_ref}'; the worktree is untouched, the PR is not merged"
-            ),
+            )),
         ));
     }
     if crate::git::worktree_dirty(target_path)
@@ -743,10 +744,10 @@ pub(crate) fn validate_recycle_target(
     {
         return Err(recycle_error(
             "refused-dirty",
-            format!(
+            CliError::invalid(format!(
                 "worktree '{target}' has uncommitted changes; commit, stash or clean it, \
              or pass --force to recycle anyway"
-            ),
+            )),
         ));
     }
     Ok(())
@@ -796,11 +797,11 @@ pub(crate) fn recycle_source_worktree(
     {
         return Err(recycle_error(
             "refused-dirty",
-            format!(
+            CliError::invalid(format!(
                 "worktree '{target}' has uncommitted changes (dirt appeared after the pre-merge \
              validation); the worktree is untouched, commit/stash/clean it or pass --force \
              to recycle anyway"
-            ),
+            )),
         ));
     }
     // Debug-only test seam (VAL-112): GIT_FORGE_TEST_FAIL_RECYCLE_REMOVE=<path>
@@ -837,7 +838,7 @@ pub(crate) fn recycle_source_worktree(
     if target_path.exists() || worktree_registered_path(repo_dir, target_path) {
         return Err(recycle_error(
             &format!("partial-leftover({target})"),
-            "worktree still present after removal".into(),
+            "worktree still present after removal",
         ));
     }
     let Some(tip) = live_tip else {
