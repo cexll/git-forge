@@ -263,6 +263,7 @@ fn publish(
             base_head: Some(base_oid.to_string()),
             merge_base: Some(merge_base.to_string()),
             closes,
+            creator_role: crate::identity::command_role(),
             ci_status: Some("pending".to_string()),
             ci_plan: None,
             ..Default::default()

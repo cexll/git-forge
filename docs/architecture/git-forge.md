@@ -378,6 +378,10 @@ The `ci` member of `pr create|show` is `null` or `{"status","plan","reason",
 tail (CI failure, above), and `null` for a pending or green Check and for a
 Check recorded before these fields existed.
 
+`pr create --json` returns the resolved role recorded on `pr.created` as
+`creator_role`, matching `pr show --json`. An unset or empty role returns
+`null`. Human `pr create` output does not include role fields.
+
 Mutation results open with `id` (the Issue or PR number) and `state`, the
 entity state after the command: `open|closed` for an Issue and
 `open|merged|abandoned` for a PR. `state` is folded from the entity chain up
