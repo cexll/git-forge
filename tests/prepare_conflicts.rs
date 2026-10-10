@@ -1,7 +1,6 @@
-//! `pr prepare` conflict diagnostics at the built CLI boundary: every path
-//! that leaves an unmerged index reports the conflicted paths, the remedy,
-//! and a complete `E_PREPARE_CONFLICT` JSON error, with no ref change and no
-//! temporary worktree left behind.
+//! Prepare and merge strategy conflict diagnostics at the built CLI boundary:
+//! conflicted paths, remedies, and complete typed JSON errors, with no ref
+//! changes, no user worktree changes, and no temporary worktree left behind.
 use std::path::PathBuf;
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -98,6 +97,8 @@ impl Repo {
 enum Divergence {
     /// Both sides edit `shared.txt` differently.
     Content,
+    /// Both sides edit ordinary and git-quoted paths differently.
+    QuotedContent,
     /// The source deletes `shared.txt`; the base modifies it.
     ModifyDelete,
     /// The source renames `shared.txt` to `renamed.txt`; the base deletes it.
@@ -125,10 +126,13 @@ fn conflict_fixture(divergence: Divergence) -> Repo {
     for path in many_paths() {
         repo.write(&path, "ancestor\n");
     }
+    if matches!(divergence, Divergence::QuotedContent) {
+        repo.write("new\nline\".txt", "ancestor\n");
+    }
     repo.commit_all("ancestor");
     repo.git(&["checkout", "-q", "-b", "feature"]);
     match divergence {
-        Divergence::Content => repo.write("shared.txt", "source\n"),
+        Divergence::Content | Divergence::QuotedContent => repo.write("shared.txt", "source\n"),
         Divergence::ModifyDelete => {
             repo.git(&["rm", "-q", "shared.txt"]);
         }
@@ -141,10 +145,15 @@ fn conflict_fixture(divergence: Divergence) -> Repo {
             .for_each(|path| repo.write(path, "source\n")),
         Divergence::CleanWithHook => repo.write("source-only.txt", "source\n"),
     }
+    if matches!(divergence, Divergence::QuotedContent) {
+        repo.write("new\nline\".txt", "source\n");
+    }
     repo.commit_all("source change");
     repo.git(&["checkout", "-q", "main"]);
     match divergence {
-        Divergence::Content | Divergence::ModifyDelete => repo.write("shared.txt", "base\n"),
+        Divergence::Content | Divergence::QuotedContent | Divergence::ModifyDelete => {
+            repo.write("shared.txt", "base\n");
+        }
         Divergence::RenameDelete => {
             repo.git(&["rm", "-q", "shared.txt"]);
         }
@@ -153,6 +162,9 @@ fn conflict_fixture(divergence: Divergence) -> Repo {
             .iter()
             .for_each(|path| repo.write(path, "base\n")),
         Divergence::CleanWithHook => repo.write("base-only.txt", "base\n"),
+    }
+    if matches!(divergence, Divergence::QuotedContent) {
+        repo.write("new\nline\".txt", "base\n");
     }
     repo.commit_all("base change");
     let (code, _, stderr) = repo.forge(&[
@@ -397,4 +409,148 @@ fn prepare_ff_divergence_keeps_precondition_refusal() {
     );
     assert_eq!(repo.ref_oid("refs/forge/prs/1/result"), None);
     assert_eq!(repo.worktree_count(), 1);
+}
+
+fn merge_conflict_fixture() -> Repo {
+    let repo = conflict_fixture(Divergence::QuotedContent);
+    for args in [
+        vec!["forge", "ci", "run", "1"],
+        vec!["forge", "pr", "review", "1", "--approve"],
+    ] {
+        let (code, _, stderr) = repo.forge(&args);
+        assert_eq!(code, 0, "{args:?}: {stderr}");
+    }
+    repo
+}
+
+/// Compare every ref, worktree registration, and the user's HEAD/index/tree.
+fn merge_failure_state(repo: &Repo) -> Vec<String> {
+    vec![
+        repo.git(&[
+            "for-each-ref",
+            "--format=%(refname) %(objectname) %(symref)",
+        ]),
+        repo.git(&["worktree", "list", "--porcelain"]),
+        repo.git(&["rev-parse", "HEAD"]),
+        repo.git(&["symbolic-ref", "HEAD"]),
+        repo.git(&["write-tree"]),
+        repo.git(&["status", "--porcelain"]),
+        std::fs::read_to_string(repo.0.join("shared.txt")).unwrap(),
+        std::fs::read_to_string(repo.0.join("new\nline\".txt")).unwrap(),
+    ]
+}
+
+fn assert_merge_failure(repo: &Repo, strategy: &str, expected: serde_json::Value) {
+    let before = merge_failure_state(repo);
+    let flag = format!("--{strategy}");
+    for json in [true, false] {
+        let mut args = vec!["forge", "pr", "merge", "1", &flag];
+        if json {
+            args.push("--json");
+        }
+        let child = Command::new(env!("CARGO_BIN_EXE_git-forge"))
+            .args(&args)
+            .current_dir(&repo.0)
+            .env_remove("GIT_FORGE_ROLE")
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(1));
+        assert_eq!(
+            merge_failure_state(repo),
+            before,
+            "failure mutated user state"
+        );
+        for entry in std::fs::read_dir(std::env::temp_dir()).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            assert!(
+                !(name.starts_with("git-forge-pr1-merge-") && name.contains(&format!("-{pid}-"))),
+                "temporary worktree or path lock left at {}",
+                entry.path().display()
+            );
+        }
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        if json {
+            let actual: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+            assert_eq!(actual, expected, "{strategy}: full JSON error contract");
+        } else {
+            assert_eq!(stdout, "");
+        }
+        assert_eq!(
+            String::from_utf8(output.stderr).unwrap(),
+            format!(
+                "git-forge: {}\n",
+                expected["error"]["message"].as_str().unwrap()
+            ),
+            "{strategy}: stderr contract"
+        );
+    }
+}
+
+fn assert_merge_conflict(strategy: &str) {
+    let repo = merge_conflict_fixture();
+    let base = repo.ref_oid("refs/heads/main").unwrap();
+    let source = repo.ref_oid("refs/heads/feature").unwrap();
+    let paths = strings(&["\"new\\nline\\\".txt\"", "shared.txt"]);
+    let message = expected_message(strategy, &base, &source, &paths).replacen(
+        "cannot be prepared",
+        "cannot be merged",
+        1,
+    );
+    assert_merge_failure(
+        &repo,
+        strategy,
+        serde_json::json!({"error": {
+            "code": "E_MERGE_CONFLICT",
+            "message": message,
+            "input": "1",
+            "hint": HINT.replace("<n>", "1"),
+            "retryable": false,
+            "data": {"pr": 1, "strategy": strategy, "base": base, "source": source, "paths": paths}
+        }}),
+    );
+}
+
+#[test]
+fn merge_strategy_conflict_reports_typed_paths() {
+    assert_merge_conflict("merge");
+}
+
+#[test]
+fn squash_strategy_conflict_reports_typed_paths() {
+    assert_merge_conflict("squash");
+}
+
+#[test]
+fn rebase_strategy_conflict_reports_typed_paths() {
+    assert_merge_conflict("rebase");
+}
+
+/// ff reaches its strategy step only for ancestor history; no tree merge
+/// occurs there. Divergence refuses before creating a temporary worktree.
+#[test]
+fn merge_ff_divergence_keeps_precondition_refusal() {
+    let repo = merge_conflict_fixture();
+    let base = repo.ref_oid("refs/heads/main").unwrap();
+    let merge_base = repo.git(&["merge-base", "main", "feature"]);
+    assert_merge_failure(
+        &repo,
+        "ff",
+        serde_json::json!({"error": {
+            "code": "E_INTERNAL",
+            "message": format!(
+                "PR #1 cannot fast-forward: the source does not sit directly on top of \
+                 the current base tip of 'main' (merge_base {merge_base} != base tip {base}); \
+                 use `pr merge --rebase` to replay the source or recreate the PR"
+            ),
+            "input": "",
+            "hint": "Inspect the repository and the reported failure before retrying.",
+            "retryable": false
+        }}),
+    );
 }

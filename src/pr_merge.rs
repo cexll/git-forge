@@ -585,7 +585,23 @@ pub(crate) fn cmd_pr_merge(args: &[String]) -> Result<String, CliError> {
         exec_merge_base,
         state.title.as_deref().unwrap_or(""),
     )
-    .map_err(|error| CliError::from(error.message))?;
+    .map_err(|error| {
+        if error.conflict_paths.is_empty() {
+            CliError::from(error.message)
+        } else {
+            crate::cli_error::strategy_conflict_error(&crate::cli_error::StrategyConflict {
+                operation: crate::cli_error::ConflictOperation::Merge,
+                id,
+                strategy,
+                base_ref: &base_ref,
+                source_ref: state.source_ref.as_deref().unwrap_or(""),
+                base: current_base,
+                source: source_oid,
+                paths: &error.conflict_paths,
+                cleanup: &error.cleanup,
+            })
+        }
+    })?;
     let result_commit = result_commit.parse::<git2::Oid>().map_err(|_| {
         crate::git::cleanup_failed_worktree(
             &repo_dir,
