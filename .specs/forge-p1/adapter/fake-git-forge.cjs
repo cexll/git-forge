@@ -286,10 +286,10 @@ if (group === 'pr') {
       const block = wl.stdout.split('\n\n').find((b) => b.startsWith(`worktree ${recyclePath}\n`) || b.trim() === `worktree ${recyclePath}`);
       const branchLine = block ? block.split('\n').find((l) => l.startsWith('branch ')) : null;
       if (!block || branchLine !== `branch refs/heads/${p.source}`) {
-        finish(1, '', `recycle refused (refused-not-contained): '${recyclePath}' is not a registered worktree checked out on the PR source branch '${p.source}'; the worktree is untouched, the PR is not merged`);
+        finish(1, '', `'${recyclePath}' is not a registered worktree checked out on the PR source branch '${p.source}'; the worktree is untouched, the PR is not merged\nrecycle outcome: refused-not-contained`);
       }
       if (dirty && !flags.force) {
-        finish(1, '', `recycle refused (refused-dirty): worktree '${recyclePath}' has uncommitted changes; commit, stash or clean it, or pass --force to recycle anyway`);
+        finish(1, '', `worktree '${recyclePath}' has uncommitted changes; commit, stash or clean it, or pass --force to recycle anyway\nrecycle outcome: refused-dirty`);
       }
     }
     // ff precondition (real forge pr_merge.rs): the snapshot source must sit
@@ -325,29 +325,30 @@ if (group === 'pr') {
     // validation and the removal. The merge is TERMINAL (the output carries the
     // merged line) but the exit is non-zero and the worktree stays.
     if (recyclePath && take('recycleDirtyToctou')) {
-      finish(1, '', `merged PR #${id} into ${p.base} (${p.source_head}); recycle refused (refused-dirty): worktree '${recyclePath}' has uncommitted changes (dirt appeared after the pre-merge validation); the worktree is untouched, commit/stash/clean it or pass --force to recycle anyway`);
+      fs.writeFileSync(path.join(recyclePath, 'recycle-dirty.txt'), 'preserve uncommitted work\n');
+      finish(1, '', `merged PR #${id} into ${p.base} (${p.source_head})\nworktree '${recyclePath}' has uncommitted changes (dirt appeared after the pre-merge validation); the worktree is untouched, commit/stash/clean it or pass --force to recycle anyway\nrecycle outcome: refused-dirty`);
     }
     if (recyclePath && take('partialRecycle')) {
-      finish(1, '', `merged PR #${id} into ${p.base} (${p.source_head}); recycle outcome: partial-leftover(${recyclePath}): worktree still present after removal`);
+      finish(1, '', `merged PR #${id} into ${p.base} (${p.source_head})\nworktree still present after removal\nrecycle outcome: partial-leftover(${recyclePath})`);
     }
     let outcome = null;
     if (recyclePath) {
       const rm = git(['worktree', 'remove', recyclePath]);
       if (!rm.ok) {
-        finish(1, '', `merged PR #${id} into ${p.base} (${p.source_head}); recycle outcome: partial-leftover(${recyclePath}): worktree removal failed: ${rm.stderr}`);
+        finish(1, '', `merged PR #${id} into ${p.base} (${p.source_head})\nworktree removal failed: ${rm.stderr}\nrecycle outcome: partial-leftover(${recyclePath})`);
       }
       const tip = git(['rev-parse', `refs/heads/${p.source}`]);
       const anc = tip.ok ? git(['merge-base', '--is-ancestor', tip.stdout, p.source_head]) : { ok: false };
       if (tip.ok && tip.stdout === p.source_head && anc.ok) {
         git(['branch', '-D', p.source]);
-        outcome = `removed; branch-deleted (${p.source})`;
+        outcome = 'removed; branch-deleted';
       } else if (!tip.ok) {
-        outcome = `removed (branch ${p.source} absent)`;
+        outcome = 'removed';
       } else {
-        outcome = `removed; branch-kept(${p.source}: its tip is not an ancestor of the integrated result commit — the branch holds unmerged work; salvage renaming is pipeline-side)`;
+        outcome = 'removed; branch-kept(source tip changed or is not an ancestor of the integrated result; unmerged work retained; salvage renaming is pipeline-side)';
       }
     }
-    finish(0, `merged PR #${id} into ${p.base} (${p.source_head})${outcome ? `; recycle outcome: ${outcome}` : ''}`);
+    finish(0, `merged PR #${id} into ${p.base} (${p.source_head})${outcome ? `\nrecycle outcome: ${outcome}` : ''}`);
   }
   finish(2, '', 'usage: git forge pr <create|list|show|comment|review|diff|merge|abandon> ...');
 }

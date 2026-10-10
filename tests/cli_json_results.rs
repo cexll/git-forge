@@ -388,10 +388,9 @@ fn pr_merge_of_a_prepared_candidate_reports_the_recycle_outcome() {
     assert_eq!(result["strategy"], "squash");
     assert_eq!(result["merge_commit"], candidate.as_str());
     assert_eq!(result["merge_commit"], tip(&repo, "main"));
-    let recycle = result["recycle"].as_str().unwrap();
-    assert!(
-        recycle.starts_with("recycle outcome: removed; branch-kept(feature"),
-        "{recycle}"
+    assert_eq!(
+        result["recycle"],
+        "recycle outcome: removed; branch-kept(squash synthesizes a new commit; original source commits retained; salvage renaming is pipeline-side)"
     );
     assert!(!worktree.exists());
 }

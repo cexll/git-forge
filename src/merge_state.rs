@@ -629,10 +629,10 @@ impl MergeOutcome {
         )
     }
 
-    /// The human success line: the merged line, then the recycle outcome.
+    /// Human success detail followed by a separate structured recycle line.
     pub(crate) fn prose(&self) -> String {
         match &self.recycle {
-            Some(recycle) => format!("{}; {recycle}", self.merged_line()),
+            Some(recycle) => format!("{}\n{recycle}", self.merged_line()),
             None => self.merged_line(),
         }
     }
@@ -683,14 +683,23 @@ fn finish_merge_output(
             outcome.recycle = Some(recycle);
             Ok(outcome)
         }
-        // CR-01 (code review): a recycle epilogue failure (phase-2 refused-dirty,
-        // partial-leftover) does NOT undo the merge — the PR is terminal. Keep the
-        // merged line in the error so the adapter can classify the outcome (its
-        // contract: the merged line always precedes the recycle outcome, success
-        // or failure); a bare Err would send a terminal merge into the adapter's
-        // bridge-failure catch-all with the wrong remedy.
-        Err(recycle_err) => Err(format!("{merged}; {recycle_err}").into()),
+        // A failed recycle does not undo the terminal merge. Preserve its
+        // context and the typed recycle data for both CLI output modes.
+        Err(mut error) => {
+            error.message = format!("{merged}\n{}", error.message);
+            Err(error)
+        }
     }
+}
+
+/// One structured line shared by stderr and the additive JSON error data.
+fn recycle_error(state: &str, detail: String) -> CliError {
+    let line = format!("recycle outcome: {}", crate::cli::sanitize_terminal(state));
+    let mut error: CliError = format!("{}\n{line}", crate::cli::sanitize_terminal(&detail)).into();
+    error
+        .data
+        .push(("recycle", crate::event::JsonValue::String(line)));
+    error
 }
 
 /// ── #4 source-worktree recycle, phase 1: PRE-MERGE validation. A recycle
@@ -706,12 +715,13 @@ pub(crate) fn validate_recycle_target(
     source_ref: &str,
     target: &str,
     force: bool,
-) -> Result<(), String> {
+) -> Result<(), CliError> {
     let target_path = std::path::Path::new(target);
     let (ok_list, porcelain, list_err) = crate::git::worktree_list_raw(repo_dir);
     if !ok_list {
-        return Err(format!(
-            "recycle refused (refused-not-contained): git worktree list failed: {list_err}"
+        return Err(recycle_error(
+            "refused-not-contained",
+            format!("git worktree list failed: {list_err}"),
         ));
     }
     let head_ref = format!("refs/heads/{source_ref}");
@@ -719,16 +729,24 @@ pub(crate) fn validate_recycle_target(
         .map(|b| b == head_ref)
         .unwrap_or(false);
     if !on_source {
-        return Err(format!(
-            "recycle refused (refused-not-contained): '{target}' is not a registered \
-             worktree checked out on the PR source branch '{source_ref}'; \
-             the worktree is untouched, the PR is not merged"
+        return Err(recycle_error(
+            "refused-not-contained",
+            format!(
+                "'{target}' is not a registered worktree checked out on the PR source branch \
+             '{source_ref}'; the worktree is untouched, the PR is not merged"
+            ),
         ));
     }
-    if crate::git::worktree_dirty(target_path)? && !force {
-        return Err(format!(
-            "recycle refused (refused-dirty): worktree '{target}' has uncommitted \
-             changes; commit, stash or clean it, or pass --force to recycle anyway"
+    if crate::git::worktree_dirty(target_path)
+        .map_err(|detail| recycle_error("refused-dirty", detail))?
+        && !force
+    {
+        return Err(recycle_error(
+            "refused-dirty",
+            format!(
+                "worktree '{target}' has uncommitted changes; commit, stash or clean it, \
+             or pass --force to recycle anyway"
+            ),
         ));
     }
     Ok(())
@@ -764,7 +782,7 @@ pub(crate) fn recycle_source_worktree(
     target: &str,
     strategy: &str,
     force: bool,
-) -> Result<String, String> {
+) -> Result<String, CliError> {
     let target_path = std::path::Path::new(target);
     // F-003: re-run the dirty check immediately before the destructive
     // removal. Phase-1 validated a clean tree, but dirt may appear in the
@@ -772,11 +790,17 @@ pub(crate) fn recycle_source_worktree(
     // would silently destroy uncommitted work. Refuse (refused-dirty)
     // unless the caller passed --force; a refusal does NOT undo the merge
     // (the PR is terminal), the outcome names what stayed.
-    if crate::git::worktree_dirty(target_path)? && !force {
-        return Err(format!(
-            "recycle refused (refused-dirty): worktree '{target}' has uncommitted \
-             changes (dirt appeared after the pre-merge validation); the worktree \
-             is untouched, commit/stash/clean it or pass --force to recycle anyway"
+    if crate::git::worktree_dirty(target_path)
+        .map_err(|detail| recycle_error(&format!("partial-leftover({target})"), detail))?
+        && !force
+    {
+        return Err(recycle_error(
+            "refused-dirty",
+            format!(
+                "worktree '{target}' has uncommitted changes (dirt appeared after the pre-merge \
+             validation); the worktree is untouched, commit/stash/clean it or pass --force \
+             to recycle anyway"
+            ),
         ));
     }
     // Debug-only test seam (VAL-112): GIT_FORGE_TEST_FAIL_RECYCLE_REMOVE=<path>
@@ -788,9 +812,11 @@ pub(crate) fn recycle_source_worktree(
         == Ok(target_path.to_string_lossy().as_ref())
     {
         if let Err(lock_err) = crate::git::lock_source_worktree_for_recycle(repo_dir, target_path) {
-            return Err(format!(
-                "recycle outcome: partial-leftover({target}): test seam failed to lock the \
-                 worktree for removal-failure injection: {lock_err}"
+            return Err(recycle_error(
+                &format!("partial-leftover({target})"),
+                format!(
+                "test seam failed to lock the worktree for removal-failure injection: {lock_err}"
+            ),
             ));
         }
     }
@@ -802,19 +828,23 @@ pub(crate) fn recycle_source_worktree(
     // injected (VAL-112) or genuine.
     if let Err(rm_err) = crate::git::worktree_remove(repo_dir, target_path) {
         if target_path.exists() || worktree_registered_path(repo_dir, target_path) {
-            return Err(format!(
-                "recycle outcome: partial-leftover({target}): worktree removal failed: {rm_err}"
+            return Err(recycle_error(
+                &format!("partial-leftover({target})"),
+                format!("worktree removal failed: {rm_err}"),
             ));
         }
     }
     if target_path.exists() || worktree_registered_path(repo_dir, target_path) {
-        return Err(format!(
-            "recycle outcome: partial-leftover({target}): worktree still present \
-             after removal"
+        return Err(recycle_error(
+            &format!("partial-leftover({target})"),
+            "worktree still present after removal".into(),
         ));
     }
+    let Some(tip) = live_tip else {
+        return Ok("recycle outcome: removed".into());
+    };
     // Branch deletion (VAL-111). --squash/--rebase synthesize a NEW commit:
-    // the branch is ALWAYS kept, with branch-kept(<reason>) naming the
+    // an existing branch is kept, with branch-kept(<reason>) naming the
     // strategy. --ff/--merge keep the source tip in the result, so the
     // branch is deleted only when its live tip still equals the PR's
     // snapshot source_head (a moved branch holds unmerged work) AND that
@@ -823,35 +853,26 @@ pub(crate) fn recycle_source_worktree(
     // nothing to delete.
     if strategy == "squash" || strategy == "rebase" {
         return Ok(format!(
-            "recycle outcome: removed; branch-kept({source_ref}: the {strategy} merge \
-             synthesized a new commit, so the branch tip is not an ancestor of the \
-             integrated result commit — the branch holds the original commits; \
-             salvage renaming is pipeline-side)"
+            "recycle outcome: removed; branch-kept({strategy} synthesizes a new commit; \
+             original source commits retained; salvage renaming is pipeline-side)"
         ));
     }
-    let Some(tip) = live_tip else {
-        return Ok(format!(
-            "recycle outcome: removed (branch {source_ref} absent)"
-        ));
-    };
     if tip == source_head
         && crate::git::merge_base_is_ancestor(repo_dir, source_head, result_commit)
     {
         match crate::git::branch_force_delete(repo_dir, source_ref) {
-            Ok(()) => Ok(format!(
-                "recycle outcome: removed; branch-deleted ({source_ref})"
-            )),
-            Err(del_err) => Err(format!(
-                "recycle outcome: partial-leftover({target}): worktree removed but branch \
-                 deletion failed: {del_err}"
+            Ok(()) => Ok("recycle outcome: removed; branch-deleted".into()),
+            Err(del_err) => Err(recycle_error(
+                &format!("partial-leftover({target})"),
+                format!("worktree removed but branch deletion failed: {del_err}"),
             )),
         }
     } else {
-        Ok(format!(
-            "recycle outcome: removed; branch-kept({source_ref}: its tip is not an \
-             ancestor of the integrated result commit — the branch holds unmerged work; \
-             salvage renaming is pipeline-side)"
-        ))
+        Ok(
+            "recycle outcome: removed; branch-kept(source tip changed or is not an ancestor \
+            of the integrated result; unmerged work retained; salvage renaming is pipeline-side)"
+                .into(),
+        )
     }
 }
 
@@ -974,30 +995,4 @@ fn maybe_run_test_issue_barrier(attempt: u32) -> Result<(), String> {
 #[cfg(debug_assertions)]
 fn maybe_run_test_retry_barrier() -> Result<(), String> {
     run_test_barrier("GIT_FORGE_TEST_MERGE_RETRY_BARRIER")
-}
-
-#[cfg(test)]
-mod tests {
-    use super::MergeOutcome;
-
-    /// The human success line stays byte-identical to the pre-JSON output:
-    /// the merged line, then `; <recycle outcome>` when a recycle ran.
-    #[test]
-    fn merge_outcome_prose_keeps_the_human_success_line() {
-        let mut outcome = MergeOutcome {
-            id: 7,
-            state: "merged",
-            base_ref: "main".into(),
-            strategy: "squash".into(),
-            generation: 2,
-            merge_commit: "0123abcd".into(),
-            recycle: None,
-        };
-        assert_eq!(outcome.prose(), "merged PR #7 into main (0123abcd)");
-        outcome.recycle = Some("recycle outcome: removed".into());
-        assert_eq!(
-            outcome.prose(),
-            "merged PR #7 into main (0123abcd); recycle outcome: removed"
-        );
-    }
 }
